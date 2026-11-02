@@ -1,0 +1,42 @@
+{
+	"name": "cmd-compress",
+	"version": "0.1.0",
+	"description": "Token compression mods for Command Code: terse replies (caveman), lean code (ponytail), condensed shell output (RTK) — one package, four mods.",
+	"keywords": [
+		"cmd-mod",
+		"cmd-mod-hook",
+		"cmd-mod-command",
+		"commandcode",
+		"tokens",
+		"compression",
+		"caveman",
+		"ponytail",
+		"rtk"
+	],
+	"license": "MIT",
+	"type": "module",
+	"repository": "https://github.com/malikshi/cmd-compress",
+	"engines": {
+		"node": ">=22"
+	},
+	"files": [
+		"mods",
+		"rules",
+		"scripts",
+		"README.md",
+		"LICENSE",
+		"ATTRIBUTION.md"
+	],
+	"commandcode": {
+		"mods": [
+			"./mods/caveman.ts",
+			"./mods/ponytail.ts",
+			"./mods/rtk.ts",
+			"./mods/compress.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test test/*.test.ts",
+		"verify": "node --test test/*.test.ts && node scripts/verify-mods.ts"
+	}
+}

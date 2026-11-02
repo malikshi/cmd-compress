@@ -1,0 +1,96 @@
+// shared — mode lookup, prompt-block helpers, and binary/path utilities for the four mods.
+// exports: MODES, OFF, readOwnMode, writeOwnMode, wrapBlock, stripBlock, promptHas, resolveBin, shortPaths
+// used_by: mods/*.ts, test/*.test.ts
+// related: rules/caveman.ts, rules/ponytail.ts
+// rules: cmd.store is namespaced per mod, so a mod persists ONLY its own key; a sibling's mode is read through cmd.use.
+// rules: prompt text must be byte-stable per mode so the provider prefix cache survives across rounds.
+// agent: 2026-11-02 initial — per-mod store key after learning each mod gets its own file
+
+import {accessSync, constants, existsSync} from 'node:fs';
+import {delimiter, join} from 'node:path';
+import {homedir} from 'node:os';
+
+export const MODES = ['caveman', 'ponytail', 'rtk'] as const;
+export type ModeName = (typeof MODES)[number];
+
+export const OFF = 'off';
+
+// Rules: a fresh install starts with every mode off — compression is opt-in, so nothing changes silently.
+export const DEFAULT_MODE = OFF;
+
+// The one key each mod owns in its own store file.
+const MODE_KEY = 'mode';
+
+interface StoreLike {
+	get(key: string): unknown;
+	set(key: string, value: unknown): Promise<void>;
+}
+
+// Rules: a malformed value degrades to the default — a corrupt store must not break a session.
+export function readOwnMode(store: StoreLike, fallback: string = DEFAULT_MODE): string {
+	const raw = store.get(MODE_KEY);
+	return typeof raw === 'string' && raw ? raw : fallback;
+}
+
+// Rules: writes are fire-and-forget but serialised per process, so two setters in one tick keep the last value.
+let writeChain: Promise<void> = Promise.resolve();
+
+export function writeOwnMode(store: StoreLike, value: string): void {
+	writeChain = writeChain
+		.then(() => store.set(MODE_KEY, value))
+		.catch(() => {
+			// a failed persist must not reject the chain and skip later writes
+		});
+}
+
+/* ---------------------------------------------------------------- prompt text */
+
+export function promptHas(prompt: string, marker: string): boolean {
+	return prompt.includes(marker);
+}
+
+export function wrapBlock(tag: string, body: string): string {
+	return `<${tag}>\n${body.trim()}\n</${tag}>`;
+}
+
+// Rules: removes every previously injected <tag> block so a level change cannot leave two rulesets.
+export function stripBlock(prompt: string, tag: string): string {
+	const pattern = new RegExp(`\\n*<${tag}>[\\s\\S]*?</${tag}>\\n*`, 'g');
+	return prompt
+		.replace(pattern, '\n')
+		.replace(/\n{3,}/g, '\n\n')
+		.trimEnd();
+}
+
+/* ---------------------------------------------------------------- binaries */
+
+// Rules: rtk ships to ~/.bun/bin and is often off PATH for GUI hosts, so probe PATH then the managed dir.
+export function resolveBin(
+	name: string,
+	extraDirs: readonly string[] = [join(homedir(), '.bun', 'bin')],
+): string | null {
+	const exe = process.platform === 'win32' ? `${name}.exe` : name;
+	const dirs = [...(process.env.PATH ?? '').split(delimiter).filter(Boolean), ...extraDirs];
+	for (const dir of dirs) {
+		const candidate = join(dir, exe);
+		try {
+			if (existsSync(candidate)) {
+				accessSync(candidate, constants.X_OK);
+				return candidate;
+			}
+		} catch {
+			// not executable: keep probing
+		}
+	}
+	return null;
+}
+
+/* ---------------------------------------------------------------- paths */
+
+// Rules: a shortened path must stay identifiable — drop only the workspace prefix, keep the tail.
+export function shortPaths(text: string, cwd: string): string {
+	if (!cwd || cwd === '/') return text;
+	const prefix = cwd.endsWith('/') ? cwd.slice(0, -1) : cwd;
+	const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	return text.replace(new RegExp(`(^|[\\s"'\`(])${escaped}/`, 'g'), '$1');
+}

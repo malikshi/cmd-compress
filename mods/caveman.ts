@@ -1,0 +1,77 @@
+// caveman — terse-reply mode: `/caveman <level|off|status>` injects one rule block into the prompt.
+// exports: default (ModFactory), CAVEMAN_STOP_PHRASES, normalizeCavemanLevel
+// used_by: package.json (commandcode.mods), mods/compress.ts, test/caveman.test.ts
+// related: rules/caveman.ts, mods/shared.ts
+// rules: exactly one level block is live at a time; the injected text is byte-stable per level so the prompt cache survives.
+// agent: 2026-11-02 ported from JuliusBrussee/caveman + tersio caveman extension
+
+import type {ModApi} from '@commandcode/harness';
+import {CAVEMAN_DEFAULT, CAVEMAN_LEVELS, cavemanRule, type CavemanLevel} from '../rules/caveman.ts';
+import {readOwnMode, wrapBlock, writeOwnMode, OFF} from './shared.ts';
+
+export const CAVEMAN_STOP_PHRASES = new Set(['stop caveman', 'caveman off']);
+
+const LEVELS = new Set<string>(CAVEMAN_LEVELS);
+
+// Rules: `on` means the default level; anything unrecognised answers null so the caller can print usage.
+export function normalizeCavemanLevel(raw: string): CavemanLevel | 'off' | null {
+	const value = raw.trim().toLowerCase();
+	if (!value || value === 'on') return CAVEMAN_DEFAULT;
+	if (value === 'off' || value === 'stop') return OFF;
+	return LEVELS.has(value) ? (value as CavemanLevel) : null;
+}
+
+export default function (cmd: ModApi): void {
+	cmd.addFlag('caveman', {type: 'string', default: '', description: 'Start mode: lite|full|ultra|megacave-* (default: off)'});
+
+	let mode = readOwnMode(cmd.store);
+
+	// Rules: the setter is the single write path (own command, /compress preset) so the session and the store cannot disagree.
+	function setMode(next: string): void {
+		mode = next;
+		writeOwnMode(cmd.store, next);
+	}
+
+	cmd.expose('setMode', (next: unknown) => {
+		const parsed = typeof next === 'string' ? normalizeCavemanLevel(next) : null;
+		if (!parsed) return false;
+		setMode(parsed);
+		return true;
+	});
+	cmd.expose('getMode', () => mode);
+
+	cmd.addCommand({
+		name: 'caveman',
+		description: 'Toggle terse caveman replies for this session',
+		argumentHint: '[lite|full|ultra|megacave-lite|megacave-full|megacave-ultra|off|status]',
+		handler: ({args}) => {
+			const arg = args.trim().toLowerCase();
+			if (arg === 'status') return {message: `Caveman mode: ${mode}`};
+			const parsed = normalizeCavemanLevel(arg);
+			if (!parsed) {
+				return {message: `Unknown caveman level: ${arg}. Use: ${[...CAVEMAN_LEVELS, 'off', 'status'].join(' | ')}`};
+			}
+			setMode(parsed);
+			return {message: parsed === OFF ? 'Caveman off.' : `Caveman ${parsed} on.`};
+		},
+	});
+
+	cmd.hooks({
+		// Rules: a flag is a per-session override applied at bind — getFlag answers the default at factory time.
+		onSessionStart: () => {
+			const flag = String(cmd.getFlag('caveman') ?? '').trim().toLowerCase();
+			const parsed = flag ? normalizeCavemanLevel(flag) : null;
+			if (parsed) mode = parsed;
+		},
+
+		appendSystemPrompt: () => (mode === OFF ? undefined : wrapBlock('caveman', cavemanRule(mode))),
+
+		// Rules: the stop phrase must be the whole message, so "add a caveman off toggle" never disables it.
+		transformInput: ({text}) => {
+			if (mode === OFF) return undefined;
+			if (!CAVEMAN_STOP_PHRASES.has(text.trim().toLowerCase())) return undefined;
+			setMode(OFF);
+			return {action: 'handled', message: 'Caveman off.'};
+		},
+	});
+}

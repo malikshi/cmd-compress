@@ -1,0 +1,96 @@
+// compress — one preset for all three modes, plus the live status line.
+// exports: default (ModFactory), COMPRESS_PRESETS, presetFor
+// used_by: package.json (commandcode.mods), test/compress.test.ts
+// related: mods/caveman.ts, mods/ponytail.ts, mods/rtk.ts
+// rules: a preset is applied through each mode's exposed setMode, so the three mods stay the only writers of their own state.
+// rules: status reads each sibling's getMode live; reading cmd.store would see only this mod's own file.
+// agent: 2026-11-02 ported from tersio /combo
+
+import type {ModApi} from '@commandcode/harness';
+import {MODES, type ModeName} from './shared.ts';
+
+export interface Preset {
+	readonly caveman: string;
+	readonly ponytail: string;
+	readonly rtk: string;
+}
+
+// Rules: `off` turns all three off; lite/balanced/max escalate the three live levels together.
+export const COMPRESS_PRESETS: Record<string, Preset> = {
+	off: {caveman: 'off', ponytail: 'off', rtk: 'off'},
+	lite: {caveman: 'lite', ponytail: 'lite', rtk: 'on'},
+	balanced: {caveman: 'full', ponytail: 'full', rtk: 'on'},
+	max: {caveman: 'ultra', ponytail: 'ultra', rtk: 'on'},
+};
+
+export function presetFor(raw: string): Preset | null {
+	const key = raw.trim().toLowerCase();
+	if (!key) return COMPRESS_PRESETS.balanced;
+	return key in COMPRESS_PRESETS ? COMPRESS_PRESETS[key] : null;
+}
+
+type Setter = (value: unknown) => boolean;
+type Getter = () => string;
+
+export default function (cmd: ModApi): void {
+	// Rules: use() answers undefined until the sibling mod loads, so every lookup happens at command time, not factory time.
+	const setter = (name: ModeName): Setter | undefined => cmd.use(name, 'setMode') as Setter | undefined;
+	const getter = (name: ModeName): Getter | undefined => cmd.use(name, 'getMode') as Getter | undefined;
+
+	function snapshot(): Record<ModeName, string> {
+		const read = (name: ModeName) => getter(name)?.() ?? '?';
+		return {caveman: read('caveman'), ponytail: read('ponytail'), rtk: read('rtk')};
+	}
+
+	function line(state: Record<ModeName, string>): string {
+		return `caveman=${state.caveman} | ponytail=${state.ponytail} | rtk=${state.rtk}`;
+	}
+
+	cmd.addCommand({
+		name: 'compress',
+		description: 'Set caveman, ponytail and rtk together, or show their state',
+		argumentHint: '[off|lite|balanced|max|status]',
+		handler: ({args}) => {
+			const arg = args.trim().toLowerCase();
+
+			if (!arg || arg === 'status') return {message: `compress: ${line(snapshot())}`};
+
+			if (arg === 'help') {
+				return {
+					message: [
+						'/compress lite      caveman=lite, ponytail=lite, rtk=on',
+						'/compress balanced  caveman=full, ponytail=full, rtk=on',
+						'/compress max       caveman=ultra, ponytail=ultra, rtk=on',
+						'/compress off       all three off',
+						'Each mode still has its own command: /caveman, /ponytail, /rtk',
+					].join('\n'),
+				};
+			}
+
+			const preset = presetFor(arg);
+			if (!preset) return {message: `Unknown preset: ${arg}. Use: off | lite | balanced | max | status`};
+
+			const missing: ModeName[] = [];
+			for (const name of MODES) {
+				const setMode = setter(name);
+				if (!setMode) missing.push(name);
+				else setMode(preset[name]);
+			}
+			const summary = `compress ${arg}: ${line(preset as unknown as Record<ModeName, string>)}`;
+			return {message: missing.length ? `${summary} (not loaded: ${missing.join(', ')})` : summary};
+		},
+	});
+
+	// Rules: one footer segment for all three — three segments would crowd the row the prompt already owns.
+	cmd.hooks({
+		onSessionStart: () => paint(),
+		onRunEnd: () => paint(),
+	});
+
+	function paint(): void {
+		if (!cmd.ui.capabilities.status) return;
+		const state = snapshot();
+		const off = state.caveman === 'off' && state.ponytail === 'off' && state.rtk === 'off';
+		cmd.ui.setStatus(off ? 'compress off' : `caveman=${state.caveman} pony=${state.ponytail} rtk=${state.rtk}`);
+	}
+}
