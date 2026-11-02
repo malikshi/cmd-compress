@@ -121,12 +121,45 @@ Three details worth knowing if you fork this:
 2. **`cmd.getFlag` answers the default at factory time.** Flags are read in `onSessionStart`, after the host binds.
 3. **The injected block is byte-stable per level.** The provider's prompt-prefix cache keys off the system prompt, so a level's text must not change between rounds. A level switch swaps the block rather than appending a second one — the text is wrapped in `<caveman>`, `<ponytail>`, or `<rtk>` for exactly that reason.
 
+## Benchmark
+
+Two benches, both runnable. Full protocol: [docs/BENCHMARK.md](./docs/BENCHMARK.md). Measured numbers: [docs/BENCHMARK-RESULTS.md](./docs/BENCHMARK-RESULTS.md).
+
+```bash
+npm run bench                     # exact half — rtk byte reduction, rewrite latency, prompt overhead
+npm run bench:prompt -- 5 <model> # live half — reply tokens per mode against base
+```
+
+The first is deterministic and free: the same fixtures through the same `rtk` binary give the same bytes on any machine. The second spends real tokens and depends on the model, so it reports medians and a run count.
+
+### What the measurements actually found
+
+Two full runs, 900 headless sessions, `nexrouter/deepseek-v4.1-flash`. The most important result is the variance:
+
+| Claim | Result |
+|---|---|
+| Shell output gets smaller | **Conditionally, exactly.** 80.5% on file-clustered grep, 71.3% on `find`, **0%** when hits are one-per-file |
+| A mode adds prompt overhead | **Yes, reproducible.** Within 10% of the static estimate for one mode; presets ~20% above it |
+| Caveman shortens replies | **Only `ultra`, ~12–13%**, and only on open prompts. `full` cost tokens in both runs |
+| The mode pays off in one turn | **No** — `ultra` saves ~50–70 reply tokens against a 232-token block |
+| Any dollar saving | **Not claimed** — no price table, no bill figure |
+
+Three things worth knowing before you trust a benchmark table, this one included:
+
+- **Run-to-run variance beats most of the effects.** Base reply median moved 407 → 525 (+29%) between two runs of the same configuration, and only 4 of 9 mode deltas kept their sign. 5 runs is not enough to rank these modes to ±10%.
+- **A length-pinned prompt measures the prompt, not the mode.** On "in three sentences" prompts, `full` and `ultra` swap places versus the open prompts. Both surfaces are published so the reversal is visible.
+- **Ponytail is measured on the wrong axis.** Reply tokens say what the ruleset costs (~+536/turn), not whether the code is leaner.
+
+The exact, quotable numbers are the filter bytes and the prompt overhead. The live reply-token rows are directional at best.
+
 ## Known limits
 
 - **Caveman does not shorten tool output.** It changes the reply voice. Shell output is rtk's job.
+- **Caveman may not shorten replies at all on your model.** Measured here, only `ultra` saved (~12%) and `full` cost tokens in both runs. Treat the mode names as voice settings, not as a savings guarantee.
+- **The live benchmark cannot rank modes tightly.** Two runs of the same configuration disagreed on 5 of 9 cases. Quote the filter bytes and the prompt overhead; treat reply-token deltas as directional.
 - **The rtk filter is heuristic.** `rtk pipe -f grep` groups and truncates; a very unusual grep layout can come back less legible than the original. `rtk` mode is off by default and `/rtk off` stops it immediately.
 - **A compressed reply can read as curt.** That is the mode working. `/caveman off` restores normal prose mid-session.
-- **No measured savings are claimed here.** Tersio publishes its own benchmark; this package ports the modes, not the measurements. Measure your own with `rtk gain` for the shell half.
+- **No dollar figure is claimed.** Tersio publishes its own benchmark; this package ports the modes. For the shell half, `rtk gain` reports what rtk itself saved on your machine.
 
 ## Develop
 
@@ -147,7 +180,9 @@ mods/
 rules/
   caveman.ts       the six level blocks
   ponytail.ts      the three level blocks
-test/              46 tests
+bench/            exact (bytes) + live (reply tokens) benchmarks
+docs/             BENCHMARK.md, BENCHMARK-RESULTS.md
+test/              67 tests
 ```
 
 ## Attribution

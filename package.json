@@ -37,6 +37,8 @@
 	},
 	"scripts": {
 		"test": "node --test test/*.test.ts",
-		"verify": "node --test test/*.test.ts && node scripts/verify-mods.ts"
+		"verify": "node --test test/*.test.ts && node scripts/verify-mods.ts",
+		"bench": "node bench/cli.ts output",
+		"bench:prompt": "node bench/cli.ts prompt"
 	}
 }
