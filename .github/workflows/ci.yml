@@ -22,6 +22,8 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm ci
+      - name: Install rtk (real-binary tests)
+        run: node scripts/install-rtk.mjs
       - name: Typecheck
         run: npm run typecheck
       - name: Tests

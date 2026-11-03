@@ -246,3 +246,12 @@ test('splitSegments: reassembly preserves every non-whitespace character', () =>
 		}
 	}
 });
+
+// Rules: this file's whole value is running against a real binary. When rtk is absent every test here skips, and a skipped suite looks exactly like a passing one in a summary line — which is how this coverage went quiet before CI installed rtk. The guard turns that silence into a visible note instead of a hidden skip, and CI fails the install step rather than reaching here without the binary.
+test('rtk-shapes: note when the real binary is absent, so the skips are never invisible', t => {
+	if (hasRtk()) {
+		assert.ok(true, 'rtk is installed; every test in this file ran');
+		return;
+	}
+	t.diagnostic('rtk is not installed — this file skipped all of its real-binary tests. Run `node scripts/install-rtk.mjs`.');
+});
