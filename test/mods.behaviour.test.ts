@@ -67,6 +67,43 @@ test('caveman: an ordinary sentence mentioning the mode does not turn it off', (
 	assert.equal(fake.hooks[0].transformInput?.({text: 'add a normal mode toggle'}), undefined);
 });
 
+// Rules: the host stops the transformInput chain at the first `handled`, so `normal mode` must turn the siblings off itself or they keep running.
+test('caveman: "normal mode" turns off every reachable sibling, not just caveman', () => {
+	const cavemanFake = load(caveman);
+	const ponytailFake = load(ponytail);
+	const rtkFake = load(rtk);
+	cavemanFake.cmd.use = (mod: string, name: string) => {
+		const source = mod === 'ponytail' ? ponytailFake : mod === 'rtk' ? rtkFake : cavemanFake;
+		return source.exposed.get('probe')?.get(name);
+	};
+
+	runHandler(cavemanFake.commands, 'caveman', 'full');
+	runHandler(ponytailFake.commands, 'ponytail', 'ultra');
+	runHandler(rtkFake.commands, 'rtk', 'on');
+	assert.notEqual(appends(cavemanFake), '');
+	assert.notEqual(appends(ponytailFake), '');
+
+	const result = cavemanFake.hooks[0].transformInput?.({text: 'normal mode'}) as {action: string};
+	assert.equal(result.action, 'handled');
+	assert.equal(appends(cavemanFake), '', 'caveman is off');
+	assert.equal(appends(ponytailFake), '', 'ponytail followed through its exposed setMode');
+	assert.equal(appends(rtkFake), '', 'rtk followed too');
+});
+
+// Rules: the phrase must work when caveman and ponytail are already off, so a lone `rtk` cannot outlive it.
+test('caveman: "normal mode" turns off a sibling that is the only mode running', () => {
+	const cavemanFake = load(caveman);
+	const rtkFake = load(rtk);
+	cavemanFake.cmd.use = (mod: string, name: string) => (mod === 'rtk' ? rtkFake.exposed.get('probe')?.get(name) : undefined);
+
+	runHandler(rtkFake.commands, 'rtk', 'on');
+	assert.notEqual(appends(rtkFake), '');
+
+	const result = cavemanFake.hooks[0].transformInput?.({text: 'normal mode'}) as {action: string};
+	assert.equal(result.action, 'handled');
+	assert.equal(appends(rtkFake), '', 'rtk is off even though caveman itself was already off');
+});
+
 test('caveman: status reports the live mode and unknown levels print usage', () => {
 	const fake = load(caveman);
 	runHandler(fake.commands, 'caveman', 'ultra');
@@ -128,7 +165,7 @@ test('rtk: on rewrites a shell command through rtk and injects guidance', async 
 		toolName: 'shell_command',
 		input: {command: 'git status'},
 	})) as {input: {command: string}};
-	assert.equal(result.input.command, 'rtk git status');
+	assert.match(result.input.command, /rtk'? git status$/, 'the rewrite is pinned to the resolved absolute path');
 	assert.match(seen[0], /rewrite git status$/);
 	assert.match(appends(fake), /<rtk>/);
 });
@@ -239,7 +276,7 @@ test('rtk: exit 3 still supplies a rewrite', async () => {
 		toolName: 'shell_command',
 		input: {command: 'ls'},
 	})) as {input: {command: string}};
-	assert.equal(result.input.command, 'rtk ls');
+	assert.match(result.input.command, /rtk'? ls$/, 'the rewrite is pinned to the resolved absolute path');
 });
 
 // Rules: `npm test` has no rewrite, so the only way its output is ever condensed is the auto-detect pass.

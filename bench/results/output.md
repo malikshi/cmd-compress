@@ -1,19 +1,23 @@
 # Command output benchmark
 
-Measured: 2026-11-02T23:25:41.640Z
+Measured: 2026-11-03T06:09:34.742Z
 rtk binary: /root/.bun/bin/rtk
 
 Byte ratios reproduce across machines. Milliseconds do not — compare percentages.
 
 | Case | Shape | Bytes in | Bytes out | Saved | Mean | Fidelity |
 |---|---|---:|---:|---:|---:|---|
-| grep, clustered | 240 matches in 6 files (40 per file) | 16,130 | 3,148 | 80.5% | 13 ms | 6/6 files named, 60 of 240 match lines kept |
-| grep, scattered | 240 matches in 240 files (1 per file) | 14,874 | 14,874 | 0.0% | 14 ms | passed through unchanged (240 matches, 240 files) |
-| find | 260 paths in 10 dirs | 6,092 | 1,748 | 71.3% | 13 ms | 10/10 dirs named, header claims 260 files in 10 dirs |
+| grep, clustered | 240 matches in 6 files (40 per file) | 16,130 | 3,148 | 80.5% | 16 ms | 6/6 files named, 60 of 240 match lines kept |
+| grep, scattered | 240 matches in 240 files (1 per file) | 14,874 | 14,874 | 0.0% | 16 ms | passed through unchanged (240 matches, 240 files) |
+| find | 260 paths in 10 dirs | 6,092 | 1,748 | 71.3% | 14 ms | 10/10 dirs named, header claims 260 files in 10 dirs |
+| glob tool | 260 paths + Found header | 4,326 | 1,149 | 73.4% | 14 ms | header kept |
+| glob tool, truncated | 260 paths + truncation notice | 5,021 | 1,345 | 73.2% | 14 ms | header kept, trailer kept |
+| grep tool, truncated | 240 matches + pagination notice | 15,540 | 3,183 | 79.5% | 14 ms | trailer kept |
+| shell tool | cargo failure + Exit code head | 2,769 | 324 | 88.3% | 13 ms | header kept |
 
 | Case | Commands | Rewritten | Mean | p95 |
 |---|---:|---:|---:|---:|
-| rewrite lookup | 12 | 12 | 91.4 ms | 205.0 ms |
+| rewrite lookup | 12 | 12 | 78.4 ms | 100.0 ms |
 
 ## Prompt overhead per mode
 

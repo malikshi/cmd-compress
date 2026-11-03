@@ -60,6 +60,21 @@ Copyright (c) 2026 DietrichGebert
 `rtk rewrite` exit-code contract (0/1/2/3), fail open on every path, and the
 agent-facing awareness text from `hooks/rtk-awareness*.md`.
 
+Three things here are this package's own, not upstream:
+
+- **The host-envelope split** (`splitSegments`). Upstream hooks only rewrite a
+  command; they never post-process a tool result this host wrapped. Command
+  Code opens a `glob` with `Found N files`, closes a truncated result with a
+  pagination or truncation notice, and opens a `shell_command` result with
+  `Exit code: N`. rtk treats those as noise. This package cuts them off before
+  filtering and re-attaches them verbatim.
+- **`pinBinary`.** `rtk rewrite` answers a bare `rtk …`, but this mod can find
+  rtk in `~/.bun/bin` when the host shell's `PATH` does not include it. Pinning
+  each command-position `rtk` to the resolved absolute path is what stops a
+  rewrite from turning a working command into `rtk: not found`.
+- **The auto-detect output pass** for shell calls that got no rewrite, and the
+  `grep`/`glob` result filter, both driven from `rtk pipe`.
+
 **This package does not vendor or reimplement RTK.** It shells out to an `rtk`
 binary the user installs separately. The Rust source is not copied. See the
 upstream repository for RTK's own license terms, which include a BUSL-1.1

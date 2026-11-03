@@ -1,10 +1,11 @@
 // shared — mode lookup, prompt-block helpers, and binary/path utilities for the four mods.
-// exports: MODES, OFF, readOwnMode, writeOwnMode, wrapBlock, stripBlock, promptHas, resolveBin, shortPaths
+// exports: MODES, OFF, DEFAULT_MODE, readOwnMode, writeOwnMode, wrapBlock, stripBlock, promptHas, resolveBin, shortPaths, turnOffSiblings
 // used_by: mods/*.ts, test/*.test.ts
 // related: rules/caveman.ts, rules/ponytail.ts
 // rules: cmd.store is namespaced per mod, so a mod persists ONLY its own key; a sibling's mode is read through cmd.use.
 // rules: prompt text must be byte-stable per mode so the provider prefix cache survives across rounds.
 // agent: 2026-11-02 initial — per-mod store key after learning each mod gets its own file
+// agent: 2026-11-03 turnOffSiblings — "normal mode" must end every mode, and transformInput short-circuits on handled
 
 import {accessSync, constants, existsSync} from 'node:fs';
 import {delimiter, join} from 'node:path';
@@ -14,6 +15,9 @@ export const MODES = ['caveman', 'ponytail', 'rtk'] as const;
 export type ModeName = (typeof MODES)[number];
 
 export const OFF = 'off';
+
+// Rules: both upstream references use this one phrase to mean "stop every mode", so it is the shared trigger for turning siblings off, not a caveman-only alias.
+export const NORMAL_MODE = 'normal mode';
 
 // Rules: a fresh install starts with every mode off — compression is opt-in, so nothing changes silently.
 export const DEFAULT_MODE = OFF;
@@ -43,8 +47,23 @@ export function writeOwnMode(store: StoreLike, value: string): void {
 		});
 }
 
-/* ---------------------------------------------------------------- prompt text */
+type Setter = (value: unknown) => boolean;
 
+// Rules: `normal mode` is one phrase for every mode, but the host's transformInput chain stops at the first `handled`. So the mod that sees it turns its SIBLINGS off through their exposed setMode, and only then answers handled — otherwise the phrase would end one mode and leave the rest running.
+export function turnOffSiblings(use: (mod: string, name: string) => unknown, self: ModeName): string[] {
+	const off: string[] = [];
+	for (const name of MODES) {
+		if (name === self) continue;
+		const setMode = use(name, 'setMode') as Setter | undefined;
+		if (setMode) {
+			setMode(OFF);
+			off.push(name);
+		}
+	}
+	return off;
+}
+
+/* ---------------------------------------------------------------- prompt text */
 export function promptHas(prompt: string, marker: string): boolean {
 	return prompt.includes(marker);
 }

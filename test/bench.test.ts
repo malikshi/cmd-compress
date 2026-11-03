@@ -8,7 +8,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {estimateTokens, formatPct, median, percentile, reduction, table} from '../bench/lib/stats.ts';
-import {makeGrepClustered, makeGrepScattered, makeFindOutput, REWRITE_COMMANDS} from '../bench/lib/fixtures.ts';
+import {makeGrepClustered, makeGrepScattered, makeFindOutput, REWRITE_COMMANDS, makeGlobToolOutput, makeGlobToolTruncated, makeGrepToolTruncated, makeShellToolOutput} from '../bench/lib/fixtures.ts';
 import {CODE_PROMPTS, PROSE_PROMPTS, checkCode, checkProse} from '../bench/lib/prompts.ts';
 import {readUsage, writePromptResult} from '../bench/prompt.ts';
 import {writeOutputResult} from '../bench/output.ts';
@@ -80,6 +80,14 @@ test('fixtures: the rewrite list covers real agent commands and has no duplicate
 	assert.equal(new Set(REWRITE_COMMANDS).size, REWRITE_COMMANDS.length);
 	assert.ok(REWRITE_COMMANDS.includes('git status'));
 	assert.ok(REWRITE_COMMANDS.length >= 12);
+});
+
+// Rules: the host-shape fixtures exist because the raw ones hid an envelope bug — a filter that drops the `Found N files` header or the pagination notice deletes information, however many bytes it saves.
+test('fixtures: the host tool shapes carry their envelope', () => {
+	assert.match(makeGlobToolOutput(), /^Found 260 files\n\.\/src\/d0\/f0\.ts/);
+	assert.match(makeGlobToolTruncated(), /^Found 100 files\n  \.\/src\/d0\/f0\.ts/);
+	assert.match(makeGrepToolTruncated(), /\[Showing results with pagination = limit: 240\]\n$/);
+	assert.match(makeShellToolOutput(), /^Exit code: 1 \(test failure\)\n/);
 });
 
 test('checkProse: every group must match, a group is an OR', () => {

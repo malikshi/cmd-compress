@@ -13,7 +13,17 @@ import {join} from 'node:path';
 import {CAVEMAN_LEVELS, cavemanRule} from '../rules/caveman.ts';
 import {PONYTAIL_LEVELS, ponytailRule} from '../rules/ponytail.ts';
 import {resolveBin} from '../mods/shared.ts';
-import {makeFindOutput, makeGrepClustered, makeGrepScattered, REWRITE_COMMANDS} from './lib/fixtures.ts';
+import {splitSegments} from '../mods/rtk.ts';
+import {
+	makeFindOutput,
+	makeGlobToolOutput,
+	makeGlobToolTruncated,
+	makeGrepClustered,
+	makeGrepScattered,
+	makeGrepToolTruncated,
+	makeShellToolOutput,
+	REWRITE_COMMANDS,
+} from './lib/fixtures.ts';
 import {estimateTokens, formatBytes, formatPct, median, percentile, reduction} from './lib/stats.ts';
 
 export interface FilterResult {
@@ -76,25 +86,40 @@ export const FILTER_CASES = [
 	},
 ] as const;
 
+// Rules: the raw fixtures above are rtk's own input shape. These are Command Code's — a header, a trailer, and an exit status around the same body. The envelope must survive, so each row asserts it.
+export const ENVELOPE_CASES = [
+	{case: 'glob tool', filter: 'find', tool: 'glob', shape: '260 paths + Found header', build: () => makeGlobToolOutput()},
+	{case: 'glob tool, truncated', filter: 'find', tool: 'glob', shape: '260 paths + truncation notice', build: () => makeGlobToolTruncated()},
+	{case: 'grep tool, truncated', filter: 'grep', tool: 'grep', shape: '240 matches + pagination notice', build: () => makeGrepToolTruncated()},
+	{case: 'shell tool', filter: null, tool: 'shell_command', shape: 'cargo failure + Exit code head', build: () => makeShellToolOutput()},
+] as const;
+
 // Rules: rtk pipe takes stdin only, so the fixture is redirected from a temp file rather than interpolated into a command line.
-function condense(bin: string, filter: string, input: string): {stdout: string; ms: number} | null {
+function pipeThrough(bin: string, filter: string | null, input: string): string | null {
 	let dir: string | undefined;
 	try {
 		dir = mkdtempSync(join(tmpdir(), 'cmd-compress-bench-'));
 		const file = join(dir, 'in.txt');
 		writeFileSync(file, input, 'utf8');
-		const started = process.hrtime.bigint();
-		const stdout = execFileSync('/bin/sh', ['-c', `"${bin}" pipe -f ${filter} < "${file}"`], {
-			encoding: 'utf8',
-			timeout: 10_000,
-		});
-		const ms = Number(process.hrtime.bigint() - started) / 1_000_000;
-		return {stdout, ms};
+		const flags = filter ? `-f ${filter} ` : '';
+		return execFileSync('/bin/sh', ['-c', `"${bin}" pipe ${flags}< "${file}"`], {encoding: 'utf8', timeout: 10_000});
 	} catch {
 		return null;
 	} finally {
 		if (dir) rmSync(dir, {recursive: true, force: true});
 	}
+}
+
+// Rules: this mirrors the mod's own condense() step exactly — split the host envelope off, filter only the body, put the envelope back. Measuring a path production does not run is what let the envelope bug through.
+function condenseTool(bin: string, filter: string | null, tool: string, input: string): {stdout: string; fidelity: string} | null {
+	const {head, body, tail} = splitSegments(tool, input);
+	const filtered = pipeThrough(bin, filter, body);
+	if (filtered === null) return null;
+	const composed = `${head}${filtered}${tail}`;
+	const keptHead = head === '' || composed.startsWith(head);
+	const keptTail = tail === '' || composed.endsWith(tail);
+	const notes = [head.trim() ? `header ${keptHead ? 'kept' : 'LOST'}` : '', tail.trim() ? `trailer ${keptTail ? 'kept' : 'LOST'}` : ''].filter(Boolean);
+	return {stdout: composed, fidelity: notes.length ? notes.join(', ') : 'no envelope'};
 }
 
 // Rules: fidelity is asserted, not assumed — a filter that drops a whole file is a failed run and says so.
@@ -177,12 +202,11 @@ export function runOutputBench(): OutputBenchResult {
 			const samples: number[] = [];
 			let output = '';
 			for (let index = 0; index < FILTER_SAMPLES; index += 1) {
-				const result = condense(bin, testCase.filter, input);
-				if (!result) break;
-				output = result.stdout;
-				samples.push(result.ms);
+				const started = process.hrtime.bigint();
+				output = pipeThrough(bin, testCase.filter, input) ?? '';
+				samples.push(Number(process.hrtime.bigint() - started) / 1_000_000);
 			}
-			if (samples.length === 0) continue;
+			if (!output) continue;
 			const outputBytes = Buffer.byteLength(output, 'utf8');
 			filters.push({
 				case: testCase.case,
@@ -195,6 +219,37 @@ export function runOutputBench(): OutputBenchResult {
 				p95Ms: percentile(samples, 95),
 				samples: samples.length,
 				fidelity: testCase.filter === 'find' ? findFidelity(input, output) : grepFidelity(input, output),
+			});
+		}
+
+		// Rules: measured through the mod's own split-then-filter path, so the number reflects what a session actually gets.
+		for (const testCase of ENVELOPE_CASES) {
+			const input = testCase.build();
+			const inputBytes = Buffer.byteLength(input, 'utf8');
+			const samples: number[] = [];
+			let output = '';
+			let fidelity = 'unmeasured';
+			for (let index = 0; index < FILTER_SAMPLES; index += 1) {
+				const started = process.hrtime.bigint();
+				const result = condenseTool(bin, testCase.filter, testCase.tool, input);
+				samples.push(Number(process.hrtime.bigint() - started) / 1_000_000);
+				if (!result) break;
+				output = result.stdout;
+				fidelity = result.fidelity;
+			}
+			if (!output) continue;
+			const outputBytes = Buffer.byteLength(output, 'utf8');
+			filters.push({
+				case: testCase.case,
+				filter: testCase.filter ?? 'auto',
+				shape: testCase.shape,
+				inputBytes,
+				outputBytes,
+				reduction: reduction(inputBytes, outputBytes),
+				meanMs: median(samples),
+				p95Ms: percentile(samples, 95),
+				samples: samples.length,
+				fidelity,
 			});
 		}
 	}

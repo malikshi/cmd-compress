@@ -71,3 +71,40 @@ export const REWRITE_COMMANDS = [
 	'cargo test',
 	'docker ps',
 ];
+
+/* --------------------------------------------------- the host's own tool shapes */
+
+// Rules: these are the exact envelopes Command Code wraps a result in — `glob` opens with a `Found N files` line, `grep` closes with a pagination notice, and `shell_command` opens with the exit status. Measuring only raw `path:line:text` hid that rtk folds the envelope away.
+
+export function makeGlobToolOutput(files = 260, dirs = 10): string {
+	const paths = Array.from({length: files}, (_, index) => `./src/d${index % dirs}/f${index}.ts`);
+	return `Found ${files} files\n${paths.join('\n')}\n`;
+}
+
+export function makeGlobToolTruncated(files = 260, dirs = 10): string {
+	const paths = Array.from({length: files}, (_, index) => `  ./src/d${index % dirs}/f${index}.ts`);
+	const notice = '(Results are truncated: showing 1-100 of 382 matches, sorted by modification time. Consider using a more specific path or pattern, or retry with offset=100 for the next page.)';
+	return `Found 100 files\n${paths.join('\n')}\n${notice}`;
+}
+
+export function makeGrepToolTruncated(matches = 240, files = 6): string {
+	const lines = Array.from({length: matches}, (_, index) => `src/d${index % files}/handlers.ts:${index + 1}:  const result = compute(input, options);`);
+	return `${lines.join('\n')}\n\n[Showing results with pagination = limit: ${matches}]\n`;
+}
+
+export function makeShellToolOutput(): string {
+	const body = [
+		'test result: FAILED. 120 passed; 1 failed; 0 ignored',
+		'',
+		'failures:',
+		'    tests::fails_here',
+		'',
+		'---- tests::fails_here stdout ----',
+		"thread 'tests::fails_here' panicked at src/lib.rs:42:5:",
+		'assertion `left == right` failed',
+		'  left: 1',
+		' right: 2',
+		...Array.from({length: 60}, (_, index) => `    note line ${index} that a filter folds away`),
+	].join('\n');
+	return `Exit code: 1 (test failure)\n${body}\n`;
+}

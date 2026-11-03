@@ -7,9 +7,10 @@
 
 import type {ModApi} from '@commandcode/harness';
 import {CAVEMAN_DEFAULT, CAVEMAN_LEVELS, cavemanRule, type CavemanLevel} from '../rules/caveman.ts';
-import {readOwnMode, wrapBlock, writeOwnMode, OFF} from './shared.ts';
+import {NORMAL_MODE, OFF, readOwnMode, turnOffSiblings, wrapBlock, writeOwnMode} from './shared.ts';
 
-export const CAVEMAN_STOP_PHRASES = new Set(['stop caveman', 'caveman off']);
+// Rules: `normal mode` is the upstream phrase for the same thing, so it must work too; the whole message has to be the phrase.
+export const CAVEMAN_STOP_PHRASES = new Set(['stop caveman', 'caveman off', NORMAL_MODE]);
 
 const LEVELS = new Set<string>(CAVEMAN_LEVELS);
 
@@ -67,9 +68,16 @@ export default function (cmd: ModApi): void {
 		appendSystemPrompt: () => (mode === OFF ? undefined : wrapBlock('caveman', cavemanRule(mode))),
 
 		// Rules: the stop phrase must be the whole message, so "add a caveman off toggle" never disables it.
+		// Rules: `normal mode` ends EVERY mode, so it is answered even when caveman is already off — otherwise it would fall through the chain and leave a lone `rtk` running. The host stops the chain at the first `handled`, so the siblings are turned off here rather than by their own hooks.
 		transformInput: ({text}) => {
+			const phrase = text.trim().toLowerCase();
+			if (phrase === NORMAL_MODE) {
+				turnOffSiblings(cmd.use, 'caveman');
+				setMode(OFF);
+				return {action: 'handled', message: 'All compression modes off.'};
+			}
 			if (mode === OFF) return undefined;
-			if (!CAVEMAN_STOP_PHRASES.has(text.trim().toLowerCase())) return undefined;
+			if (!CAVEMAN_STOP_PHRASES.has(phrase)) return undefined;
 			setMode(OFF);
 			return {action: 'handled', message: 'Caveman off.'};
 		},

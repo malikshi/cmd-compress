@@ -7,9 +7,10 @@
 
 import type {ModApi} from '@commandcode/harness';
 import {PONYTAIL_DEFAULT, PONYTAIL_LEVELS, ponytailRule, type PonytailLevel} from '../rules/ponytail.ts';
-import {readOwnMode, wrapBlock, writeOwnMode, OFF} from './shared.ts';
+import {NORMAL_MODE, OFF, readOwnMode, turnOffSiblings, wrapBlock, writeOwnMode} from './shared.ts';
 
-export const PONYTAIL_STOP_PHRASES = new Set(['stop ponytail', 'ponytail off']);
+// Rules: `normal mode` is the upstream phrase for the same thing, so it must work too; the whole message has to be the phrase.
+export const PONYTAIL_STOP_PHRASES = new Set(['stop ponytail', 'ponytail off', NORMAL_MODE]);
 
 const LEVELS = new Set<string>(PONYTAIL_LEVELS);
 
@@ -63,9 +64,16 @@ export default function (cmd: ModApi): void {
 
 		appendSystemPrompt: () => (mode === OFF ? undefined : wrapBlock('ponytail', ponytailRule(mode))),
 
+		// Rules: `normal mode` ends EVERY mode, so it is answered even when ponytail is already off; caveman normally handles it first, and this is the fallback when caveman is not loaded.
 		transformInput: ({text}) => {
+			const phrase = text.trim().toLowerCase();
+			if (phrase === NORMAL_MODE && mode !== OFF) {
+				turnOffSiblings(cmd.use, 'ponytail');
+				setMode(OFF);
+				return {action: 'handled', message: 'All compression modes off.'};
+			}
 			if (mode === OFF) return undefined;
-			if (!PONYTAIL_STOP_PHRASES.has(text.trim().toLowerCase())) return undefined;
+			if (!PONYTAIL_STOP_PHRASES.has(phrase)) return undefined;
 			setMode(OFF);
 			return {action: 'handled', message: 'Ponytail off.'};
 		},

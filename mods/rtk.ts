@@ -1,11 +1,14 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, filterNameFor, parseRtkVersion, isSupportedVersion, classifyRewrite
-// used_by: package.json (commandcode.mods), mods/compress.ts, test/rtk.test.ts
+// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, filterNameFor, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
+// used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
 // rules: exit 2 is a deny from rtk's own contract: a message on stdout names the rule that blocked it, so it becomes a block; empty means a Claude-only deny rule the host does not own, so it passes.
+// rules: the host's own envelope — a `Found N files` header, a pagination notice, an `Exit code:` line — is split off before filtering and re-attached verbatim. rtk folds those as noise; they carry the count, the truncation, and the failure.
+// rules: the emitted `rtk` is pinned to the resolved absolute path. rtk often lives in ~/.bun/bin, which the host shell may not have on PATH, so a bare name would turn a working command into `rtk: not found`.
 // agent: 2026-11-02 ported from rtk-ai/rtk hooks/pi/rtk.ts and tersio extensions/rtk
 // agent: 2026-11-02 honour exit 2 as a deny, add auto-detect output condensing for unrewritten shell calls, drop the ignored exec `timeout` for an AbortController, add gain + version reporting
+// agent: 2026-11-03 envelope-preserving filter (splitSegments + condense), pinBinary against off-PATH rtk, drop the dead `rg` mapping, consume the rewritten-call marker before every early return
 
 import type {ModApi} from '@commandcode/harness';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -23,10 +26,67 @@ export const MIN_SUPPORTED_RTK_MINOR = 23;
 
 const FILTER_TIMEOUT_MS = 5000;
 
-const FILTER_BY_TOOL: Record<string, string> = {grep: 'grep', glob: 'find', rg: 'grep'};
+const FILTER_BY_TOOL: Record<string, string> = {grep: 'grep', glob: 'find'};
 
 export function filterNameFor(toolName: string): string | undefined {
 	return FILTER_BY_TOOL[toolName];
+}
+
+/* ------------------------------------------------------------ tool envelopes */
+
+export interface Segments {
+	readonly head: string;
+	readonly body: string;
+	readonly tail: string;
+}
+
+// Rules: the last lines of a Command Code result often carry the truth the body hides: `[Showing results with pagination = …]` and `(Results are truncated: showing 1-100 of 382 …)` mean the list is incomplete, `(Search timed out …)` means it may be wrong, and `Command aborted` means it did not finish. rtk folds all of them away as noise, so they are cut off before the filter and re-attached after it.
+// Rules: anchored to the end of the whole result, not to any line end — a notice that merely appears mid-output is body text and must be filtered with it.
+const TRAILER = new RegExp(
+	'\\n*(?:' +
+		'\\[Showing results with pagination = [^\\]\\n]*\\]' +
+		'|\\(Results are truncated: [^)\\n]*\\)' +
+		'|\\(Search timed out[^)\\n]*\\)' +
+		'|Found \\d+ total occurrences? across \\d+ files?\\.' +
+		'|Command (?:aborted|timed out after \\d+\\s?ms)' +
+		')[\\s]*$',
+);
+
+// Rules: `formatShellCommandResult` puts the exit status and the signal on the first lines, before any output.
+const SHELL_HEAD = /^(?:(?:Exit code|Signal):[^\n]*\n)+/;
+
+// Rules: `glob` prints `Found N files` and then one indented path per line. The find filter reads that header line as a path, so it is split off rather than fed in.
+const GLOB_HEAD = /^Found \d+ files?[^\n]*\n/;
+
+// Rules: a result is split into the envelope the host wrote and the body rtk should condense; only the body is ever filtered, so no host information is lost.
+// Rules: the tail keeps the host's own separator, capped at one blank line — enough to keep the notice visually separate without carrying a run of blank lines the filter just folded.
+function tailFrom(matched: string): string {
+	const blank = matched.startsWith('\n\n') ? '\n\n' : '\n';
+	return `${blank}${matched.trimStart()}`;
+}
+
+export function splitSegments(toolName: string, text: string): Segments {
+	if (toolName === 'glob') {
+		const head = GLOB_HEAD.exec(text);
+		if (head) {
+			const rest = text.slice(head[0].length);
+			const trailer = TRAILER.exec(rest);
+			if (!trailer) return {head: head[0], body: rest, tail: ''};
+			return {head: head[0], body: rest.slice(0, trailer.index), tail: tailFrom(trailer[0])};
+		}
+	}
+	const trailer = TRAILER.exec(text);
+	if (trailer) {
+		const body = text.slice(0, trailer.index);
+		const head = SHELL_HEAD.exec(body);
+		const tail = tailFrom(trailer[0]);
+		return head ? {head: head[0], body: body.slice(head[0].length), tail} : {head: '', body, tail};
+	}
+	if (toolName === 'shell_command') {
+		const head = SHELL_HEAD.exec(text);
+		if (head) return {head: head[0], body: text.slice(head[0].length), tail: ''};
+	}
+	return {head: '', body: text, tail: ''};
 }
 
 export type RtkVersion = {major: number; minor: number; patch: number};
@@ -68,6 +128,17 @@ export function shouldRewrite(command: string): boolean {
 	if (/^rtk\s/.test(trimmed)) return false;
 	if (/^RTK_DISABLED=/.test(trimmed)) return false;
 	return true;
+}
+
+// Rules: `rtk rewrite` answers a bare `rtk …`, which the host shell resolves from ITS PATH. This mod can find rtk in ~/.bun/bin when that directory is not on PATH, so the bare name would run as `rtk: not found` and turn a working command into a failure. Pin each command-position `rtk` to the resolved absolute path.
+// Rules: a command position is the start of a segment (`&&`, `||`, `;`, `|`), the first word after a run of `VAR=value` assignments, and the first word after `env` and its own assignments — rtk emits all three (`FOO=1 rtk ls`, `env FOO=1 rtk git status`). An argument that merely contains the word (`git commit -m "use rtk"`) is data and stays untouched.
+export function pinBinary(command: string, bin: string): string {
+	const quoted = `'${bin.replace(/'/g, `'\\''`)}'`;
+	const prefix = '(?:[ \\t]*[A-Za-z_][A-Za-z0-9_]*=\\S+[ \\t]+)*';
+	return command.replace(
+		new RegExp(`(^|&&|\\|\\||[;|])([ \\t]*(?:env[ \\t]+)?${prefix})rtk(?=[ \\t]|$)`, 'g'),
+		(_match, lead: string, before: string) => `${lead}${before}${quoted}`,
+	);
 }
 
 // Rules: grouping is applied by hand because toLocaleString varies with the host locale, so the message would differ per machine.
@@ -178,6 +249,15 @@ export default function (cmd: ModApi): void {
 		}
 	}
 
+	// Rules: only the body is condensed; the host's own header and trailer are re-attached verbatim, so an exit status or a truncation notice cannot be folded away.
+	async function condense(toolName: string, filter: string | null, text: string): Promise<string | null> {
+		const {head, body, tail} = splitSegments(toolName, text);
+		if (body.trim().length < MIN_FILTER_BYTES) return null;
+		const filtered = await filterThroughRtk(filter, body);
+		if (!filtered) return null;
+		return `${head}${filtered}${tail}`;
+	}
+
 	function textOf(result: unknown): string | null {
 		if (!Array.isArray(result) || result.length === 0) return null;
 		const parts = result as Array<{type?: string; text?: string}>;
@@ -249,10 +329,13 @@ export default function (cmd: ModApi): void {
 			}
 			if (verdict.kind !== 'rewrite') return undefined;
 			if (typeof toolCallId === 'string' && toolCallId) rewrittenCalls.add(toolCallId);
-			return {input: {...input, command: verdict.command}};
+			return {input: {...input, command: pinBinary(verdict.command, bin)}};
 		},
 
 		afterToolCall: async ({toolCallId, toolName, result, isError}) => {
+			// Rules: the marker is consumed before any early return, so a rewritten call whose output was too small to filter does not leave its id behind.
+			if (rewrittenCalls.size > 256) rewrittenCalls.clear();
+			const alreadyRewritten = wasRewritten(toolCallId);
 			if (mode === OFF || isError || !supported()) return undefined;
 			const text = textOf(result);
 			if (text === null || text.length < MIN_FILTER_BYTES) return undefined;
@@ -261,16 +344,15 @@ export default function (cmd: ModApi): void {
 			const filter = filterNameFor(toolName);
 			if (filter) {
 				if (cmd.getFlag('rtk-filter') === false) return undefined;
-				const filtered = await filterThroughRtk(filter, text);
+				const filtered = await condense(toolName, filter, text);
 				return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 			}
 
 			// Shell output rtk did not rewrite still gets auto-detected: `npm test` has no rewrite but cargo-style output does.
 			if (toolName !== 'shell_command') return undefined;
 			if (cmd.getFlag('rtk-shell') === false) return undefined;
-			if (rewrittenCalls.size > 256) rewrittenCalls.clear();
-			if (wasRewritten(toolCallId)) return undefined;
-			const filtered = await filterThroughRtk(null, text);
+			if (alreadyRewritten) return undefined;
+			const filtered = await condense(toolName, null, text);
 			return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 		},
 	});

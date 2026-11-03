@@ -28,13 +28,30 @@ Protocol: [BENCHMARK.md](./BENCHMARK.md). Reproduce with `npm run bench` and `np
 
 From `npm run bench`. No model involved; these bytes are the same on any machine with the same rtk.
 
+### Raw output, rtk's own input shape
+
 | Case | Shape | Bytes in | Bytes out | Saved | Fidelity |
 |---|---|---:|---:|---:|---|
 | grep, clustered | 240 matches in 6 files | 16,130 | 3,148 | **80.5%** | 6/6 files named, 60 of 240 match lines kept |
 | grep, scattered | 240 matches in 240 files | 14,874 | 14,874 | **0.0%** | passed through unchanged |
 | find | 260 paths in 10 dirs | 6,092 | 1,748 | **71.3%** | 10/10 dirs named, header correct |
 
-Rewrite: 12 of 12 commands rewritten, 89–166 ms mean, up to 592 ms p95.
+### Command Code's own tool shapes
+
+The raw rows above are rtk's fixture, not what this host produces. A `glob` result opens with `Found N files`, a truncated `glob` closes with `(Results are truncated: showing 1-100 of 382 matches …)`, a truncated `grep` closes with `[Showing results with pagination = …]`, and `shell_command` opens with the exit status. These rows run the mod's real split → filter → re-attach path, and the fidelity column asserts the envelope survived.
+
+| Case | Envelope | Bytes in | Bytes out | Saved | Fidelity |
+|---|---|---:|---:|---:|---|
+| glob tool | `Found 260 files` header | 4,326 | 1,149 | **73.4%** | header kept |
+| glob tool, truncated | header + truncation notice | 5,021 | 1,345 | **73.2%** | header kept, trailer kept |
+| grep tool, truncated | pagination notice | 15,540 | 3,183 | **79.5%** | trailer kept |
+| shell tool | `Exit code: 1` head | 2,769 | 324 | **88.3%** | header kept |
+
+A live headless run against a fixture repo confirms it outside the bench: a `glob` of 380 files came back as `Found 100 files` plus rtk's grouped body and the host's own truncation notice intact — **1,771 → 471 bytes**, every directory named.
+
+Those four rows exist because an earlier build lost every one of them: the `find` filter read `Found N files` as a path, the `grep` filter folded the pagination notice away as noise, and the shell pass folded away `Exit code: 1`. All three were measured, then fixed by filtering only the body and re-attaching the host's envelope verbatim. The truncation notice itself was the second discovery: the first fix guessed at `[…]` when the host actually prints `(Results are truncated: showing 1-100 of 382 matches …)`, caught by reading a real result instead of the source.
+
+Rewrite: 12 of 12 commands rewritten, ~77 ms mean, ~82 ms p95.
 
 **The scattered row is the important one.** It saves nothing, and that is not a bug: rtk's `never_worse` guard refuses a regrouping larger than its input. Reporting only the clustered case would have claimed 80% as if it were universal. The honest claim is *"a shell result that groups by file gets much smaller; a result with one hit per file is unchanged."*
 

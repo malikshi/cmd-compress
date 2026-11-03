@@ -47,7 +47,7 @@ Set one mode on its own when a preset is too blunt:
 /rtk off
 ```
 
-Or say `stop caveman` / `stop ponytail` as the whole message. An ordinary sentence that merely mentions the mode does not disable it.
+Or say `stop caveman` / `stop ponytail` as the whole message. `normal mode` — the phrase both upstream projects use — turns every mode off at once, `rtk` included. An ordinary sentence that merely mentions the mode does not disable it.
 
 ### Presets
 
@@ -82,9 +82,10 @@ curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/main/install.sh | sh
 
 `/rtk status` reports whether the binary was found and which version it is. When rtk is active:
 
-- **`shell_command` is rewritten** through `rtk rewrite` before it runs, so `git status` executes as `rtk git status`. The full documented exit-code contract is honoured: `0` and `3` carry a rewrite, `1` means no equivalent, and `2` is a deny — a `2` that prints a reason becomes a block carrying that reason, while a silent `2` is a host deny rule rtk only relays and is left to the host to enforce.
+- **`shell_command` is rewritten** through `rtk rewrite` before it runs, so `git status` executes as `rtk git status`. The full documented exit-code contract is honoured: `0` and `3` carry a rewrite, `1` means no equivalent, and `2` is a deny — a `2` that prints a reason becomes a block carrying that reason, while a silent `2` is a host deny rule rtk only relays and is left to the host to enforce. The emitted `rtk` is **pinned to the absolute path** this mod resolved, because rtk is often installed under `~/.bun/bin`, which the shell may not have on `PATH` — a bare name there would fail as `rtk: not found`.
 - **Shell output with no rewrite is still condensed.** `npm test`, `awk`, and `sed` have no rtk equivalent, yet their output can be cargo-test or pytest shaped. Above 1200 bytes it goes through `rtk pipe` with no `-f`, which auto-detects the format and passes the text through unchanged when nothing matches. A call that *was* rewritten is skipped, since rtk already filtered it.
 - **`grep` and `glob` results are condensed** above 1200 bytes, through `rtk pipe -f grep|find`.
+- **The host's own envelope is never filtered.** A `glob` result opens with `Found N files`; a truncated `grep` closes with `[Showing results with pagination = …]`; `shell_command` opens with `Exit code: 1`. Those lines carry meaning — the count, that the list is truncated, that the command failed — and rtk folds them away as noise. The mod splits them off before the filter and re-attaches them verbatim after it, so only the body is ever condensed.
 - **Every failure passes through.** A missing binary, an abort, a non-zero exit from the filter, or a result that came back larger than the original leaves the original untouched. No rtk call can hang a tool call: `cmd.exec` ignores a `timeout` option, so each one runs under an `AbortController`.
 - **A failed tool result is never filtered** — the error text reaches the model intact.
 - **A binary older than 0.23.0 turns rewrites off** instead of silently doing nothing, since that is the version `rtk rewrite` shipped in.
@@ -149,7 +150,8 @@ Two full runs, 900 headless sessions, `nexrouter/deepseek-v4.1-flash`. The most 
 
 | Claim | Result |
 |---|---|
-| Shell output gets smaller | **Conditionally, exactly.** 80.5% on file-clustered grep, 71.3% on `find`, **0%** when hits are one-per-file |
+| Shell output gets smaller | **Conditionally, exactly.** 73–80% on the grep and glob shapes Command Code produces, 88% on a cargo-style failure, **0%** when hits are one-per-file |
+| The host envelope survives | **Yes, asserted.** The `Found N files` header, the pagination notice, and the `Exit code:` line are all kept — the earlier build lost every one |
 | A mode adds prompt overhead | **Yes, reproducible.** Within 10% of the static estimate for one mode; presets ~20% above it |
 | Caveman shortens replies | **Only `ultra`, ~12–13%**, and only on open prompts. `full` cost tokens in both runs |
 | The mode pays off in one turn | **No** — `ultra` saves ~50–70 reply tokens against a 232-token block |
@@ -168,8 +170,8 @@ The exact, quotable numbers are the filter bytes and the prompt overhead. The li
 - **Caveman does not shorten tool output.** It changes the reply voice. Shell output is rtk's job.
 - **Caveman may not shorten replies at all on your model.** Measured here, only `ultra` saved (~12%) and `full` cost tokens in both runs. Treat the mode names as voice settings, not as a savings guarantee.
 - **The live benchmark cannot rank modes tightly.** Two runs of the same configuration disagreed on 5 of 9 cases. Quote the filter bytes and the prompt overhead; treat reply-token deltas as directional.
-- **The rtk filter is heuristic and declines rather than mangles.** `rtk pipe` refuses anything larger than its input (`never_worse`), so a scattered grep result comes back byte-identical instead of worse — measured at 0.0% on 240 matches across 240 files. A very unusual layout can still read worse; `rtk` mode is off by default and `/rtk off` stops it immediately.
-- **The extra shell pass costs a process.** About 44 ms per qualifying result. Below 1200 bytes the filter never runs, and `/rtk-shell=false` turns the pass off while keeping rewrites.
+- **The rtk filter is heuristic and declines rather than mangles.** `rtk pipe` refuses anything larger than its input (`never_worse`), so a scattered grep result comes back byte-identical instead of worse — measured at 0.0% on 240 matches across 240 files. A very unusual layout can still read worse; `rtk` mode is off by default and `/rtk off` stops it immediately. The host envelope — header, pagination notice, exit status — is split off before filtering and re-attached verbatim, so those lines are never at risk.
+- **The extra shell pass costs a process.** Measured here, 12–15 ms per qualifying result on a warm page cache. Below 1200 bytes the filter never runs, and `/rtk-shell=false` turns the pass off while keeping rewrites.
 - **A compressed reply can read as curt.** That is the mode working. `/caveman off` restores normal prose mid-session.
 - **No dollar figure is claimed.** Tersio publishes its own benchmark; this package ports the modes. For the shell half, `/rtk gain` reports what rtk itself saved on your machine, read from its own database rather than estimated.
 
@@ -194,7 +196,8 @@ rules/
   ponytail.ts      the three level blocks
 bench/            exact (bytes) + live (reply tokens) benchmarks
 docs/             BENCHMARK.md, BENCHMARK-RESULTS.md
-test/              67 tests
+test/              100 tests; 9 of them drive the real rtk binary, the rest use a fake
+                   ModApi so they run without one
 ```
 
 ## Attribution
