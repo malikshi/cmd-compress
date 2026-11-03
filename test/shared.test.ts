@@ -192,3 +192,27 @@ test('pipeCommand: the Windows line actually redirects through cmd.exe', t => {
 		rmSync(dir, {recursive: true, force: true});
 	}
 });
+
+// Rules: cmd.exe `/s` removes the first quote and the last quote of the whole string. Modelling that rule — not the builder — lets this host prove the line the shell will actually interpret, so the Windows path is checked by computation here and by a real cmd.exe in the windows-latest CI job rather than asserted alone.
+function cmdStripOuterQuotes(line: string): string {
+	const first = line.indexOf('"');
+	const last = line.lastIndexOf('"');
+	return first < 0 || last <= first ? line : line.slice(first + 1, last);
+}
+
+test('pipeCommand: the Windows line survives the outer-quote strip cmd.exe performs', () => {
+	const shell = {command: 'C:\\Windows\\system32\\cmd.exe', args: ['/d', '/s', '/c'], wrap: true};
+	const cases: Array<[string, string | null, string]> = [
+		['C:\\rtk.exe', 'find', 'C:\\tmp\\in.txt'],
+		['C:\\rtk.exe', null, 'C:\\tmp\\in.txt'],
+		// paths with spaces are the case that breaks a naive quoter
+		['C:\\Users\\a b\\.bun\\bin\\rtk.exe', 'grep', 'C:\\Users\\a b\\AppData\\Local\\Temp\\x y\\in.txt'],
+	];
+	for (const [bin, filter, file] of cases) {
+		const built = pipeCommand(bin, filter, file, shell);
+		const interpreted = cmdStripOuterQuotes(built.args.at(-1) ?? '');
+		const flags = filter ? `-f ${filter} ` : '';
+		const expected = `"${bin}" pipe ${flags}< "${file}"`;
+		assert.equal(interpreted, expected, `cmd.exe would run: ${interpreted}`);
+	}
+});
