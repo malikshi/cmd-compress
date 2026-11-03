@@ -649,3 +649,34 @@ test('a filter that drops a negation is refused', async () => {
 	assert.equal(report.ok, false);
 	assert.match(report.lost[0] ?? '', /negation/);
 });
+
+// Rules: the host's `grep` tool supports `-A/-B/-C`, and ripgrep prints a context line as `path-line-text` where a match is `path:line:text`. rtk's grep filter keeps only the match form, so the context the caller explicitly asked for is dropped — measured end-to-end through the real mod, a 40-match result with 40 context lines went 3,178 -> 1,665 bytes with all 40 gone. The explicit-filter path skips the grouping test, so this needs its own check.
+test('a grep result carrying -A/-B/-C context is not handed to the grep filter', async () => {
+	const {checkFidelity} = await import('../mods/rtk.ts');
+	const paths = Array.from({length: 40}, (_, index) => `src/f${index % 4}.ts`);
+	const withContext = paths.map((path, index) => `src/f${index % 4}.ts:${index + 1}:  const hit${index} = f();\nsrc/f${index % 4}.ts-${index + 2}-  context${index}`).join('\n');
+	const grouped = '40 matches in 4F:\n\n[file] src/f0.ts (10):\n    10: const hit0 = f();';
+	const report = checkFidelity(withContext, grouped, false);
+	assert.equal(report.ok, false, 'the explicit grep/open filter is refused when context rows would be lost');
+	assert.match(report.lost.join(' '), /context/);
+
+	const bareRows = paths.map((_, index) => `src/f${index % 4}.ts:${index + 1}:  const hit${index} = f();`).join('\n');
+	assert.equal(checkFidelity(bareRows, grouped, false).ok, true, 'a context-free match list is still accepted');
+});
+
+// Rules: a path may itself contain `-<digits>-`, so a delimiter-only test reads `src/v2-feat-12-bar1.ts` as a context row and refuses a legitimate find-mode grouping (measured: a 40-path list was refused). The context path must be one the match rows already named.
+// Rules: the mixed case is the one that discriminates — real match rows present (so the early return cannot mask the bug) plus a path-shaped line that is not their context. A paths-only list exits before the delimiter test ever runs.
+test('a path containing -N- is not mistaken for grep context', async () => {
+	const {hasGrepContext, checkFidelity} = await import('../mods/rtk.ts');
+	const paths = Array.from({length: 40}, (_, index) => `src/v2-feat-12-bar${index}.ts`);
+	assert.equal(hasGrepContext(paths.join('\n')), false, 'a plain path list carries no context');
+	assert.equal(checkFidelity(paths.join('\n'), '40 files in 2 dirs:\n\n  src/  (40)', false).ok, true, 'and its grouping is accepted');
+
+	const rows = Array.from({length: 40}, (_, index) => `src/a.ts:${index + 1}:  hit${index}`).join('\n');
+	const withContext = Array.from({length: 40}, (_, index) => `src/a.ts:${index + 1}:  hit${index}\nsrc/a.ts-${index + 2}-  ctx${index}`).join('\n');
+	assert.equal(hasGrepContext(rows), false, 'match rows alone are not context');
+	assert.equal(hasGrepContext(withContext), true, 'a known path with a -N- delimiter is context');
+
+	const mixed = `${rows}\nsrc/v2-feat-12-bar1.ts\nnotes-for-2024-summary.ts`;
+	assert.equal(hasGrepContext(mixed), false, 'unrelated path-shaped lines are not context for a known match path');
+});

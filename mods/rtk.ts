@@ -1,5 +1,5 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, canRefilterCompressed, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
+// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, hasGrepContext, canRefilterCompressed, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, joinForRewrite, splitRewrite, guidanceText
 // used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
@@ -8,12 +8,13 @@
 // rules: the emitted `rtk` is pinned to the resolved absolute path. rtk ships to ~/.local/bin (its installer default), ~/.bun/bin or ~/.cargo/bin, and a GUI host often has none of them on PATH, so a bare name would turn a working command into `rtk: not found`. The pin is a quote-aware single pass, because rtk emits `&`, newlines, and prefix commands, and a quoted argument may contain both `rtk` and a separator. The one quoted form it does reach into is a shell wrapper's script (`bash -c "rtk …"`), which rtk rewrites and which is a command line in its own right.
 // rules: `shell_command` and `powershell` are both shell tools with the same result envelope, so every path keys off `isShellTool`, not the one name — a Windows session would otherwise get no rewrite and no condensing at all.
 // rules: a rewritten shell call is skipped unless rtk left its faithful baseline — no recovery marker and a majority of `path:line:text` rows — because rtk's own never-worse guard declines to compress multi-file grep output by default.
+// rules: `shell_command`'s `args` array is part of the command line the host runs, so the rewrite sees it; a `-A/-B/-C` grep result is never handed to rtk's grep filter, which keeps only match rows and would silently drop the context the caller asked for.
 // rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
-// agent: 2026-11-02 ported from rtk-ai/rtk hooks/pi/rtk.ts and tersio extensions/rtk; honour exit 2 as a deny, add auto-detect output condensing, drop the ignored exec `timeout` for an AbortController, add gain + version reporting
 // agent: 2026-11-03 envelope-preserving filter (splitSegments + condense), pinBinary against off-PATH rtk, drop the dead `rg` mapping, consume the rewritten-call marker before every early return
 // agent: 2026-11-03 re-filter a rewritten call only when rtk declined to compress it (recovery-marker + grep-row gate, measured +33% on multi-file grep, 12 ms, 0 bytes on 12 real commands)
 // agent: 2026-11-03 pinBinary rewritten as a quote-aware scan after measuring two live bugs: `&` and newline separators it emits were left bare (a rewrite then failed as `rtk: not found` off PATH), and a `rtk` inside a quoted argument was rewritten, corrupting the argument
 // agent: 2026-11-03 inspect rtk 1.1.0 against the mod: cover the `powershell` shell tool, accept rtk's abbreviated `NF:` grouping header in both the recovery and fidelity markers, and probe every documented install dir (rtk's own installer writes ~/.local/bin, not ~/.bun/bin)
+// agent: 2026-11-03 two measured defects: `shell_command`'s `args` were never part of the rewrite lookup (every compound call missed), and a `-A/-B/-C` grep result had its context rows silently dropped by rtk's grep filter; forcing a filter on misdetected text measured destructive, so auto-detect stays
 
 import type {ModApi} from '@commandcode/harness';
 import {accessSync, constants, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -99,6 +100,25 @@ export function isGrepRows(text: string): boolean {
 	return rows / lines.length >= 0.5;
 }
 
+// Rules: ripgrep separates a match from its context with different delimiters — `path:line:text` for a match, `path-line-text` for a `-A/-B/-C` context line (verified with `rg -A1`: `2:beta` then `3-gamma`). rtk's grep filter only understands the match form, so every context line is dropped (measured: 40 match rows plus 40 context rows, 3,178 -> 1,665 bytes with all 40 context lines gone). The context is the reason the caller passed `-A/-B/-C`.
+// Rules: the file prefix must match one the match rows already named, because a path alone is not evidence — `src/v2-feat-12-bar1.ts` has the shape `<path>-<digits>-` and a bare delimiter test reads it as a context row (measured: a 40-path find-mode list was refused as lost context). Requiring a known path removes that false positive while keeping the single-file form, where the prefix is empty on both rows.
+const GREP_CONTEXT_ROW = /^([\s\S]*?)-\d+-/;
+
+export function hasGrepContext(text: string): boolean {
+	const lines = text.split('\n').filter(line => line.trim());
+	const knownPaths = new Set<string>();
+	for (const line of lines) {
+		if (GREP_ROW.test(line)) knownPaths.add(line.slice(0, line.indexOf(':')));
+	}
+	if (knownPaths.size === 0) return false;
+	for (const line of lines) {
+		if (GREP_ROW.test(line)) continue;
+		const path = GREP_CONTEXT_ROW.exec(line)?.[1];
+		if (path !== undefined && knownPaths.has(path)) return true;
+	}
+	return false;
+}
+
 // Rules: a rewritten call is normally left alone because rtk already filtered it. The exception is the baseline rtk declined to compress: it carries no recovery hint, so a second pass recovers rows it refused to group instead of discarding information.
 export function canRefilterCompressed(text: string): boolean {
 	return !RECOVERY_MARKER.test(text) && isGrepRows(text);
@@ -180,6 +200,12 @@ export function checkFidelity(original: string, filtered: string, autoDetected: 
 	const negationsOut = countOf(filtered, NEGATION);
 	if (negationsOut < negationsIn) lost.push(`negation: ${negationsIn} -> ${negationsOut}`);
 
+	// Rules: an explicit `-f grep` is rtk's grep filter, and that filter keeps only `path:line:text` rows. A result from the host's `grep` tool with `-A/-B/-C` carries `path-line-text` rows too, and every one of them is dropped (measured end-to-end: 40 context lines in, 0 out, accepted). The check runs for the explicit filter as well, because `autoDetected` is false on that path and the grouping test below would never see it.
+	// Rules: no `isGrepRows` precondition — one context line per match row is still a 50% row ratio, so the majority test would wave through exactly the case that loses the most context.
+	if (GROUPING_MARKER.test(filtered) && hasGrepContext(original)) {
+		lost.push('context: rtk dropped the grep context lines the caller asked for');
+	}
+
 	if (autoDetected && GROUPING_MARKER.test(filtered)) {
 		const rows = isGrepRows(original);
 		const paths = pathLineRatio(original);
@@ -260,6 +286,22 @@ export function shouldRewrite(command: string): boolean {
 	if (/^rtk\s/.test(trimmed)) return false;
 	if (/^RTK_DISABLED=/.test(trimmed)) return false;
 	return true;
+}
+
+// Rules: `shell_command` carries an optional `args` array beside `command`, and the host runs `command + ' ' + args.shellQuoted` (verified in the bundled cli.mjs: `buildCommand2`). The rewrite must see that whole line, or a compound command is invisible: `command: 'cargo'` + `args: ['build']` asks rtk about the bare `cargo`, which has no rewrite, so the call ran unfiltered while `cargo build` rewrites fine. Measured on 12 real compound calls, every one was missed.
+// Rules: the answer is split back into a command plus the caller's untouched args, so the host's own quoting still applies to them — round-tripping them through a string would have to re-quote, and rtk does not preserve the quoting it is handed (`grep -r 'a b' src/` came back unquoted).
+// Rules: only a rewrite the line still *ends* with is trusted. rtk normalises some commands (`npx jest` -> `rtk jest`), and then the args suffix no longer lines up, so that rewrite is left alone rather than guessed at — a wrong split would move a caller's argument into the command.
+export function joinForRewrite(command: string, args: readonly string[]): {line: string; suffix: string} {
+	const suffix = args.length > 0 ? ` ${args.join(' ')}` : '';
+	return {line: `${command}${suffix}`, suffix};
+}
+
+export function splitRewrite(rewritten: string, command: string, suffix: string): string | null {
+	if (!suffix) return rewritten === `rtk ${command}` ? rewritten : null;
+	if (!rewritten.endsWith(suffix)) return null;
+	const rest = rewritten.slice(0, rewritten.length - suffix.length);
+	// Rules: the remainder must still carry the prefix, or the split ate the whole answer (a payload that happened to equal the suffix) and the caller would run an empty command.
+	return /\brtk\b/.test(rest) ? rest : null;
 }
 
 // Rules: `rtk rewrite` answers a bare `rtk …`, which the host shell resolves from ITS PATH. This mod can find rtk in a managed install dir that is not on PATH, so the bare name would run as `rtk: not found` and turn a working command into a failure. Pin each command-position `rtk` to the resolved absolute path.
@@ -694,14 +736,19 @@ export default function (cmd: ModApi): void {
 			if (mode === OFF || !isShellTool(toolName) || !bin || !supported()) return undefined;
 			const command = typeof input.command === 'string' ? input.command : '';
 			if (!shouldRewrite(command)) return undefined;
-			const verdict = await rewrite(command);
+			// Rules: the host appends `args` after shell-quoting them, so the rewrite is asked about the whole line and split back only when the answer still ends with the caller's own suffix. `powershell` has no args field, so this is empty there.
+			const args = Array.isArray(input.args) ? (input.args as unknown[]).filter((a): a is string => typeof a === 'string') : [];
+			const {line, suffix} = joinForRewrite(command, args);
+			const verdict = await rewrite(line);
 			// Rules: a deny message is rtk's own pipeline rule, not a host rule, so the call must not run — pass the reason on as the result.
 			if (verdict.kind === 'deny') {
 				return {block: true, additionalContext: `Blocked by an rtk rule: ${verdict.reason}`};
 			}
 			if (verdict.kind !== 'rewrite') return undefined;
+			const rewrittenCommand = splitRewrite(verdict.command, command, suffix);
+			if (rewrittenCommand === null) return undefined;
 			if (typeof toolCallId === 'string' && toolCallId) rewrittenCalls.add(toolCallId);
-			return {input: {...input, command: pinBinary(verdict.command, bin)}};
+			return {input: {...input, command: pinBinary(rewrittenCommand, bin)}};
 		},
 
 		afterToolCall: async ({toolCallId, toolName, result, isError}) => {

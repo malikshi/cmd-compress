@@ -226,8 +226,15 @@ test('rtk: on rewrites a shell command through rtk and injects guidance', async 
 });
 
 // Rules: shell_command carries an optional `args` array beside `command`; the rewrite must replace only the command and leave those args for the tool to append, or a rewritten call would drop them.
+// Rules: the host runs `command + ' ' + args`, so rtk is asked about the whole line and answers `rtk git status --porcelain`; the mod splits the caller's suffix back off rather than re-quoting args itself.
 test('rtk: a rewrite keeps the call\'s own args intact', async () => {
-	const fake = load(rtk, {exec: async () => ({stdout: 'rtk git status', stderr: '', code: 0})});
+	const seen: string[] = [];
+	const fake = load(rtk, {
+		exec: async request => {
+			seen.push(effectiveLine(request.command, request.args ?? []).trim());
+			return {stdout: 'rtk git status --porcelain', stderr: '', code: 0};
+		},
+	});
 	runHandler(fake.commands, 'rtk', 'on');
 	const result = (await firstHook(fake).beforeToolCall?.({
 		toolName: 'shell_command',
@@ -236,6 +243,35 @@ test('rtk: a rewrite keeps the call\'s own args intact', async () => {
 	assert.match(result.input.command, /rtk['"] git status$/, 'only the command is rewritten, quoted for this shell');
 	assert.deepEqual(result.input.args, ['--porcelain'], 'the args survive');
 	assert.equal(result.input.timeout, 5000, 'and every other input field survives');
+	assert.match(seen[0] ?? '', /rewrite git status --porcelain$/, 'rtk is asked about the full line the host runs');
+});
+
+// Rules: a compound command lives only in `command` + `args`: `command: 'cargo'` alone has no rewrite, while `cargo build` does. Measured against rtk 1.1.0 — every one of 12 real compound calls was missed before this.
+test('rtk: a compound command is rewritten through its args', async () => {
+	const fake = load(rtk, {
+		exec: async request => {
+			const line = request.args?.at(-1) ?? '';
+			return line === 'cargo build' ? {stdout: 'rtk cargo build', stderr: '', code: 0} : {stdout: '', stderr: '', code: 1};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	const result = (await firstHook(fake).beforeToolCall?.({
+		toolName: 'shell_command',
+		input: {command: 'cargo', args: ['build']},
+	})) as {input: {command: string; args: string[]}};
+	assert.match(result.input.command, /rtk['"] cargo$/, 'the subcommand moves into the command');
+	assert.deepEqual(result.input.args, ['build'], 'and the caller keeps its own args');
+});
+
+// Rules: rtk normalises some commands (`npx jest` -> `rtk jest`), so the answer no longer ends with the caller's args. Splitting then would move an argument into the command, so the call is left untouched instead of guessed at.
+test('rtk: a rewrite that drops the args suffix is not split', async () => {
+	const fake = load(rtk, {exec: async () => ({stdout: 'rtk jest', stderr: '', code: 0})});
+	runHandler(fake.commands, 'rtk', 'on');
+	const result = await firstHook(fake).beforeToolCall?.({
+		toolName: 'shell_command',
+		input: {command: 'npx', args: ['jest', '--coverage']},
+	});
+	assert.equal(result, undefined, 'an unalignable rewrite is left alone');
 });
 
 test('rtk: a command with no rewrite is left untouched', async () => {
