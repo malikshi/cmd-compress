@@ -31,6 +31,27 @@ test('caveman: the ordinary levels keep the negation rule and the verbatim-paylo
 	}
 });
 
+test('caveman: every level carries the floor, not only the heavier ones', () => {
+	for (const level of CAVEMAN_LEVELS) {
+		const body = CAVEMAN_RULES[level];
+		assert.match(body, /[Nn]egation|[Nn]ever drop/, `${level}: negation floor`);
+		assert.match(body, /One term per thing|one term per thing/, `${level}: one term per thing`);
+		assert.match(body, /persisted outside chat/, `${level}: persisted text stays prose`);
+	}
+});
+
+test('caveman: every level forbids performing the voice', () => {
+	for (const level of CAVEMAN_LEVELS) {
+		assert.match(CAVEMAN_RULES[level], /Never perform/, `${level}: no performed caveman`);
+	}
+});
+
+test('caveman: every level defers to the user language', () => {
+	for (const level of CAVEMAN_LEVELS) {
+		assert.match(CAVEMAN_RULES[level], /user language|user's language|compress the style, not the language/i, level);
+	}
+});
+
 test('caveman: megacave levels stay in the classical register and keep their negations', () => {
 	for (const level of ['megacave-lite', 'megacave-full', 'megacave-ultra'] as const) {
 		const body = CAVEMAN_RULES[level];
