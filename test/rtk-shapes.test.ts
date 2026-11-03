@@ -195,7 +195,10 @@ test('the rewrite never emits a bare `rtk` the shell cannot resolve', async t =>
 	})) as {input: {command: string}} | undefined;
 	assert.ok(result, 'git status rewrites');
 	const emitted = result.input.command;
-	assert.match(emitted, /\/rtk' git status$/, 'the rewrite is pinned to the absolute path the host can run');
+	// Rules: the pin is an absolute path in this shell's own quote style — single quotes on POSIX, double on Windows, where the binary is rtk.exe. Asserting one style made this pass on Linux and fail on the Windows runner.
+	const absolute = process.platform === 'win32' ? /"[A-Za-z]:.*rtk\.exe" git status$/ : /'\/.*\/rtk' git status$/;
+	assert.match(emitted, absolute, 'the rewrite is pinned to the absolute path the host can run');
+	assert.doesNotMatch(emitted, /(^|[\s&|;])rtk git status$/, 'a bare name would resolve from a PATH the host may not have');
 });
 
 // Rules: rtk's `auto_detect_filter` inspects only the first 1024 bytes, so a summary that arrives before that window is what makes the pass fire. The mod leaves detection to rtk rather than reimplementing it.
