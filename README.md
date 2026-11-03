@@ -116,9 +116,12 @@ Each mod takes a per-session starting mode, applied when the session binds:
 cmd --mod-option caveman=full --mod-option ponytail=ultra --mod-option rtk=on
 cmd --mod-option rtk-filter=false
 cmd --mod-option rtk-shell=false
+cmd --mod-option rtk-bin=/opt/rtk/bin/rtk
 ```
 
 A flag beats the stored value for that session. It does not overwrite the store.
+
+`rtk-bin` sets the binary path when the probe misses an unusual install. The probe itself checks `PATH` first, then `~/.bun/bin`, where rtk ships when installed through bun.
 
 ## How it works
 

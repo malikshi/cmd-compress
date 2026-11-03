@@ -166,12 +166,15 @@ export function guidanceText(): string {
 
 export default function (cmd: ModApi): void {
 	cmd.addFlag('rtk', {type: 'string', default: '', description: 'Start mode: on|off (default: off)'});
+	cmd.addFlag('rtk-bin', {type: 'string', default: '', description: 'Absolute path to the rtk binary (default: probe PATH then ~/.bun/bin)'});
 	cmd.addFlag('rtk-filter', {type: 'boolean', default: true, description: 'Condense grep/glob tool output'});
 	cmd.addFlag('rtk-shell', {type: 'boolean', default: true, description: 'Condense shell output that no rewrite covered'});
 
 	let mode = readOwnMode(cmd.store, OFF, value => value === 'on' || value === 'off');
 
-	const bin = resolveBin('rtk');
+	// Rules: an explicit path wins over the probe, so an install in an unusual place works without editing PATH; an empty flag leaves the probe as the only answer.
+	const binFlag = String(cmd.getFlag('rtk-bin') ?? '').trim();
+	const bin = binFlag || resolveBin('rtk');
 
 	// Rules: the rewrite is judged against the session's rules, so it runs in the session cwd; a deny file above it is found the same way rtk finds it for any other host.
 	const cwd = typeof cmd.cwd === 'string' && cmd.cwd ? cmd.cwd : undefined;

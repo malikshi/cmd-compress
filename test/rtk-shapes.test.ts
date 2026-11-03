@@ -6,7 +6,7 @@
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {execFile} from 'node:child_process';
+import {execFile, execFileSync} from 'node:child_process';
 import rtk, {splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
 import {createFakeCmd, firstHook, resultText, runHandler} from './harness.ts';
 
@@ -28,9 +28,10 @@ function realExec(request: ExecRequest): Promise<{stdout: string; stderr: string
 	});
 }
 
+// Rules: `execFile` is asynchronous, so an ENOENT lands in a callback that a surrounding try/catch never sees — the guard answered true with no rtk installed, so every test in this file failed instead of skipping. `execFileSync` throws synchronously, which is what a probe needs.
 function hasRtk(): boolean {
 	try {
-		execFile('rtk', ['--version'], {encoding: 'utf8', timeout: 5000});
+		execFileSync('rtk', ['--version'], {encoding: 'utf8', timeout: 5000, stdio: 'ignore'});
 		return true;
 	} catch {
 		return false;

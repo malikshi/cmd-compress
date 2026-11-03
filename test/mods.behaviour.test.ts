@@ -15,8 +15,11 @@ import {createFakeCmd, firstHook, runHandler, messageOf} from './harness.ts';
 
 type Fake = ReturnType<typeof createFakeCmd>;
 
+// Rules: the mod resolves its binary with resolveBin, which probes PATH and ~/.bun/bin. With no rtk installed every hook is a no-op, so the suite would pass on a machine that has rtk and fail in CI — measured: 14 failures under an empty HOME. Seeding rtk-bin pins the factory to a fixed path, so the fake exec is the only thing consulted and the suite is hermetic anywhere.
+const TEST_BIN = '/opt/rtk/bin/rtk';
+
 function load(factory: (cmd: never) => void, options: Parameters<typeof createFakeCmd>[0] = {}) {
-	const fake = createFakeCmd(options);
+	const fake = createFakeCmd({...options, flags: {'rtk-bin': TEST_BIN, ...options.flags}});
 	fake.cmd.name = 'probe';
 	factory(fake.cmd as never);
 	return fake;
@@ -607,4 +610,18 @@ test('compress: a missing sibling is reported as unchanged, never as applied', (
 	assert.match(message, /not loaded: caveman, ponytail, rtk/);
 	assert.match(message, /caveman=\?/, 'an unloaded mode reads as unknown, not as the preset value');
 	assert.doesNotMatch(message, /caveman=ultra/, 'nothing was applied, so nothing may be reported as applied');
+});
+
+test('rtk: an explicit --rtk-bin is used instead of probing PATH', async () => {
+	const seen: string[] = [];
+	const fake = load(rtk, {
+		flags: {'rtk-bin': '/custom/place/rtk'},
+		exec: async request => {
+			seen.push(request.command);
+			return {stdout: 'rtk git status', stderr: '', code: 0};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'b1', toolName: 'shell_command', input: {command: 'git status'}});
+	assert.equal(seen[0], '/custom/place/rtk', 'the flag wins over the probe');
 });
