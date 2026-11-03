@@ -194,3 +194,14 @@ test('the injected guidance only names flags each subcommand actually takes', as
 	assert.match(helpOf('gain') ?? '', /--format/, 'the read is `gain -f json`, and -f is --format');
 });
 
+
+test('filterNameFor: only the two real tool names map, prototype keys do not', () => {
+	assert.equal(filterNameFor('grep'), 'grep');
+	assert.equal(filterNameFor('glob'), 'find');
+	assert.equal(filterNameFor('shell_command'), undefined);
+	for (const hostile of ['toString', 'constructor', '__proto__', 'valueOf', 'hasOwnProperty', 'isPrototypeOf']) {
+		const got = filterNameFor(hostile);
+		assert.equal(got, undefined, `${hostile} must not answer a filter name`);
+		assert.equal(typeof got, 'undefined', `${hostile} must not leak a prototype value`);
+	}
+});

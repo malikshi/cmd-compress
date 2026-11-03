@@ -28,8 +28,9 @@ const FILTER_TIMEOUT_MS = 5000;
 
 const FILTER_BY_TOOL: Record<string, string> = {grep: 'grep', glob: 'find'};
 
+// Rules: owned-key lookup only. `FILTER_BY_TOOL[name]` walks the prototype chain, so a tool named `toString` or `constructor` answers a function, which would reach `rtk pipe -f` as the filter name and spawn a pointless process for a name rtk does not know.
 export function filterNameFor(toolName: string): string | undefined {
-	return FILTER_BY_TOOL[toolName];
+	return Object.hasOwn(FILTER_BY_TOOL, toolName) ? FILTER_BY_TOOL[toolName] : undefined;
 }
 
 /* ------------------------------------------------------------ tool envelopes */
@@ -341,7 +342,7 @@ export default function (cmd: ModApi): void {
 		},
 
 		afterToolCall: async ({toolCallId, toolName, result, isError}) => {
-			// Rules: the marker is consumed before any early return, so a rewritten call whose output was too small to filter does not leave its id behind.
+			// Rules: the marker is consumed on entry, before any guard that returns early, so a rewritten call whose output was too small or errored leaves no id behind. The value is captured once and read by the shell pass below, so consuming early cannot lose the answer this call needs.
 			if (rewrittenCalls.size > 256) rewrittenCalls.clear();
 			const alreadyRewritten = wasRewritten(toolCallId);
 			if (mode === OFF || isError || !supported()) return undefined;
