@@ -28,7 +28,7 @@ jobs:
         run: npm run typecheck
       - name: Tests
         run: npm test
-      - name: Mods load through the real loader
+      - name: Mods import and their factories run
         run: |
           npm i -g command-code@latest
           node scripts/verify-mods.ts

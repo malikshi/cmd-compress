@@ -82,9 +82,42 @@ test('splitSegments: the shell exit status is split off, so a failure stays visi
 	assert.equal(split.body, 'running 2 tests\n');
 });
 
+// Rules: formatResult2 follows the exit status with a parenthesised interpretation (`(No matches found)`, `(test failure)` is inline, this one is on its own line). rtk drops it like the exit line, so it belongs in the head — but only right after an `Exit code:` line, or a body starting with `(` would be eaten.
+test('splitSegments: the interpreted exit code line is split off with the head', () => {
+	const split = splitSegments('shell_command', 'Exit code: 1\n(No matches found)\nrunning 3 tests\n');
+	assert.equal(split.head, 'Exit code: 1\n(No matches found)\n');
+	assert.equal(split.body, 'running 3 tests\n');
+
+	const bodyParen = splitSegments('shell_command', '(paren body start\nrest\n');
+	assert.equal(bodyParen.head, '', 'a body that starts with a parenthesis is untouched');
+	assert.equal(bodyParen.body, '(paren body start\nrest\n');
+});
+
 test('splitSegments: ordinary output is one unsplit body', () => {
 	const split = splitSegments('shell_command', 'plain output\n');
 	assert.deepEqual(split, {head: '', body: 'plain output\n', tail: ''});
+});
+
+// Rules: the grep tool's DEFAULT mode is `files_with_matches`, which prints a path list under a `Found N files` header — the same envelope glob uses. The grep filter passes that shape through untouched (measured 4,447 → 4,447 bytes) while the find filter condenses it (→ 620), so the shape decides the filter, not the tool name.
+test('splitSegments: grep files-mode splits the same Found header glob does', () => {
+	const text = `Found 2 files\n  src/a.ts\n  src/b.ts\n`;
+	const split = splitSegments('grep', text);
+	assert.equal(split.head, 'Found 2 files\n');
+	assert.equal(split.body, '  src/a.ts\n  src/b.ts\n');
+
+	const content = splitSegments('grep', 'src/a.ts:1: hit\nsrc/b.ts:2: hit\n');
+	assert.equal(content.head, '', 'content-mode rows have no header');
+});
+
+test('grep files-mode is condensed with the find filter, and the count survives', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	const paths = Array.from({length: 300}, (_, index) => `src/d${index % 5}/f${index}.ts`);
+	const notice = 'Found 300 files with pagination = limit: 300, offset: 300';
+	const input = `${notice}\n${paths.join('\n')}`;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: input}], isError: false}));
+	assert.ok(out.startsWith(`${notice}\n`), 'the count and the pagination text are verbatim');
+	assert.ok(out.length < input.length, 'and the path list shrank, which the grep filter could not do');
 });
 
 test('glob: the count and the pagination notice survive condensation', async t => {
@@ -154,6 +187,82 @@ test('splitSegments: the real glob truncation notice is split off', () => {
 	assert.equal(split.head, 'Found 100 files\n');
 	assert.equal(split.tail.trim(), notice);
 	assert.ok(!split.body.includes('truncated'));
+});
+
+// Rules: every notice below is copied from the host's own formatter (`finishContentMode`, `finishCountMode`, the grep timeout path, `formatResult2`'s abort notice), not invented. A regex that only knew the pagination form let the count-mode, the em-dash timeout, and the long timeout notice be folded away by rtk — measured: the tail vanished from the model's view entirely.
+test('splitSegments: each notice shape the host actually emits is split off', () => {
+	const notices: Array<[tool: string, text: string, tail: string]> = [
+		[
+			'grep',
+			'src/a.ts:1:x\nsrc/b.ts:2:y\n\nFound 10 total occurrences across 2 files with pagination = limit: 2, offset: 2.',
+			'Found 10 total occurrences across 2 files with pagination = limit: 2, offset: 2.',
+		],
+		[
+			'grep',
+			'src/a.ts:1:x\nsrc/b.ts:2:y\n\nFound 10 total occurrences across 2 files.',
+			'Found 10 total occurrences across 2 files.',
+		],
+		[
+			'grep',
+			'src/a.ts:1:x\n\n[Search timed out — results above are partial. Narrow the pattern, path, or glob for complete results.]',
+			'[Search timed out — results above are partial. Narrow the pattern, path, or glob for complete results.]',
+		],
+		[
+			'shell_command',
+			'Exit code: 124\nbuild output\n\nCommand timed out after 120000ms (exit code 124). If this is expected to take longer and is not waiting for interactive input, retry with a larger timeout or run_in_background=true.',
+			'Command timed out after 120000ms (exit code 124). If this is expected to take longer and is not waiting for interactive input, retry with a larger timeout or run_in_background=true.',
+		],
+		['shell_command', 'Exit code: 130\npartial\nCommand aborted', 'Command aborted'],
+		// formatResult2 appends these two after the output on the platforms that produce them.
+		[
+			'shell_command',
+			'Exit code: 1\nbuild output\n\n[cwd change to /tmp discarded: outside the workspace — next call starts from the project directory]',
+			'[cwd change to /tmp discarded: outside the workspace — next call starts from the project directory]',
+		],
+		[
+			'shell_command',
+			'Exit code: 1\nbuild output\n\n[PowerShell edition: Windows PowerShell 5.1]',
+			'[PowerShell edition: Windows PowerShell 5.1]',
+		],
+	];
+	for (const [tool, text, tail] of notices) {
+		const split = splitSegments(tool, text);
+		assert.equal(split.tail.trim(), tail, `${tool}: the notice survives`);
+		assert.ok(!split.body.includes('pagination = limit: 2'), `${tool}: the notice is not left in the body`);
+	}
+});
+
+test('splitSegments: the count-mode notice survives the real filter path', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	// Rules: a count-mode body groups well — 40 files x 10 hits — so rtk actually shrinks it; a scattered 1-per-file body is returned unchanged (never_worse) and would prove nothing about the trailer.
+	const rows = Array.from({length: 40}, (_, file) =>
+		Array.from({length: 10}, (_, hit) => `src/file${file}.ts:${hit + 1}:  const x = compute(input)`).join('\n'),
+	);
+	const notice = 'Found 400 total occurrences across 40 files with pagination = limit: 400, offset: 400.';
+	const input = `${rows.join('\n')}\n\n${notice}`;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: input}], isError: false}));
+	assert.ok(out.trimEnd().endsWith(notice), 'the count and the truncation notice are the last thing the model reads');
+	assert.ok(out.length < input.length, 'and the body still shrank');
+});
+
+// Rules: `formatResult2` appends the abort notice after the output, and it is longer than a plain "Command aborted" — the earlier regex demanded a bare `ms`, so the whole sentence was fed to the filter and folded away. The body is a pytest shape, which is what makes the auto-detect pass fire at all.
+test('splitSegments: the timed-out shell notice survives the real filter path', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	const notice = 'Command timed out after 120000ms (exit code 124). If this is expected to take longer and is not waiting for interactive input, retry with a larger timeout or run_in_background=true.';
+	const body = [
+		'running 3 tests',
+		'test tests::it_works ... ok',
+		'test tests::fails_here ... FAILED',
+		'failures:',
+		'    tests::fails_here',
+		'test result: FAILED. 2 passed; 1 failed; 0 ignored',
+		...Array.from({length: 120}, (_, index) => `filler line that the filter folds away ${index}`),
+	].join('\n');
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'shell_command', result: [{type: 'text', text: `Exit code: 124\n${body}\n\n${notice}`}], isError: false}));
+	assert.ok(out.startsWith('Exit code: 124\n'), 'the exit status is still the first line');
+	assert.ok(out.trimEnd().endsWith(notice), 'and the timeout notice is still the last');
 });
 
 test('splitSegments: the glob timeout notice is split off', () => {

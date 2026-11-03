@@ -1,5 +1,5 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, filterNameFor, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
+// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, filterNameFor, filterForShape, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
 // used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
@@ -41,23 +41,31 @@ export interface Segments {
 	readonly tail: string;
 }
 
-// Rules: the last lines of a Command Code result often carry the truth the body hides: `[Showing results with pagination = …]` and `(Results are truncated: showing 1-100 of 382 …)` mean the list is incomplete, `(Search timed out …)` means it may be wrong, and `Command aborted` means it did not finish. rtk folds all of them away as noise, so they are cut off before the filter and re-attached after it.
+// Rules: the last lines of a Command Code result often carry the truth the body hides. Each form is taken from the host's own formatter, not guessed: grep's content mode closes with `[Showing results with pagination = …]`, its count mode with `Found N total occurrences across M files[ with pagination = …].`, and the grep tool times out with `[Search timed out — …]`; glob closes with `(Results are truncated: …)` or `(Search timed out …)`; a `shell_command` that ends early appends `Command aborted` or `Command timed out after Nms (exit code 124). …`, and `formatResult2` puts the cwd note and the PowerShell edition banner after the output. rtk folds all of them away as noise, so they are cut off before the filter and re-attached after it.
 // Rules: anchored to the end of the whole result, not to any line end — a notice that merely appears mid-output is body text and must be filtered with it.
 const TRAILER = new RegExp(
 	'\\n*(?:' +
-		'\\[Showing results with pagination = [^\\]\\n]*\\]' +
+		'\\[(?:Showing results with pagination|Search timed out)[^\\]\\n]*\\]' +
 		'|\\(Results are truncated: [^)\\n]*\\)' +
 		'|\\(Search timed out[^)\\n]*\\)' +
-		'|Found \\d+ total occurrences? across \\d+ files?\\.' +
-		'|Command (?:aborted|timed out after \\d+\\s?ms)' +
+		'|\\[cwd change to [^\\]\\n]*\\]' +
+		'|\\[PowerShell edition: [^\\]\\n]*\\]' +
+		'|Found \\d+ total occurrences? across \\d+ files?(?: with pagination = [^\\n]*)?\\.' +
+		'|Command (?:aborted|timed out after [^\\n]*)' +
 		')[\\s]*$',
 );
 
-// Rules: `formatShellCommandResult` puts the exit status and the signal on the first lines, before any output.
-const SHELL_HEAD = /^(?:(?:Exit code|Signal):[^\n]*\n)+/;
+// Rules: `formatResult2` puts the exit status and the signal on the first lines, before any output, and follows the exit status with a parenthesised interpretation (`(No matches found)`, `(test failure)`). Both are host words, not output, and rtk drops them, so they are split with the head. The interpretation is only recognised directly after an `Exit code:` line, so a body that happens to start with a parenthesis is not eaten.
+const SHELL_HEAD = /^(?:(?:(?:Exit code|Signal):[^\n]*\n)(?:\([^)\n]*\)\n)?)+/;
 
 // Rules: `glob` prints `Found N files` and then one indented path per line. The find filter reads that header line as a path, so it is split off rather than fed in.
 const GLOB_HEAD = /^Found \d+ files?[^\n]*\n/;
+
+// Rules: `grep` is not one shape. Its default `files_with_matches` mode prints a plain path list under a `Found N files` header, which the grep filter passes through untouched (measured 4,448 → 4,448 bytes) while the find filter condenses it (→ 630). Content mode is the opposite: `path:line:text` rows, where grep wins. So the filter is chosen from the body's shape, not from the tool name alone.
+export function filterForShape(toolName: string, filter: string | null, text: string): string | null {
+	if (toolName === 'grep' && GLOB_HEAD.test(text)) return 'find';
+	return filter;
+}
 
 // Rules: a result is split into the envelope the host wrote and the body rtk should condense; only the body is ever filtered, so no host information is lost.
 // Rules: the tail keeps the host's own separator, capped at one blank line — enough to keep the notice visually separate without carrying a run of blank lines the filter just folded.
@@ -67,7 +75,8 @@ function tailFrom(matched: string): string {
 }
 
 export function splitSegments(toolName: string, text: string): Segments {
-	if (toolName === 'glob') {
+	// Rules: `grep`'s default files mode opens with the same `Found N files` line `glob` does, so both split it off; a content-mode body starts with `path:line:text` and never matches.
+	if (toolName === 'glob' || toolName === 'grep') {
 		const head = GLOB_HEAD.exec(text);
 		if (head) {
 			const rest = text.slice(head[0].length);
@@ -172,9 +181,13 @@ export default function (cmd: ModApi): void {
 
 	let mode = readOwnMode(cmd.store, OFF, value => value === 'on' || value === 'off');
 
-	// Rules: an explicit path wins over the probe, so an install in an unusual place works without editing PATH; an empty flag leaves the probe as the only answer.
-	const binFlag = String(cmd.getFlag('rtk-bin') ?? '').trim();
-	const bin = binFlag || resolveBin('rtk');
+	// Rules: the host registers every mod, THEN applies `--mod-option` values (verified against the bundled host: buildHost runs loadMods before setFlagValue). A `getFlag` in the factory therefore answers the default, so `rtk-bin` must be resolved lazily — on the first hook or command — or the user's explicit path is silently ignored.
+	// Rules: the probe runs once and is cached; an explicit path wins over the probe, and an empty flag leaves the probe as the only answer.
+	let binCache: {value: string | null} | undefined;
+	function binPath(): string | null {
+		binCache ??= {value: String(cmd.getFlag('rtk-bin') ?? '').trim() || resolveBin('rtk')};
+		return binCache.value;
+	}
 
 	// Rules: the rewrite is judged against the session's rules, so it runs in the session cwd; a deny file above it is found the same way rtk finds it for any other host.
 	const cwd = typeof cmd.cwd === 'string' && cmd.cwd ? cmd.cwd : undefined;
@@ -185,6 +198,7 @@ export default function (cmd: ModApi): void {
 	let guidanceDecided: boolean | undefined;
 	const supported = () => isSupportedVersion(version);
 	const versionNote = () => {
+		const bin = binPath();
 		if (!bin) return 'binary: NOT FOUND';
 		if (!version) return `binary: ${bin}`;
 		const label = `${version.major}.${version.minor}.${version.patch}`;
@@ -223,6 +237,7 @@ export default function (cmd: ModApi): void {
 	}
 
 	async function readVersion(): Promise<void> {
+		const bin = binPath();
 		if (!bin) return;
 		try {
 			const {stdout} = await exec({command: bin, args: ['--version']}, REWRITE_TIMEOUT_MS);
@@ -233,6 +248,7 @@ export default function (cmd: ModApi): void {
 	}
 
 	async function rewrite(command: string): Promise<RewriteVerdict> {
+		const bin = binPath();
 		if (!bin || !supported()) return {kind: 'pass'};
 		try {
 			const {stdout, code} = await exec({command: bin, args: ['rewrite', command]}, REWRITE_TIMEOUT_MS);
@@ -246,6 +262,7 @@ export default function (cmd: ModApi): void {
 	// Rules: never pass tool output through a heredoc — a line equal to the delimiter would run as shell.
 	// Rules: an omitted filter lets rtk auto-detect; it is an identity pass when nothing matches and `never_worse` refuses anything larger than the input.
 	async function filterThroughRtk(filter: string | null, text: string): Promise<string | null> {
+		const bin = binPath();
 		if (!bin) return null;
 		let dir: string | undefined;
 		try {
@@ -273,9 +290,11 @@ export default function (cmd: ModApi): void {
 
 	// Rules: only the body is condensed; the host's own header and trailer are re-attached verbatim, so an exit status or a truncation notice cannot be folded away.
 	async function condense(toolName: string, filter: string | null, text: string): Promise<string | null> {
+		// Rules: the shape is read from the original result, because the split below removes the very header it looks for.
+		const shapeFilter = filterForShape(toolName, filter, text);
 		const {head, body, tail} = splitSegments(toolName, text);
 		if (body.trim().length < MIN_FILTER_BYTES) return null;
-		const filtered = await filterThroughRtk(filter, body);
+		const filtered = await filterThroughRtk(shapeFilter, body);
 		if (!filtered) return null;
 		return `${head}${filtered}${tail}`;
 	}
@@ -301,6 +320,7 @@ export default function (cmd: ModApi): void {
 		handler: async ({args}) => {
 			const arg = args.trim().toLowerCase();
 			if (arg === 'gain') {
+				const bin = binPath();
 				if (!bin) return {message: 'rtk binary not found — install rtk, then /reload.'};
 				try {
 					const {stdout, code} = await exec({command: bin, args: ['gain', '-f', 'json']}, FILTER_TIMEOUT_MS);
@@ -324,7 +344,7 @@ export default function (cmd: ModApi): void {
 			}
 			if (arg !== 'on' && arg !== 'off') return {message: 'Usage: /rtk [on|off|gain|status]'};
 			setMode(arg);
-			if (arg === 'on' && !bin) return {message: 'RTK on, but the rtk binary was not found. Install it, then /reload.'};
+			if (arg === 'on' && !binPath()) return {message: 'RTK on, but the rtk binary was not found. Install it, then /reload.'};
 			if (arg === 'on' && !supported()) return {message: `RTK on, but ${versionNote()}. Upgrade rtk — rewrites fall back to raw until then.`};
 			return {message: `RTK ${arg}.`};
 		},
@@ -343,7 +363,7 @@ export default function (cmd: ModApi): void {
 
 		// Rules: the block must be byte-stable across rounds or the provider's prompt-prefix cache misses every turn, and `onSessionStart` is fire-and-forget, so the version probe is not guaranteed to have answered before round one. The decision is therefore taken once, on the first round, and reused for the session: the probe cannot move the bytes mid-session. A mode change is the one legitimate reason for the block to change, and it is a durable input the caller actually changed.
 		appendSystemPrompt: () => {
-			if (mode === OFF || !bin) return undefined;
+			if (mode === OFF || !binPath()) return undefined;
 			guidanceDecided ??= supported();
 			return guidanceDecided ? wrapBlock('rtk', GUIDANCE) : undefined;
 		},
@@ -357,6 +377,7 @@ export default function (cmd: ModApi): void {
 		},
 
 		beforeToolCall: async ({toolCallId, toolName, input}) => {
+			const bin = binPath();
 			if (mode === OFF || toolName !== 'shell_command' || !bin || !supported()) return undefined;
 			const command = typeof input.command === 'string' ? input.command : '';
 			if (!shouldRewrite(command)) return undefined;

@@ -79,15 +79,15 @@ Every reply ends with one or two lines: what was skipped, and any risk.
 `rtk` mode shells out to the [RTK](https://github.com/rtk-ai/rtk) binary. Install it first:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/master/install.sh | sh
 ```
 
 `/rtk status` reports whether the binary was found and which version it is. When rtk is active:
 
 - **`shell_command` is rewritten** through `rtk rewrite` before it runs, so `git status` executes as `rtk git status`. The full documented exit-code contract is honoured: `0` and `3` carry a rewrite, `1` means no equivalent, and `2` is a deny — a `2` that prints a reason becomes a block carrying that reason, while a silent `2` is a host deny rule rtk only relays and is left to the host to enforce. The emitted `rtk` is **pinned to the absolute path** this mod resolved, because rtk is often installed under `~/.bun/bin`, which the shell may not have on `PATH` — a bare name there would fail as `rtk: not found`.
 - **Shell output with no rewrite is still condensed.** `npm test`, `awk`, and `sed` have no rtk equivalent, yet their output can be cargo-test or pytest shaped. Above 1200 bytes it goes through `rtk pipe` with no `-f`, which auto-detects the format and passes the text through unchanged when nothing matches. A call that *was* rewritten is skipped, since rtk already filtered it.
-- **`grep` and `glob` results are condensed** above 1200 bytes, through `rtk pipe -f grep|find`.
-- **The host's own envelope is never filtered.** A `glob` result opens with `Found N files`; a truncated `grep` closes with `[Showing results with pagination = …]`; `shell_command` opens with `Exit code: 1`. Those lines carry meaning — the count, that the list is truncated, that the command failed — and rtk folds them away as noise. The mod splits them off before the filter and re-attaches them after it, so only the body is ever condensed: the head byte-for-byte, the tail with its notice text exact and only the blank run before it capped at one line.
+- **`grep` and `glob` results are condensed** above 1200 bytes, through `rtk pipe -f grep|find`. The filter is chosen from the result's shape, not its tool name: `grep`'s default `files_with_matches` mode prints a path list under a `Found N files` header, which the grep filter passes through untouched, so that shape is condensed with the find filter instead.
+- **The host's own envelope is never filtered.** Every shape is taken from the host's formatter, not guessed. A `glob` or files-mode `grep` result opens with `Found N files`; a truncated `grep` closes with `[Showing results with pagination = …]`, its count mode with `Found N total occurrences across M files …`, and its timeout with `[Search timed out — …]`; `shell_command` opens with `Exit code: 1` (and the parenthesised interpretation the host adds under it), and closes with `Command aborted`, `Command timed out after …`, a `[cwd change to …]` note, or a `[PowerShell edition: …]` banner. Those lines carry meaning — the count, that the list is truncated, that the command failed — and rtk folds them away as noise. The mod splits them off before the filter and re-attaches them after it, so only the body is ever condensed: the head byte-for-byte, the tail with its notice text exact and only the blank run before it capped at one line.
 - **Every failure passes through.** A missing binary, an abort, a non-zero exit from the filter, or a result that came back larger than the original leaves the original untouched. No rtk call can hang a tool call: `cmd.exec` ignores a `timeout` option, so each one runs under an `AbortController`.
 - **A failed tool result is never filtered** — the error text reaches the model intact.
 - **A binary older than 0.25.0 turns rewrites off** instead of silently doing nothing, since that is the release that added the `rtk rewrite` subcommand (v0.24.0 has none; v0.25.0 does).
@@ -137,7 +137,7 @@ Each mod is one file, default-exporting a factory that registers a slash command
 Three details worth knowing if you fork this:
 
 1. **`cmd.store` is namespaced per mod.** Each mod owns one file under `~/.commandcode/mods/.store/` and persists exactly one key, `mode`. `/compress` never writes a sibling's state; it calls that mod's exposed `setMode`, so exactly one mod owns each value.
-2. **`cmd.getFlag` answers the default at factory time.** Flags are read in `onSessionStart`, after the host binds.
+2. **`cmd.getFlag` answers the default inside the factory.** The host registers every mod first and applies `--mod-option` values afterwards, so a factory-time read never sees the user's value. Every mode flag is therefore read in `onSessionStart`, and `rtk-bin` is resolved lazily on first use, then cached for the session.
 3. **The injected block is byte-stable per level.** The provider's prompt-prefix cache keys off the system prompt, so a level's text must not change between rounds. A level switch swaps the block rather than appending a second one — the text is wrapped in `<caveman>`, `<ponytail>`, or `<rtk>` for exactly that reason.
 
 ## Benchmark
@@ -178,7 +178,7 @@ The exact, quotable numbers are the filter bytes and the prompt overhead. The li
 - **Caveman may not shorten replies at all on your model.** Measured here, only `ultra` saved (~12%) and `full` cost tokens in both runs. Treat the mode names as voice settings, not as a savings guarantee.
 - **The live benchmark cannot rank modes tightly.** Two runs of the same configuration disagreed on 5 of 9 cases. Quote the filter bytes and the prompt overhead; treat reply-token deltas as directional.
 - **The rtk filter is heuristic and declines rather than mangles.** `rtk pipe` refuses anything larger than its input (`never_worse`), so a scattered grep result comes back byte-identical instead of worse — measured at 0.0% on 240 matches across 240 files. A very unusual layout can still read worse; `rtk` mode is off by default and `/rtk off` stops it immediately. The host envelope — header, pagination notice, exit status — is split off before filtering and re-attached verbatim, so those lines are never at risk.
-- **The extra shell pass costs a process.** Measured here, 12–15 ms per qualifying result on a warm page cache. Below 1200 bytes the filter never runs, and `/rtk-shell=false` turns the pass off while keeping rewrites.
+- **The extra shell pass costs a process.** Measured here, 11–17 ms per qualifying result on a warm page cache. Below 1200 bytes the filter never runs, and `/rtk-shell=false` turns the pass off while keeping rewrites.
 - **A compressed reply can read as curt.** That is the mode working. `/caveman off` restores normal prose mid-session.
 - **Windows is supported but less exercised than POSIX.** The filter redirect runs through `cmd.exe /d /s /c`, and a pinned path is double-quoted because cmd.exe gives single quotes no meaning. Both are unit-tested on every OS, and a real `cmd.exe` redirect is asserted by the `windows-latest` CI job; the maintainer's own runs are on Linux, so a Windows-specific report matters more here than elsewhere.
 - **No dollar figure is claimed.** Tersio publishes its own benchmark; this package ports the modes. For the shell half, `/rtk gain` reports what rtk itself saved on your machine, read from its own database rather than estimated.
@@ -188,10 +188,10 @@ The exact, quotable numbers are the filter bytes and the prompt overhead. The li
 ```bash
 npm test           # node:test — rules, store, prompt surgery, every mod's wiring
 npm run typecheck  # tsc --noEmit against types/harness.d.ts
-npm run verify     # typecheck, tests, then each mod through the real Command Code loader
+npm run verify     # typecheck, tests, then import every mod and run its factory
 ```
 
-`npm run verify` is the gate CI runs on Linux, macOS, and Windows against Node 22 and 24.
+`npm run verify` is the gate CI runs on Linux, macOS, and Windows against Node 22.18+ and 24. `cmd mods inspect` only reads the source text, so it cannot catch a factory that throws; `scripts/verify-mods.ts` imports each mod and runs its factory against a stub API, which does.
 
 Tests drive each mod through its exported factory against a fake `ModApi` (`test/harness.ts`), so the hooks and command handlers are covered, not just the pure helpers.
 
@@ -211,8 +211,8 @@ types/
   harness.d.ts     the mod API slice the package compiles against
 bench/            exact (bytes) + live (reply tokens) benchmarks
 docs/             BENCHMARK.md, BENCHMARK-RESULTS.md
-test/              107 tests; 9 of them drive the real rtk binary, the rest use a fake
-                   ModApi so they run without one
+test/              141 tests; 13 of them drive the real rtk binary and skip when it is
+                   absent, the rest use a fake ModApi so they run without one
 ```
 
 ## Attribution

@@ -13,7 +13,7 @@ import {join} from 'node:path';
 import {CAVEMAN_LEVELS, cavemanRule} from '../rules/caveman.ts';
 import {PONYTAIL_LEVELS, ponytailRule} from '../rules/ponytail.ts';
 import {resolveBin} from '../mods/shared.ts';
-import {splitSegments} from '../mods/rtk.ts';
+import {filterForShape, splitSegments} from '../mods/rtk.ts';
 import {
 	makeFindOutput,
 	makeGlobToolOutput,
@@ -21,7 +21,10 @@ import {
 	makeGrepClustered,
 	makeGrepScattered,
 	makeGrepToolTruncated,
+	makeGrepFilesModeOutput,
+	makeGrepCountModeOutput,
 	makeShellToolOutput,
+	makeShellAbortOutput,
 	REWRITE_COMMANDS,
 } from './lib/fixtures.ts';
 import {estimateTokens, formatBytes, formatPct, median, percentile, reduction} from './lib/stats.ts';
@@ -91,7 +94,10 @@ export const ENVELOPE_CASES = [
 	{case: 'glob tool', filter: 'find', tool: 'glob', shape: '260 paths + Found header', build: () => makeGlobToolOutput()},
 	{case: 'glob tool, truncated', filter: 'find', tool: 'glob', shape: '260 paths + truncation notice', build: () => makeGlobToolTruncated()},
 	{case: 'grep tool, truncated', filter: 'grep', tool: 'grep', shape: '240 matches + pagination notice', build: () => makeGrepToolTruncated()},
+	{case: 'grep tool, files mode', filter: 'grep', tool: 'grep', shape: '300 paths + Found header (find filter takes over)', build: () => makeGrepFilesModeOutput()},
+	{case: 'grep tool, count mode', filter: 'grep', tool: 'grep', shape: '400 hits + total-occurrences notice', build: () => makeGrepCountModeOutput()},
 	{case: 'shell tool', filter: null, tool: 'shell_command', shape: 'cargo failure + Exit code head', build: () => makeShellToolOutput()},
+	{case: 'shell tool, timed out', filter: null, tool: 'shell_command', shape: 'pytest failure + timeout notice', build: () => makeShellAbortOutput()},
 ] as const;
 
 // Rules: rtk pipe takes stdin only, so the fixture is redirected from a temp file rather than interpolated into a command line.
@@ -110,10 +116,11 @@ function pipeThrough(bin: string, filter: string | null, input: string): string 
 	}
 }
 
-// Rules: this mirrors the mod's own condense() step exactly — split the host envelope off, filter only the body, put the envelope back. Measuring a path production does not run is what let the envelope bug through.
+// Rules: this mirrors the mod's own condense() step exactly — pick the filter from the shape, split the host envelope off, filter only the body, put the envelope back. Measuring a path production does not run is what let the envelope bug through.
 function condenseTool(bin: string, filter: string | null, tool: string, input: string): {stdout: string; fidelity: string} | null {
+	const shapeFilter = filterForShape(tool, filter, input);
 	const {head, body, tail} = splitSegments(tool, input);
-	const filtered = pipeThrough(bin, filter, body);
+	const filtered = pipeThrough(bin, shapeFilter, body);
 	if (filtered === null) return null;
 	const composed = `${head}${filtered}${tail}`;
 	const keptHead = head === '' || composed.startsWith(head);

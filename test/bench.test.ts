@@ -8,7 +8,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {estimateTokens, formatPct, median, percentile, reduction, table} from '../bench/lib/stats.ts';
-import {makeGrepClustered, makeGrepScattered, makeFindOutput, REWRITE_COMMANDS, makeGlobToolOutput, makeGlobToolTruncated, makeGrepToolTruncated, makeShellToolOutput} from '../bench/lib/fixtures.ts';
+import {makeGrepClustered, makeGrepScattered, makeFindOutput, REWRITE_COMMANDS, makeGlobToolOutput, makeGlobToolTruncated, makeGrepToolTruncated, makeGrepFilesModeOutput, makeGrepCountModeOutput, makeShellToolOutput, makeShellAbortOutput} from '../bench/lib/fixtures.ts';
 import {CODE_PROMPTS, PROSE_PROMPTS, checkCode, checkProse} from '../bench/lib/prompts.ts';
 import {readUsage, writePromptResult} from '../bench/prompt.ts';
 import {writeOutputResult} from '../bench/output.ts';
@@ -88,6 +88,14 @@ test('fixtures: the host tool shapes carry their envelope', () => {
 	assert.match(makeGlobToolTruncated(), /^Found 100 files\n  \.\/src\/d0\/f0\.ts/);
 	assert.match(makeGrepToolTruncated(), /\[Showing results with pagination = limit: 240\]\n$/);
 	assert.match(makeShellToolOutput(), /^Exit code: 1 \(test failure\)\n/);
+});
+
+// Rules: these three cover the shapes that used to be mangled or skipped — grep's default files mode, its count mode, and a shell call that ended on the host's timeout notice. Each keeps its envelope lines intact in the fixture, so the bench measures the same input production sees.
+test('fixtures: the corrected shapes carry their own envelope', () => {
+	assert.match(makeGrepFilesModeOutput(), /^Found 300 files with pagination = limit: 300, offset: 300\n/);
+	assert.match(makeGrepCountModeOutput(), /Found 400 total occurrences across 40 files with pagination = limit: 400, offset: 400\.\n$/);
+	assert.match(makeShellAbortOutput(), /^Exit code: 124\n/);
+	assert.match(makeShellAbortOutput(), /Command timed out after 120000ms \(exit code 124\)\. .*\n$/);
 });
 
 test('checkProse: every group must match, a group is an OR', () => {

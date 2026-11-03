@@ -17,7 +17,7 @@
 	"type": "module",
 	"repository": "https://github.com/malikshi/cmd-compress",
 	"engines": {
-		"node": ">=22"
+		"node": ">=22.18.0"
 	},
 	"files": [
 		"mods",

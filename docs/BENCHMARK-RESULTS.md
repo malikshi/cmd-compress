@@ -38,18 +38,27 @@ From `npm run bench`. No model involved; these bytes are the same on any machine
 
 ### Command Code's own tool shapes
 
-The raw rows above are rtk's fixture, not what this host produces. A `glob` result opens with `Found N files`, a truncated `glob` closes with `(Results are truncated: showing 1-100 of 382 matches …)`, a truncated `grep` closes with `[Showing results with pagination = …]`, and `shell_command` opens with the exit status. These rows run the mod's real split → filter → re-attach path, and the fidelity column asserts the envelope survived.
+The raw rows above are rtk's fixture, not what this host produces. A `glob` result opens with `Found N files`, a truncated `glob` closes with `(Results are truncated: showing 1-100 of 382 matches …)`, a truncated `grep` closes with `[Showing results with pagination = …]` or `Found N total occurrences across M files …`, and `shell_command` opens with the exit status and may close with `Command aborted` or `Command timed out after …`. These rows run the mod's real split → filter → re-attach path, and the fidelity column asserts the envelope survived.
 
 | Case | Envelope | Bytes in | Bytes out | Saved | Fidelity |
 |---|---|---:|---:|---:|---|
 | glob tool | `Found 260 files` header | 4,326 | 1,149 | **73.4%** | header kept |
 | glob tool, truncated | header + truncation notice | 5,021 | 1,345 | **73.2%** | header kept, trailer kept |
 | grep tool, truncated | pagination notice | 15,540 | 3,183 | **79.5%** | trailer kept |
+| grep tool, files mode | `Found 300 files …` header (find filter) | 4,448 | 620 | **86.1%** | header kept |
+| grep tool, count mode | total-occurrences notice | 17,228 | 14,420 | **16.3%** | trailer kept |
 | shell tool | `Exit code: 1` head | 2,769 | 324 | **88.3%** | header kept |
+| shell tool, timed out | header + timeout notice | 5,889 | 340 | **94.2%** | header kept, trailer kept |
 
 A live headless run against a fixture repo confirms it outside the bench: a `glob` of 380 files came back as `Found 100 files` plus rtk's grouped body and the host's own truncation notice intact — **1,771 → 471 bytes**, every directory named.
 
-Those four rows exist because an earlier build lost every one of them: the `find` filter read `Found N files` as a path, the `grep` filter folded the pagination notice away as noise, and the shell pass folded away `Exit code: 1`. All three were measured, then fixed by filtering only the body and re-attaching the host's envelope verbatim. The truncation notice itself was the second discovery: the first fix guessed at `[…]` when the host actually prints `(Results are truncated: showing 1-100 of 382 matches …)`, caught by reading a real result instead of the source.
+Those rows exist because an earlier build lost or skipped every one of them. Each was found by reading the host's own formatter and the real binary's output, not by guessing:
+
+- The `find` filter read `Found N files` as a path, the `grep` filter folded the pagination notice away as noise, and the shell pass folded away `Exit code: 1`. Fixed by filtering only the body and re-attaching the host's envelope verbatim.
+- The truncation notice was a second discovery: the first fix guessed at `[…]` when the host prints `(Results are truncated: showing 1-100 of 382 matches …)`.
+- **Count mode, the timeout notice, the cwd note and the edition banner were still being folded away.** `rtk pipe` dropped `Found N total occurrences across M files …`, `[Search timed out — …]`, `Command timed out after 120000ms (exit code 124). …`, `[cwd change to …]` and `[PowerShell edition: …]`, and the mod's trailer regex matched none of them — measured, the whole tail vanished from the model's view.
+- **The interpreted exit code was lost.** `formatResult2` writes `(No matches found)` on its own line under `Exit code: 1`; that line went into the body and was folded.
+- **`grep`'s default mode compressed nothing.** The tool defaults to `files_with_matches`, a path list under a `Found N files` header. The mod forced `-f grep`, which returns that shape byte-identical (4,448 → 4,448); the shape now selects the find filter instead (→ 620).
 
 Rewrite: 12 of 12 commands rewritten, ~77 ms mean, ~82 ms p95.
 

@@ -56,7 +56,7 @@ npm run bench:prompt -- 3                 # 3 runs per prompt per case, session 
 npm run bench:prompt -- 3 nexrouter/deepseek-v4.1-flash
 ```
 
-It writes `bench/results/prompt.md`. **This spends real tokens**: each case is `runs × 6` headless sessions, and the default matrix is 10 cases.
+It writes `bench/results/prompt.md`. **This spends real tokens**: each case is `runs × 9` headless sessions (3 open, 3 pinned, 3 code prompts), and the default matrix is 10 cases.
 
 ### What it measures
 
@@ -121,8 +121,8 @@ Read Δ Tokens beside **Input median**. A mode can cut reply tokens and still co
 ```bash
 git checkout <the commit you measured>
 npm test                      # the mods must pass before their numbers mean anything
-npm run bench                 # exact half — same bytes on any machine with the same rtk
-npm run bench -- 3 <model-id> # live half — record the model id in the result file
+npm run bench                        # exact half — same bytes on any machine with the same rtk
+npm run bench:prompt -- 3 <model-id> # live half — record the model id in the result file
 ```
 
 Record the rtk version (`rtk --version`) and the Command Code version (`cmd --version`) beside any result you publish. A result without both is not reproducible.

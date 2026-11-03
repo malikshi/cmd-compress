@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import {normalizeCavemanLevel, CAVEMAN_STOP_PHRASES} from '../mods/caveman.ts';
 import {normalizePonytailLevel, PONYTAIL_STOP_PHRASES} from '../mods/ponytail.ts';
 import {COMPRESS_PRESETS, presetFor} from '../mods/compress.ts';
-import {shouldRewrite, filterNameFor, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText, pinBinary} from '../mods/rtk.ts';
+import {shouldRewrite, filterNameFor, filterForShape, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText, pinBinary} from '../mods/rtk.ts';
 
 test('normalizeCavemanLevel: on and empty mean the default, off and stop mean off', () => {
 	assert.equal(normalizeCavemanLevel(''), 'full');
@@ -111,6 +111,14 @@ test('filterNameFor: grep and glob map to rtk filters, others do not', () => {
 	assert.equal(filterNameFor('grep'), 'grep');
 	assert.equal(filterNameFor('glob'), 'find');
 	assert.equal(filterNameFor('read_file'), undefined);
+});
+
+// Rules: the grep tool's default mode emits a path list under a `Found N files` header, which the grep filter returns unchanged. The shape overrides the tool's nominal filter so that result is condensed instead of passed through.
+test('filterForShape: a Found header on a grep result selects the find filter', () => {
+	assert.equal(filterForShape('grep', 'grep', 'Found 300 files\nsrc/a.ts\n'), 'find');
+	assert.equal(filterForShape('grep', 'grep', 'src/a.ts:1: hit\n'), 'grep', 'content rows keep the grep filter');
+	assert.equal(filterForShape('glob', 'find', 'Found 3 files\n'), 'find');
+	assert.equal(filterForShape('shell_command', null, 'Found 3 files\n'), null, 'a shell body is auto-detected, never forced');
 });
 
 test('MIN_FILTER_BYTES: the spawn threshold is above one screenful', () => {

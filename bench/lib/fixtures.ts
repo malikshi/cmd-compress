@@ -108,3 +108,29 @@ export function makeShellToolOutput(): string {
 	].join('\n');
 	return `Exit code: 1 (test failure)\n${body}\n`;
 }
+
+// Rules: grep's default output mode is files_with_matches — a path list under a `Found N files` header, not `path:line:text`. The grep filter passes this shape through untouched, so it is measured separately to keep that 0%/find-win visible.
+export function makeGrepFilesModeOutput(files = 300, dirs = 5): string {
+	const paths = Array.from({length: files}, (_, index) => `src/d${index % dirs}/f${index}.ts`);
+	return `Found ${files} files with pagination = limit: ${files}, offset: ${files}\n${paths.join('\n')}\n`;
+}
+
+export function makeGrepCountModeOutput(files = 40, perFile = 10): string {
+	const rows = Array.from({length: files}, (_, file) =>
+		Array.from({length: perFile}, (_, hit) => `src/file${file}.ts:${hit + 1}:  const x = compute(input)`).join('\n'),
+	);
+	return `${rows.join('\n')}\n\nFound ${files * perFile} total occurrences across ${files} files with pagination = limit: ${files * perFile}, offset: ${files * perFile}.\n`;
+}
+
+export function makeShellAbortOutput(): string {
+	const body = [
+		'running 3 tests',
+		'test tests::it_works ... ok',
+		'test tests::fails_here ... FAILED',
+		'failures:',
+		'    tests::fails_here',
+		'test result: FAILED. 2 passed; 1 failed; 0 ignored',
+		...Array.from({length: 120}, (_, index) => `    filler line that the filter folds away ${index}`),
+	].join('\n');
+	return `Exit code: 124\n${body}\n\nCommand timed out after 120000ms (exit code 124). If this is expected to take longer and is not waiting for interactive input, retry with a larger timeout or run_in_background=true.\n`;
+}

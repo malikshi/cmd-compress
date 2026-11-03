@@ -639,3 +639,19 @@ test('rtk: an explicit --rtk-bin is used instead of probing PATH', async () => {
 	await firstHook(fake).beforeToolCall?.({toolCallId: 'b1', toolName: 'shell_command', input: {command: 'git status'}});
 	assert.equal(seen[0], '/custom/place/rtk', 'the flag wins over the probe');
 });
+
+// Rules: the real host registers every mod, then applies --mod-option (measured: a probe mod read its own default in the factory and the user value only in onSessionStart). A factory-time getFlag therefore ignores --rtk-bin, which is exactly what this mod used to do. The fix defers the read, so the FIRST hook call must already see the user's path.
+test('rtk: --rtk-bin set after load is honoured on the first hook call', async () => {
+	const seen: string[] = [];
+	const fake = load(rtk, {
+		exec: async request => {
+			seen.push(request.command);
+			return {stdout: 'rtk git status', stderr: '', code: 0};
+		},
+	});
+	// the host applies the option after the factory has run: mutate the fake's flags now
+	fake.cmd.getFlag = (name: string) => (name === 'rtk-bin' ? '/late/applied/rtk' : undefined);
+	runHandler(fake.commands, 'rtk', 'on');
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'b2', toolName: 'shell_command', input: {command: 'git status'}});
+	assert.equal(seen.at(-1), '/late/applied/rtk', 'the value present at first use wins, not the one at factory time');
+});
