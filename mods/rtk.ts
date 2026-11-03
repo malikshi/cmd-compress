@@ -177,6 +177,9 @@ export default function (cmd: ModApi): void {
 	const cwd = typeof cmd.cwd === 'string' && cmd.cwd ? cmd.cwd : undefined;
 
 	let version: RtkVersion | null = null;
+	let versionProbe: Promise<void> | null = null;
+	// undefined = not yet decided for this session; a later mode change clears it so a re-enable decides again.
+	let guidanceDecided: boolean | undefined;
 	const supported = () => isSupportedVersion(version);
 	const versionNote = () => {
 		if (!bin) return 'binary: NOT FOUND';
@@ -184,9 +187,15 @@ export default function (cmd: ModApi): void {
 		const label = `${version.major}.${version.minor}.${version.patch}`;
 		return supported() ? `binary: ${label}` : `binary: ${label} (too old — need >= 0.${MIN_SUPPORTED_RTK_MINOR}.0)`;
 	};
+	// Rules: the guidance block must be byte-stable across rounds or the provider's prompt-prefix cache misses every turn. `version` starts null and `isSupportedVersion(null)` is true, so the answer flips only once a probe says the binary is too old; awaiting the probe before deciding makes that flip happen before the first round instead of between two.
+	const versionSettled = () => {
+		versionProbe ??= readVersion();
+		return versionProbe;
+	};
 
 	function setMode(next: string): void {
 		mode = next;
+		guidanceDecided = undefined;
 		writeOwnMode(cmd.store, next);
 	}
 
@@ -315,11 +324,19 @@ export default function (cmd: ModApi): void {
 		// Rules: a flag is a per-session override, applied when the host binds — getFlag answers the default at factory time.
 		onSessionStart: () => {
 			const flag = String(cmd.getFlag('rtk') ?? '').trim().toLowerCase();
-			if (flag === 'on' || flag === 'off') mode = flag;
-			void readVersion();
+			if (flag === 'on' || flag === 'off') {
+				mode = flag;
+				guidanceDecided = undefined;
+			}
+			void versionSettled();
 		},
 
-		appendSystemPrompt: () => (mode === OFF || !bin || !supported() ? undefined : wrapBlock('rtk', GUIDANCE)),
+		// Rules: the block must be byte-stable across rounds or the provider's prompt-prefix cache misses every turn, and `onSessionStart` is fire-and-forget, so the version probe is not guaranteed to have answered before round one. The decision is therefore taken once, on the first round, and reused for the session: the probe cannot move the bytes mid-session. A mode change is the one legitimate reason for the block to change, and it is a durable input the caller actually changed.
+		appendSystemPrompt: () => {
+			if (mode === OFF || !bin) return undefined;
+			guidanceDecided ??= supported();
+			return guidanceDecided ? wrapBlock('rtk', GUIDANCE) : undefined;
+		},
 
 		// Rules: `normal mode` ends EVERY mode, so a session where rtk is the only mod loaded must still answer it; caveman and ponytail normally handle it first, and the host stops the chain at the first `handled`.
 		transformInput: ({text}) => {

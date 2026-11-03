@@ -567,3 +567,35 @@ test('compress: a preset applied in one session survives into the next', async (
 	assert.equal(mode('ponytail'), 'full', 'ponytail restored the preset level');
 	assert.equal(mode('rtk'), 'on', 'rtk restored the preset level');
 });
+
+test('rtk: the guidance block is byte-stable across rounds, so the prompt cache survives', async () => {
+	// the appended bytes are what the provider's prompt cache keys on, so the probe resolving mid-session must not move them.
+	for (const version of ['rtk 1.0.1', 'rtk 0.20.0'] as const) {
+		const fake = load(rtk, {
+			exec: async request => {
+				if (request.args?.[0] === '--version') return {stdout: version, stderr: '', code: 0};
+				return {stdout: '', stderr: '', code: 1};
+			},
+		});
+		runHandler(fake.commands, 'rtk', 'on');
+		const hook = firstHook(fake);
+		const firstRound = hook.appendSystemPrompt?.();
+		sessionStart(fake);
+		await new Promise(resolve => setTimeout(resolve, 20));
+		const secondRound = hook.appendSystemPrompt?.();
+		assert.equal(firstRound, secondRound, `${version}: the block changed between rounds`);
+	}
+});
+
+test('rtk: a too-old binary that answers before round one injects no guidance', async () => {
+	const fake = load(rtk, {
+		exec: async request => {
+			if (request.args?.[0] === '--version') return {stdout: 'rtk 0.20.0', stderr: '', code: 0};
+			return {stdout: '', stderr: '', code: 1};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	sessionStart(fake);
+	await new Promise(resolve => setTimeout(resolve, 20));
+	assert.equal(appends(fake), '', 'the probe answered before the first round, so the decision already knows');
+});
