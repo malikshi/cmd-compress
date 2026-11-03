@@ -15,13 +15,20 @@ export interface FakeCommand {
 export interface FakeHooks {
 	appendSystemPrompt?: () => string | undefined;
 	transformInput?: (arg: {text: string}) => unknown;
-	beforeToolCall?: (arg: {toolName: string; input: Record<string, unknown>}) => Promise<unknown>;
-	afterToolCall?: (arg: {toolName: string; result: unknown; isError: boolean}) => Promise<unknown>;
+	beforeToolCall?: (arg: {toolCallId?: string; toolName: string; input: Record<string, unknown>}) => Promise<unknown>;
+	afterToolCall?: (arg: {toolCallId?: string; toolName: string; result: unknown; isError: boolean}) => Promise<unknown>;
 	onSessionStart?: () => void;
 	onRunEnd?: () => void;
 }
 
-export function createFakeCmd(options: {flags?: Record<string, unknown>; exec?: (request: {command: string; args?: string[]}) => Promise<{stdout: string; stderr: string; code: number}>} = {}) {
+export interface FakeExecRequest {
+	command: string;
+	args?: string[];
+	cwd?: string;
+	signal?: AbortSignal;
+}
+
+export function createFakeCmd(options: {flags?: Record<string, unknown>; exec?: (request: FakeExecRequest) => Promise<{stdout: string; stderr: string; code: number}>} = {}) {
 	const stores = new Map<string, Map<string, unknown>>();
 	const exposed = new Map<string, Map<string, unknown>>();
 	const commands = new Map<string, FakeCommand>();

@@ -206,6 +206,160 @@ test('rtk: hostile grep output reaches the filter as data, not as shell source',
 	assert.match(filterCommand, / pipe -f grep < "/, 'the payload arrives through a redirected file');
 });
 
+// Rules: rtk's exit 2 is a deny in its own contract — running the command anyway would ignore a rule the operator wrote.
+test('rtk: exit 2 with a message blocks the call and carries the reason', async () => {
+	const fake = load(rtk, {
+		exec: async () => ({stdout: 'pipeline rule forbids push', stderr: '', code: 2}),
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	const result = (await fake.hooks[0].beforeToolCall?.({
+		toolCallId: 'c1',
+		toolName: 'shell_command',
+		input: {command: 'git push origin main'},
+	})) as {block: boolean; additionalContext: string};
+	assert.equal(result.block, true);
+	assert.match(result.additionalContext, /pipeline rule forbids push/);
+});
+
+// Rules: an empty exit 2 is a host deny rule rtk only relays; the host owns that decision, so the command passes.
+test('rtk: exit 2 without a message passes, because the deny belongs to the host', async () => {
+	const fake = load(rtk, {exec: async () => ({stdout: '', stderr: '', code: 2})});
+	runHandler(fake.commands, 'rtk', 'on');
+	assert.equal(
+		await fake.hooks[0].beforeToolCall?.({toolCallId: 'c1', toolName: 'shell_command', input: {command: 'git push'}}),
+		undefined,
+	);
+});
+
+test('rtk: exit 3 still supplies a rewrite', async () => {
+	const fake = load(rtk, {exec: async () => ({stdout: 'rtk ls', stderr: '', code: 3})});
+	runHandler(fake.commands, 'rtk', 'on');
+	const result = (await fake.hooks[0].beforeToolCall?.({
+		toolCallId: 'c1',
+		toolName: 'shell_command',
+		input: {command: 'ls'},
+	})) as {input: {command: string}};
+	assert.equal(result.input.command, 'rtk ls');
+});
+
+// Rules: `npm test` has no rewrite, so the only way its output is ever condensed is the auto-detect pass.
+test('rtk: unrewritten shell output is still condensed by auto-detect', async () => {
+	const calls: string[] = [];
+	const fake = load(rtk, {
+		exec: async request => {
+			calls.push([request.command, ...(request.args ?? [])].join(' '));
+			if (request.args?.[0] === 'rewrite') return {stdout: '', stderr: '', code: 1};
+			return {stdout: 'FAILURES (1):\n', stderr: '', code: 0};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	assert.equal(
+		await fake.hooks[0].beforeToolCall?.({toolCallId: 'c9', toolName: 'shell_command', input: {command: 'npm test'}}),
+		undefined,
+	);
+	const filtered = (await fake.hooks[0].afterToolCall?.({
+		toolCallId: 'c9',
+		toolName: 'shell_command',
+		result: [{type: 'text', text: 'x'.repeat(3000)}],
+		isError: false,
+	})) as {content: Array<{text: string}>};
+	assert.equal(filtered.content[0].text, 'FAILURES (1):\n');
+	assert.match(calls.at(-1) ?? '', / pipe < "/, 'auto-detect runs with no -f');
+});
+
+// Rules: a rewritten call was already filtered by rtk itself, so a second pass would cost a process and gain nothing.
+test('rtk: a shell call rtk rewrote is not filtered twice', async () => {
+	let pipes = 0;
+	const fake = load(rtk, {
+		exec: async request => {
+			if (request.args?.[0] === 'rewrite') return {stdout: 'rtk git status', stderr: '', code: 0};
+			if (request.args?.join(' ').includes(' pipe ')) pipes += 1;
+			return {stdout: 'condensed\n', stderr: '', code: 0};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	await fake.hooks[0].beforeToolCall?.({toolCallId: 'c2', toolName: 'shell_command', input: {command: 'git status'}});
+	await fake.hooks[0].afterToolCall?.({
+		toolCallId: 'c2',
+		toolName: 'shell_command',
+		result: [{type: 'text', text: 'x'.repeat(3000)}],
+		isError: false,
+	});
+	assert.equal(pipes, 0);
+});
+
+test('rtk: a stray result without a matching rewrite is filtered', async () => {
+	const fake = load(rtk, {exec: async () => ({stdout: 'condensed\n', stderr: '', code: 0})});
+	runHandler(fake.commands, 'rtk', 'on');
+	const filtered = (await fake.hooks[0].afterToolCall?.({
+		toolCallId: 'never-seen',
+		toolName: 'shell_command',
+		result: [{type: 'text', text: 'x'.repeat(3000)}],
+		isError: false,
+	})) as {content: Array<{text: string}>};
+	assert.equal(filtered.content[0].text, 'condensed\n');
+});
+
+test('rtk: the shell filter has its own off switch', async () => {
+	const fake = load(rtk, {
+		flags: {'rtk-shell': false},
+		exec: async () => ({stdout: 'condensed\n', stderr: '', code: 0}),
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	assert.equal(
+		await fake.hooks[0].afterToolCall?.({
+			toolCallId: 'c3',
+			toolName: 'shell_command',
+			result: [{type: 'text', text: 'x'.repeat(3000)}],
+			isError: false,
+		}),
+		undefined,
+	);
+});
+
+// Rules: `cmd.exec` has no timeout option, so a hung rtk must be aborted or it blocks the tool call forever.
+test('rtk: every rtk call is bounded by an abort signal', async () => {
+	const signals: Array<AbortSignal | undefined> = [];
+	const fake = load(rtk, {
+		exec: async request => {
+			signals.push(request.signal);
+			return {stdout: 'rtk git status', stderr: '', code: 0};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	await fake.hooks[0].beforeToolCall?.({toolCallId: 'c4', toolName: 'shell_command', input: {command: 'git status'}});
+	assert.ok(signals.length > 0);
+	assert.ok(signals.every(signal => signal instanceof AbortSignal), 'the call carries an AbortSignal');
+});
+
+test('rtk: a too-old binary turns rewrites off and says so', async () => {
+	const fake = load(rtk, {exec: async () => ({stdout: 'rtk 0.22.9', stderr: '', code: 0})});
+	fake.hooks[0].onSessionStart?.();
+	await new Promise(resolve => setTimeout(resolve, 0));
+	const result = await fake.hooks[0].beforeToolCall?.({
+		toolCallId: 'c5',
+		toolName: 'shell_command',
+		input: {command: 'git status'},
+	});
+	assert.equal(result, undefined, 'no rewrite from a binary below the supported minor');
+	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /too old/);
+	assert.equal(appends(fake), '', 'no guidance promising rewrites that cannot happen');
+});
+
+test('rtk: /rtk gain reports the stored savings, and says so when it cannot read them', async () => {
+	const fake = load(rtk, {
+		exec: async () => ({
+			stdout: JSON.stringify({summary: {total_commands: 120, total_saved: 5400, total_input: 9000, avg_savings_pct: 60}}),
+			stderr: '',
+			code: 0,
+		}),
+	});
+	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'gain')), /5,400 tokens over 120 commands \(60\.0%\)/);
+
+	const broken = load(rtk, {exec: async () => ({stdout: 'not json', stderr: '', code: 0})});
+	assert.match(messageOf(await runHandler(broken.commands, 'rtk', 'gain')), /Could not read rtk gain/);
+});
+
 test('compress: the preset reaches all three mods and status reads them back', () => {
 	const cavemanFake = load(caveman);
 	const ponytailFake = load(ponytail);

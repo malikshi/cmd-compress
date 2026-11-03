@@ -1,9 +1,11 @@
-// rtk — condensed shell output: rewrites shell_command through `rtk rewrite` and filters grep/glob results.
-// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, shouldRewrite, filterNameFor
+// rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
+// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, filterNameFor, parseRtkVersion, isSupportedVersion, classifyRewrite
 // used_by: package.json (commandcode.mods), mods/compress.ts, test/rtk.test.ts
 // related: mods/shared.ts
-// rules: fail open on every path — a missing binary, a timeout, or exit 1/2 leaves the original command untouched.
+// rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
+// rules: exit 2 is a deny from rtk's own contract: a message on stdout names the rule that blocked it, so it becomes a block; empty means a Claude-only deny rule the host does not own, so it passes.
 // agent: 2026-11-02 ported from rtk-ai/rtk hooks/pi/rtk.ts and tersio extensions/rtk
+// agent: 2026-11-02 honour exit 2 as a deny, add auto-detect output condensing for unrewritten shell calls, drop the ignored exec `timeout` for an AbortController, add gain + version reporting
 
 import type {ModApi} from '@commandcode/harness';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -16,19 +18,50 @@ export const REWRITE_TIMEOUT_MS = 2000;
 // Rules: below this the extra process costs more than the filter saves.
 export const MIN_FILTER_BYTES = 1200;
 
+// Rules: `rtk rewrite` shipped in 0.23.0; an older binary fails every rewrite open, so say so instead of pretending to work.
+export const MIN_SUPPORTED_RTK_MINOR = 23;
+
 const FILTER_TIMEOUT_MS = 5000;
 
-const FILTER_BY_TOOL: Record<string, string> = {grep: 'grep', glob: 'find'};
+const FILTER_BY_TOOL: Record<string, string> = {grep: 'grep', glob: 'find', rg: 'grep'};
 
 export function filterNameFor(toolName: string): string | undefined {
 	return FILTER_BY_TOOL[toolName];
 }
 
-const GUIDANCE = `RTK is active: shell output is condensed before it reaches you. Every signal survives — the failing test name, the assertion, the file and line. Treat a condensed result as complete and re-run it unfiltered only when the result is empty when output was expected, contradicts its exit code, or is garbled.
+export type RtkVersion = {major: number; minor: number; patch: number};
 
-Call rtk directly for what the automatic rewrite cannot express: \`rtk read <file> --level aggressive\` for an overview, \`rtk smart <file>\` for two lines, \`rtk err <cmd>\` for errors only, \`rtk log <file>\` to dedupe, \`rtk json <file> --keys-only\` for shape, \`rtk deps\`, \`rtk diff\`, \`rtk env\`, \`rtk test <cmd>\`, and \`rtk find -name '*.ts'\`. Do not type \`rtk\` in front of a command already rewritten for you. \`rtk gain\` reports what it saved; \`RTK_DISABLED=1 <cmd>\` skips it for one command.`;
+// Rules: output is `rtk 1.0.1`; anything unparseable is null so the caller stays quiet rather than inventing a version.
+export function parseRtkVersion(raw: string): RtkVersion | null {
+	const match = raw.trim().match(/(\d+)\.(\d+)\.(\d+)/);
+	if (!match) return null;
+	return {major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3])};
+}
 
-// Rules: a command that is already rtk-prefixed, empty, or a shell function definition is left alone so rewrites cannot compound.
+// Rules: a pre-1.0 binary must reach minor 23; any 1.x already satisfies it.
+export function isSupportedVersion(version: RtkVersion | null): boolean {
+	if (!version) return true;
+	return version.major > 0 || version.minor >= MIN_SUPPORTED_RTK_MINOR;
+}
+
+export type RewriteVerdict =
+	| {kind: 'rewrite'; command: string}
+	| {kind: 'deny'; reason: string}
+	| {kind: 'pass'};
+
+// Rules: mirrors rtk's documented exit contract — 0 and 3 carry a rewrite, 2 carries a deny (with a message only when an rtk rule, not a host rule, blocked it), everything else passes.
+export function classifyRewrite(code: number, stdout: string, original: string): RewriteVerdict {
+	const out = stdout.trim();
+	if (code === 0 || code === 3) {
+		return out && out !== original ? {kind: 'rewrite', command: out} : {kind: 'pass'};
+	}
+	if (code === 2) {
+		return out ? {kind: 'deny', reason: out} : {kind: 'pass'};
+	}
+	return {kind: 'pass'};
+}
+
+// Rules: a command that is already rtk-prefixed, empty, or a disabled one is left alone so rewrites cannot compound.
 export function shouldRewrite(command: string): boolean {
 	const trimmed = command.trim();
 	if (!trimmed) return false;
@@ -37,13 +70,42 @@ export function shouldRewrite(command: string): boolean {
 	return true;
 }
 
+// Rules: grouping is applied by hand because toLocaleString varies with the host locale, so the message would differ per machine.
+function grouped(value: number): string {
+	return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+const GUIDANCE = `RTK is active: command output is condensed before it reaches you. Every signal survives — the failing test name, the assertion, the file and line. Treat a condensed result as complete. Re-run a command unfiltered only when its result is empty when output was clearly expected, contradicts its exit code, or is garbled; do that with \`rtk bypass <cmd>\` or \`RTK_DISABLED=1 <cmd>\`, not by dropping the prefix yourself.
+
+Call rtk directly for what the automatic rewrite cannot express: \`rtk read <file> --level aggressive\` for an overview, \`rtk smart <file>\` for two lines, \`rtk err <cmd>\` for errors only, \`rtk log <file>\` to dedupe, \`rtk json <file> --keys-only\` for shape, \`rtk deps\`, \`rtk diff\`, \`rtk env\`, \`rtk test <cmd>\`, and \`rtk find . -name '*.ts'\`. Do not type \`rtk\` in front of a command that is already rewritten for you.
+
+Condensed output states its own recovery path. An elided span prints a count such as \`+50\`, and when the full text was kept it also prints a hint naming \`rtk recall <hash>\`; use that hint rather than re-running the command, which can be slow or have side effects. When there is a count but no hash the elided lines were not stored — re-read the specific file or range instead of re-running the whole command. \`rtk gain\` reports what rtk has saved; \`rtk discover\` finds past commands it could have condensed.`;
+
+// Rules: exported so a test can check every named subcommand against the installed binary instead of trusting the prose.
+export function guidanceText(): string {
+	return GUIDANCE;
+}
+
 export default function (cmd: ModApi): void {
 	cmd.addFlag('rtk', {type: 'string', default: '', description: 'Start mode: on|off (default: off)'});
-	cmd.addFlag('rtk-filter', {type: 'boolean', default: true, description: 'Also condense grep/glob tool output'});
+	cmd.addFlag('rtk-filter', {type: 'boolean', default: true, description: 'Condense grep/glob tool output'});
+	cmd.addFlag('rtk-shell', {type: 'boolean', default: true, description: 'Condense shell output that no rewrite covered'});
 
 	let mode = readOwnMode(cmd.store);
 
 	const bin = resolveBin('rtk');
+
+	// Rules: the rewrite is judged against the session's rules, so it runs in the session cwd; a deny file above it is found the same way rtk finds it for any other host.
+	const cwd = typeof cmd.cwd === 'string' && cmd.cwd ? cmd.cwd : undefined;
+
+	let version: RtkVersion | null = null;
+	const supported = () => isSupportedVersion(version);
+	const versionNote = () => {
+		if (!bin) return 'binary: NOT FOUND';
+		if (!version) return `binary: ${bin}`;
+		const label = `${version.major}.${version.minor}.${version.patch}`;
+		return supported() ? `binary: ${label}` : `binary: ${label} (too old — need >= 0.${MIN_SUPPORTED_RTK_MINOR}.0)`;
+	};
 
 	function setMode(next: string): void {
 		mode = next;
@@ -59,54 +121,52 @@ export default function (cmd: ModApi): void {
 	});
 	cmd.expose('getMode', () => mode);
 
-	cmd.addCommand({
-		name: 'rtk',
-		description: 'Toggle RTK condensed shell output for this session',
-		argumentHint: '[on|off|status]',
-		handler: ({args}) => {
-			const arg = args.trim().toLowerCase();
-			if (!arg || arg === 'status') {
-				const where = bin ? `binary: ${bin}` : 'binary: NOT FOUND — install rtk, then /reload';
-				return {message: `RTK: ${mode} (${where})`};
-			}
-			if (arg !== 'on' && arg !== 'off') return {message: 'Usage: /rtk [on|off|status]'};
-			setMode(arg);
-			if (arg === 'on' && !bin) return {message: 'RTK on, but the rtk binary was not found. Install it, then /reload.'};
-			return {message: `RTK ${arg}.`};
-		},
-	});
-
-	// Rules: rewrite only when a binary exists and the mode is on; every failure returns undefined (pass through).
-	async function rewrite(command: string): Promise<string | null> {
-		if (!bin) return null;
+	// Rules: `cmd.exec` accepts no timeout (it ignores the option), so abort through a signal or a hung rtk blocks the tool call forever.
+	async function exec(options: {command: string; args: string[]}, timeoutMs: number) {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
 		try {
-			const {stdout, code} = await cmd.exec({
-				command: bin,
-				args: ['rewrite', command],
-				timeout: REWRITE_TIMEOUT_MS,
-			});
-			if (code !== 0 && code !== 3) return null;
-			const rewritten = stdout.trim();
-			return rewritten && rewritten !== command ? rewritten : null;
+			return await cmd.exec({...options, cwd, signal: controller.signal});
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	async function readVersion(): Promise<void> {
+		if (!bin) return;
+		try {
+			const {stdout} = await exec({command: bin, args: ['--version']}, REWRITE_TIMEOUT_MS);
+			version = parseRtkVersion(stdout);
 		} catch {
-			return null;
+			version = null;
+		}
+	}
+
+	async function rewrite(command: string): Promise<RewriteVerdict> {
+		if (!bin || !supported()) return {kind: 'pass'};
+		try {
+			const {stdout, code} = await exec({command: bin, args: ['rewrite', command]}, REWRITE_TIMEOUT_MS);
+			return classifyRewrite(code, stdout, command);
+		} catch {
+			return {kind: 'pass'};
 		}
 	}
 
 	// Rules: `rtk pipe` reads stdin and exec has no stdin, so the text goes to a temp file and is redirected in.
 	// Rules: never pass tool output through a heredoc — a line equal to the delimiter would run as shell.
-	async function filterThroughRtk(filter: string, text: string): Promise<string | null> {
+	// Rules: an omitted filter lets rtk auto-detect; it is an identity pass when nothing matches and `never_worse` refuses anything larger than the input.
+	async function filterThroughRtk(filter: string | null, text: string): Promise<string | null> {
 		if (!bin || process.platform === 'win32') return null;
 		let dir: string | undefined;
 		try {
 			dir = mkdtempSync(join(tmpdir(), 'cmd-compress-'));
 			const file = join(dir, 'in.txt');
 			writeFileSync(file, text, 'utf8');
-			const {stdout, code} = await cmd.exec({
-				command: '/bin/sh',
-				args: ['-c', `"${bin}" pipe -f ${filter} < "${file}"`],
-				timeout: FILTER_TIMEOUT_MS,
-			});
+			const flags = filter ? `-f ${filter} ` : '';
+			const {stdout, code} = await exec(
+				{command: '/bin/sh', args: ['-c', `"${bin}" pipe ${flags}< "${file}"`]},
+				FILTER_TIMEOUT_MS,
+			);
 			if (code !== 0) return null;
 			const out = stdout;
 			if (!out.trim() || out.length >= text.length) return null;
@@ -125,33 +185,93 @@ export default function (cmd: ModApi): void {
 		return parts.map(part => part.text ?? '').join('\n');
 	}
 
+	// Rules: a shell call rtk already rewrote had its output filtered by rtk, so condensing it again would spend a second process for nothing.
+	const rewrittenCalls = new Set<string>();
+
+	// Rules: without an id the pair cannot be matched, so the filter errs toward skipping the second pass rather than double-filtering.
+	const wasRewritten = (toolCallId: unknown) =>
+		typeof toolCallId === 'string' && rewrittenCalls.delete(toolCallId);
+
+	cmd.addCommand({
+		name: 'rtk',
+		description: 'Toggle RTK condensed command output for this session',
+		argumentHint: '[on|off|gain|status]',
+		handler: async ({args}) => {
+			const arg = args.trim().toLowerCase();
+			if (arg === 'gain') {
+				if (!bin) return {message: 'rtk binary not found — install rtk, then /reload.'};
+				try {
+					const {stdout, code} = await exec({command: bin, args: ['gain', '-f', 'json']}, FILTER_TIMEOUT_MS);
+					if (code !== 0) return {message: 'rtk gain is unavailable in this build.'};
+					const parsed = JSON.parse(stdout) as {
+						summary?: {total_commands?: number; total_saved?: number; total_input?: number; avg_savings_pct?: number};
+					};
+					const s = parsed.summary;
+					if (!s) return {message: 'rtk gain returned no summary.'};
+					const saved = Number(s.total_saved) || 0;
+					const pct = Number(s.avg_savings_pct) || 0;
+					return {
+						message: `RTK saved ${grouped(saved)} tokens over ${grouped(Number(s.total_commands) || 0)} commands (${pct.toFixed(1)}%).`,
+					};
+				} catch {
+					return {message: 'Could not read rtk gain.'};
+				}
+			}
+			if (!arg || arg === 'status') {
+				return {message: `RTK: ${mode} (${versionNote()})`};
+			}
+			if (arg !== 'on' && arg !== 'off') return {message: 'Usage: /rtk [on|off|gain|status]'};
+			setMode(arg);
+			if (arg === 'on' && !bin) return {message: 'RTK on, but the rtk binary was not found. Install it, then /reload.'};
+			if (arg === 'on' && !supported()) return {message: `RTK on, but ${versionNote()}. Upgrade rtk — rewrites fall back to raw until then.`};
+			return {message: `RTK ${arg}.`};
+		},
+	});
+
 	cmd.hooks({
 		// Rules: a flag is a per-session override, applied when the host binds — getFlag answers the default at factory time.
 		onSessionStart: () => {
 			const flag = String(cmd.getFlag('rtk') ?? '').trim().toLowerCase();
 			if (flag === 'on' || flag === 'off') mode = flag;
+			void readVersion();
 		},
 
-		appendSystemPrompt: () => (mode === OFF || !bin ? undefined : wrapBlock('rtk', GUIDANCE)),
+		appendSystemPrompt: () => (mode === OFF || !bin || !supported() ? undefined : wrapBlock('rtk', GUIDANCE)),
 
-		beforeToolCall: async ({toolName, input}) => {
-			if (mode === OFF || toolName !== 'shell_command') return undefined;
+		beforeToolCall: async ({toolCallId, toolName, input}) => {
+			if (mode === OFF || toolName !== 'shell_command' || !supported()) return undefined;
 			const command = typeof input.command === 'string' ? input.command : '';
 			if (!shouldRewrite(command)) return undefined;
-			const rewritten = await rewrite(command);
-			return rewritten ? {input: {...input, command: rewritten}} : undefined;
+			const verdict = await rewrite(command);
+			// Rules: a deny message is rtk's own pipeline rule, not a host rule, so the call must not run — pass the reason on as the result.
+			if (verdict.kind === 'deny') {
+				return {block: true, additionalContext: `Blocked by an rtk rule: ${verdict.reason}`};
+			}
+			if (verdict.kind !== 'rewrite') return undefined;
+			if (typeof toolCallId === 'string' && toolCallId) rewrittenCalls.add(toolCallId);
+			return {input: {...input, command: verdict.command}};
 		},
 
-		afterToolCall: async ({toolName, result, isError}) => {
-			if (mode === OFF || isError) return undefined;
-			if (cmd.getFlag('rtk-filter') === false) return undefined;
-			const filter = filterNameFor(toolName);
-			if (!filter) return undefined;
+		afterToolCall: async ({toolCallId, toolName, result, isError}) => {
+			if (mode === OFF || isError || !supported()) return undefined;
 			const text = textOf(result);
 			if (text === null || text.length < MIN_FILTER_BYTES) return undefined;
-			const filtered = await filterThroughRtk(filter, text);
-			if (!filtered) return undefined;
-			return {content: [{type: 'text', text: filtered}]};
+
+			// An explicit filter for a tool result that is not shell output.
+			const filter = filterNameFor(toolName);
+			if (filter) {
+				if (cmd.getFlag('rtk-filter') === false) return undefined;
+				const filtered = await filterThroughRtk(filter, text);
+				return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
+			}
+
+			// Shell output rtk did not rewrite still gets auto-detected: `npm test` has no rewrite but cargo-style output does.
+			if (toolName !== 'shell_command') return undefined;
+			if (cmd.getFlag('rtk-shell') === false) return undefined;
+			if (rewrittenCalls.size > 256) rewrittenCalls.clear();
+			if (wasRewritten(toolCallId)) return undefined;
+			const filtered = await filterThroughRtk(null, text);
+			return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 		},
 	});
 }

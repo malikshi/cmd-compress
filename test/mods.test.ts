@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import {normalizeCavemanLevel, CAVEMAN_STOP_PHRASES} from '../mods/caveman.ts';
 import {normalizePonytailLevel, PONYTAIL_STOP_PHRASES} from '../mods/ponytail.ts';
 import {COMPRESS_PRESETS, presetFor} from '../mods/compress.ts';
-import {shouldRewrite, filterNameFor, MIN_FILTER_BYTES} from '../mods/rtk.ts';
+import {shouldRewrite, filterNameFor, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText} from '../mods/rtk.ts';
 
 test('normalizeCavemanLevel: on and empty mean the default, off and stop mean off', () => {
 	assert.equal(normalizeCavemanLevel(''), 'full');
@@ -66,3 +66,48 @@ test('filterNameFor: grep and glob map to rtk filters, others do not', () => {
 test('MIN_FILTER_BYTES: the spawn threshold is above one screenful', () => {
 	assert.ok(MIN_FILTER_BYTES >= 1000);
 });
+
+test('parseRtkVersion: reads the banner and refuses anything unparseable', () => {
+	assert.deepEqual(parseRtkVersion('rtk 1.0.1\n'), {major: 1, minor: 0, patch: 1});
+	assert.deepEqual(parseRtkVersion('rtk 0.23.4-dev'), {major: 0, minor: 23, patch: 4});
+	assert.equal(parseRtkVersion('nope'), null);
+	assert.equal(parseRtkVersion(''), null);
+});
+
+test('isSupportedVersion: 0.x needs the minor that shipped rewrite, 1.x always passes', () => {
+	assert.equal(isSupportedVersion(parseRtkVersion('rtk 0.22.9')), false);
+	assert.equal(isSupportedVersion(parseRtkVersion(`rtk 0.${MIN_SUPPORTED_RTK_MINOR}.0`)), true);
+	assert.equal(isSupportedVersion(parseRtkVersion('rtk 1.0.1')), true);
+	assert.equal(isSupportedVersion(null), true, 'an unknown version is not a reason to disable');
+});
+
+// Rules: the whole exit-code contract in one table — a wrong branch here either runs a denied command or drops a rewrite.
+test('classifyRewrite: maps every documented exit code', () => {
+	assert.deepEqual(classifyRewrite(0, 'rtk git status', 'git status'), {kind: 'rewrite', command: 'rtk git status'});
+	assert.deepEqual(classifyRewrite(3, 'rtk ls', 'ls'), {kind: 'rewrite', command: 'rtk ls'});
+	assert.deepEqual(classifyRewrite(1, '', 'npm test'), {kind: 'pass'});
+	assert.deepEqual(classifyRewrite(2, 'pipeline denied', 'git push'), {kind: 'deny', reason: 'pipeline denied'});
+	assert.deepEqual(classifyRewrite(2, '', 'git push'), {kind: 'pass'});
+	assert.deepEqual(classifyRewrite(0, 'rtk git status', 'rtk git status'), {kind: 'pass'}, 'a no-op rewrite is not a rewrite');
+	assert.deepEqual(classifyRewrite(0, '', 'git status'), {kind: 'pass'}, 'an empty body is not a rewrite');
+	assert.deepEqual(classifyRewrite(9, 'wat', 'x'), {kind: 'pass'}, 'an unknown code fails open');
+});
+
+// Rules: the prompt text tells the model which commands and flags exist, so a wrong one costs a failed tool call on every session; the skip is loud when rtk is absent rather than a silent pass.
+test('the injected guidance only names commands this rtk build actually has', async t => {
+	const {execFileSync} = await import('node:child_process');
+	let help: string;
+	try {
+		help = execFileSync('rtk', ['--help'], {encoding: 'utf8', timeout: 5000});
+	} catch {
+		t.skip('rtk is not installed here');
+		return;
+	}
+	const guidance = guidanceText();
+	const named = [...guidance.matchAll(/`rtk ([a-z-]+)/g)].map(match => match[1]);
+	assert.ok(named.length >= 8, 'the guidance names several subcommands');
+	for (const name of new Set(named)) {
+		assert.match(help, new RegExp(`\\b${name}\\b`), `rtk ${name} is listed in rtk --help`);
+	}
+});
+
