@@ -24,10 +24,12 @@ if (mods.length === 0) {
 }
 
 // Rules: the stub records what the factory registers and nothing more. A mod reaching for a surface this stub does not model throws here, which is the same fail-loud behaviour the real host gives a bad registration.
+// Rules: `expose` and `use` share ONE key shape, as the real host does (`Re(modName, name)` for both). Storing bare names on one side and `mod/name` on the other made the two never match, so a mod that read a sibling's function at factory time looked fine here and would fail in the host.
 function createStubApi() {
 	const commands = new Map<string, unknown>();
 	const hooks: unknown[] = [];
 	const exposed = new Map<string, unknown>();
+	const channels = new Map<string, Set<(data?: unknown) => void>>();
 	const disposable = () => ({dispose() {}});
 	const store = new Map<string, unknown>();
 	return {
@@ -47,10 +49,22 @@ function createStubApi() {
 				return disposable();
 			},
 			expose: (name: string, fn: unknown) => {
-				exposed.set(name, fn);
+				exposed.set(`verify/${name}`, fn);
 				return disposable();
 			},
 			use: (mod: string, name: string) => exposed.get(`${mod}/${name}`),
+			// Rules: the real API always provides the bus, so the stub must too — otherwise a mod that emits without an optional chain fails here and works in production, which is a false negative rather than a real defect.
+			events: {
+				emit: (channel: string, data?: unknown) => {
+					for (const handler of channels.get(channel) ?? []) handler(data);
+				},
+				on: (channel: string, handler: (data?: unknown) => void) => {
+					const set = channels.get(channel) ?? new Set();
+					set.add(handler);
+					channels.set(channel, set);
+					return disposable();
+				},
+			},
 			store: {
 				get: (key: string) => store.get(key),
 				set: async (key: string, value: unknown) => {

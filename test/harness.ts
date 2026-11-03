@@ -1,15 +1,39 @@
 // harness.ts — a fake ModApi for exercising the mods without a TUI.
-// exports: createFakeCmd, runHandler
+// exports: createFakeCmd, createEventBus, runHandler
 // used_by: test/mods.behaviour.test.ts
 // related: mods/caveman.ts, mods/ponytail.ts, mods/rtk.ts, mods/compress.ts
 // rules: the fake mirrors only the surface these mods touch (store/expose/use/hooks/commands/flags/exec/ui), so a mod reaching further fails loudly.
 // agent: 2026-11-02 initial
+
+import type {ModEventBus as _ModEventBus} from '@commandcode/harness';
 
 export interface FakeCommand {
 	name: string;
 	description?: string;
 	argumentHint?: string;
 	handler: (ctx: {args: string}) => unknown;
+}
+
+// Rules: the mods announce mode changes on the shared bus so `compress` can repaint its footer, so the fake must provide one too — a fake without it silently exercises the degraded path instead of production's.
+export function createEventBus(): _ModEventBus {
+	const channels = new Map<string, Set<(data?: unknown) => void>>();
+	return {
+		emit: (channel: string, data?: unknown) => {
+			for (const handler of channels.get(channel) ?? []) {
+				try {
+					handler(data);
+				} catch {
+					// the host isolates a throwing subscriber; so does the fake
+				}
+			}
+		},
+		on: (channel: string, handler: (data?: unknown) => void) => {
+			const set = channels.get(channel) ?? new Set();
+			set.add(handler);
+			channels.set(channel, set);
+			return {dispose: () => set.delete(handler)};
+		},
+	};
 }
 
 export interface FakeHooks {
@@ -78,6 +102,7 @@ export function createFakeCmd(options: {flags?: Record<string, unknown>; exec?: 
 			notify: () => undefined,
 		},
 		on: () => undefined,
+		events: createEventBus(),
 		model: {},
 	};
 

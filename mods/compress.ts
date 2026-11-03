@@ -7,7 +7,7 @@
 // agent: 2026-11-02 ported from tersio /combo
 
 import type {ModApi} from '@commandcode/harness';
-import {MODES, type ModeName} from './shared.ts';
+import {MODE_EVENT, MODES, type ModeName} from './shared.ts';
 
 export interface Preset {
 	readonly caveman: string;
@@ -84,10 +84,17 @@ export default function (cmd: ModApi): void {
 	});
 
 	// Rules: one footer segment for all three — three segments would crowd the row the prompt already owns.
+	// Rules: repaint on the shared mode event as well as on the turn boundary. A `/caveman ultra` or a preset set from the prompt changes a sibling's mode between turns, and `onRunEnd` would leave the footer claiming the old state until the turn finished.
 	cmd.hooks({
 		onSessionStart: () => paint(),
 		onRunEnd: () => paint(),
 	});
+
+	try {
+		cmd.events?.on(MODE_EVENT, () => paint());
+	} catch {
+		// a host without the bus keeps the turn-boundary repaint
+	}
 
 	function paint(): void {
 		if (!cmd.ui.capabilities.status) return;

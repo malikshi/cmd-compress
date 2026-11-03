@@ -107,6 +107,14 @@ declare module '@commandcode/harness' {
 		delete(key: string): Promise<void>;
 	}
 
+	/* ------------------------------------------------------------ events */
+
+	// Rules: the host's cross-mod bus. `emit(channel, data?)` / `on(channel, handler)`; a handler throw is swallowed by the host, so it can never break a sibling.
+	export interface ModEventBus {
+		emit(channel: string, data?: unknown): void;
+		on(channel: string, handler: (data?: unknown) => void): Disposable;
+	}
+
 	/* ------------------------------------------------------------ api */
 
 	export interface ExecRequest {
@@ -127,6 +135,7 @@ declare module '@commandcode/harness' {
 		readonly cwd: string;
 		readonly store: ModStoreApi;
 		readonly ui: ModUi;
+		readonly events: ModEventBus;
 		addFlag(name: string, spec: ModFlag): Disposable;
 		getFlag(name: string): boolean | string | undefined;
 		addCommand(command: ModCommand): Disposable;

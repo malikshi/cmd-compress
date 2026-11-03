@@ -1,5 +1,5 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, filterNameFor, filterForShape, isGrepRows, canRefilterCompressed, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
+// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, canRefilterCompressed, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
 // used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
@@ -16,7 +16,7 @@ import type {ModApi} from '@commandcode/harness';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {filterShell, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, wrapBlock, writeOwnMode, OFF} from './shared.ts';
+import {announceMode, filterShell, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, wrapBlock, writeOwnMode, OFF} from './shared.ts';
 
 export const REWRITE_TIMEOUT_MS = 2000;
 
@@ -45,8 +45,9 @@ export interface Segments {
 
 // Rules: the last lines of a Command Code result often carry the truth the body hides. Each form is taken from the host's own formatter, not guessed: grep's content mode closes with `[Showing results with pagination = …]`, its count mode with `Found N total occurrences across M files[ with pagination = …].`, and the grep tool times out with `[Search timed out — …]`; glob closes with `(Results are truncated: …)` or `(Search timed out …)`; a `shell_command` that ends early appends `Command aborted` or `Command timed out after Nms (exit code 124). …`, and `formatResult2` puts the cwd note and the PowerShell edition banner after the output. rtk folds all of them away as noise, so they are cut off before the filter and re-attached after it.
 // Rules: anchored to the end of the whole result, not to any line end — a notice that merely appears mid-output is body text and must be filtered with it.
+// Rules: every notice is a SINGLE line, and it is the last non-blank line of the result, so the pattern is matched sticky at that line's start instead of scanning for it. A leading `\n*` plus a trailing `[\s]*$` made the engine retry every offset and re-scan the tail each time, which is quadratic in a long blank run: measured 825 ms at 20k newlines and 9.8 s at 60k, on a result the session is blocked on. Stripping the blank padding first makes it one pass.
 const TRAILER = new RegExp(
-	'\\n*(?:' +
+	'(?:' +
 		'\\[(?:Showing results with pagination|Search timed out)[^\\]\\n]*\\]' +
 		'|\\(Results are truncated: [^)\\n]*\\)' +
 		'|\\(Search timed out[^)\\n]*\\)' +
@@ -54,11 +55,29 @@ const TRAILER = new RegExp(
 		'|\\[PowerShell edition: [^\\]\\n]*\\]' +
 		'|Found \\d+ total occurrences? across \\d+ files?(?: with pagination = [^\\n]*)?\\.' +
 		'|Command (?:aborted|timed out after [^\\n]*)' +
-		')[\\s]*$',
+		')$',
+	'y',
 );
 
 // Rules: `formatResult2` puts the exit status and the signal on the first lines, before any output, and follows the exit status with a parenthesised interpretation (`(No matches found)`, `(test failure)`). Both are host words, not output, and rtk drops them, so they are split with the head. The interpretation is only recognised directly after an `Exit code:` line, so a body that happens to start with a parenthesis is not eaten.
 const SHELL_HEAD = /^(?:(?:(?:Exit code|Signal):[^\n]*\n)(?:\([^)\n]*\)\n)?)+/;
+
+// Rules: the notice is the last non-blank line, so the scan starts there. `index` is the start of the blank run in front of it — the same boundary the old `\n*` prefix produced, so the body never carries the padding. `blank` is the separator to re-attach (capped at two newlines, matching what the tests pin).
+export function findTrailer(text: string): {index: number; match: string; blank: string} | null {
+	let end = text.length;
+	while (end > 0 && /\s/.test(text[end - 1] ?? '')) end -= 1;
+	if (end === 0) return null;
+	// Rules: trailing whitespace after the notice must be trimmed before matching, or the notice is missed and rtk folds it away with the body. The old pattern consumed it with `[\s]*$`; doing it here keeps the match to one pass.
+	const trimmed = text.slice(0, end);
+	const lineStart = trimmed.lastIndexOf('\n') + 1;
+	TRAILER.lastIndex = lineStart;
+	const match = TRAILER.exec(trimmed);
+	if (!match) return null;
+	let runStart = lineStart;
+	while (runStart > 0 && trimmed[runStart - 1] === '\n') runStart -= 1;
+	const blank = lineStart - runStart >= 2 ? '\n\n' : '\n';
+	return {index: runStart, match: match[0], blank};
+}
 
 // Rules: `glob` prints `Found N files` and then one indented path per line. The find filter reads that header line as a path, so it is split off rather than fed in.
 const GLOB_HEAD = /^Found \d+ files?[^\n]*\n/;
@@ -90,9 +109,8 @@ export function filterForShape(toolName: string, filter: string | null, text: st
 
 // Rules: a result is split into the envelope the host wrote and the body rtk should condense; only the body is ever filtered, so no host information is lost.
 // Rules: the tail keeps the host's own separator, capped at one blank line — enough to keep the notice visually separate without carrying a run of blank lines the filter just folded.
-function tailFrom(matched: string): string {
-	const blank = matched.startsWith('\n\n') ? '\n\n' : '\n';
-	return `${blank}${matched.trimStart()}`;
+function tailFrom(trailer: {match: string; blank: string}): string {
+	return `${trailer.blank}${trailer.match.trimStart()}`;
 }
 
 export function splitSegments(toolName: string, text: string): Segments {
@@ -101,16 +119,16 @@ export function splitSegments(toolName: string, text: string): Segments {
 		const head = GLOB_HEAD.exec(text);
 		if (head) {
 			const rest = text.slice(head[0].length);
-			const trailer = TRAILER.exec(rest);
+			const trailer = findTrailer(rest);
 			if (!trailer) return {head: head[0], body: rest, tail: ''};
-			return {head: head[0], body: rest.slice(0, trailer.index), tail: tailFrom(trailer[0])};
+			return {head: head[0], body: rest.slice(0, trailer.index), tail: tailFrom(trailer)};
 		}
 	}
-	const trailer = TRAILER.exec(text);
+	const trailer = findTrailer(text);
 	if (trailer) {
 		const body = text.slice(0, trailer.index);
 		const head = SHELL_HEAD.exec(body);
-		const tail = tailFrom(trailer[0]);
+		const tail = tailFrom(trailer);
 		return head ? {head: head[0], body: body.slice(head[0].length), tail} : {head: '', body, tail};
 	}
 	if (toolName === 'shell_command') {
@@ -235,6 +253,7 @@ export default function (cmd: ModApi): void {
 		mode = next;
 		guidanceDecided = undefined;
 		writeOwnMode(cmd.store, next);
+		announceMode(cmd.events);
 	}
 
 	cmd.expose('setMode', (next: unknown) => {
@@ -378,6 +397,7 @@ export default function (cmd: ModApi): void {
 			if (flag === 'on' || flag === 'off') {
 				mode = flag;
 				guidanceDecided = undefined;
+				announceMode(cmd.events);
 			}
 			void versionSettled();
 		},

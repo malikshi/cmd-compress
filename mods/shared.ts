@@ -1,11 +1,12 @@
 // shared — mode lookup, prompt-block helpers, and binary/path utilities for the four mods.
-// exports: MODES, OFF, DEFAULT_MODE, readOwnMode, writeOwnMode, wrapBlock, stripBlock, promptHas, resolveBin, shortPaths, turnOffSiblings
+// exports: MODES, OFF, DEFAULT_MODE, MODE_EVENT, readOwnMode, writeOwnMode, announceMode, wrapBlock, resolveBin, filterShell, windowsPipeScript, pipeCommand, turnOffSiblings
 // used_by: mods/*.ts, test/*.test.ts
 // related: rules/caveman.ts, rules/ponytail.ts
 // rules: cmd.store is namespaced per mod, so a mod persists ONLY its own key; a sibling's mode is read through cmd.use.
 // rules: prompt text must be byte-stable per mode so the provider prefix cache survives across rounds.
 // agent: 2026-11-02 initial — per-mod store key after learning each mod gets its own file
 // agent: 2026-11-03 turnOffSiblings — "normal mode" must end every mode, and transformInput short-circuits on handled
+// agent: 2026-11-03 announceMode + MODE_EVENT so the compress status repaints on any mode change; drop promptHas, which no caller or test ever referenced
 
 import {accessSync, constants, existsSync} from 'node:fs';
 import {delimiter, join} from 'node:path';
@@ -67,22 +68,23 @@ export function turnOffSiblings(use: (mod: string, name: string) => unknown, sel
 	return off;
 }
 
-/* ---------------------------------------------------------------- prompt text */
-export function promptHas(prompt: string, marker: string): boolean {
-	return prompt.includes(marker);
+// Rules: a mode change must reach the `compress` status line without polling. `cmd.store` is per mod, so a sibling cannot see the write, and `onRunEnd` only fires at a turn boundary — a mode set from the prompt leaves the footer stale until the turn ends. Each mod announces on the shared bus and `compress` repaints.
+// Rules: the bus is optional on the API surface, so every emit and subscribe is guarded: a host without it keeps working, just with a footer that repaints at the turn boundary.
+export const MODE_EVENT = 'compress:mode';
+
+export function announceMode(events: {emit?: (channel: string, data?: unknown) => void} | undefined): void {
+	try {
+		events?.emit?.(MODE_EVENT);
+	} catch {
+		// a status repaint is cosmetic: never let it break a mode change
+	}
 }
 
+/* ---------------------------------------------------------------- prompt text */
+
+// Rules: no strip step is needed. The host builds the append list fresh every round (`appendSystemPrompt` collects one string per mod and joins them), so a level change swaps the block by simply returning the new one — a previous block can never accumulate, and the `<tag>` wrapper is for readability, not deduplication.
 export function wrapBlock(tag: string, body: string): string {
 	return `<${tag}>\n${body.trim()}\n</${tag}>`;
-}
-
-// Rules: removes every previously injected <tag> block so a level change cannot leave two rulesets.
-export function stripBlock(prompt: string, tag: string): string {
-	const pattern = new RegExp(`\\n*<${tag}>[\\s\\S]*?</${tag}>\\n*`, 'g');
-	return prompt
-		.replace(pattern, '\n')
-		.replace(/\n{3,}/g, '\n\n')
-		.trimEnd();
 }
 
 /* ---------------------------------------------------------------- binaries */
@@ -140,14 +142,4 @@ export function resolveBin(
 		}
 	}
 	return null;
-}
-
-/* ---------------------------------------------------------------- paths */
-
-// Rules: a shortened path must stay identifiable — drop only the workspace prefix, keep the tail.
-export function shortPaths(text: string, cwd: string): string {
-	if (!cwd || cwd === '/') return text;
-	const prefix = cwd.endsWith('/') ? cwd.slice(0, -1) : cwd;
-	const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	return text.replace(new RegExp(`(^|[\\s"'\`(])${escaped}/`, 'g'), '$1');
 }

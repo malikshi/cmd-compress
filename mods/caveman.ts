@@ -7,7 +7,7 @@
 
 import type {ModApi} from '@commandcode/harness';
 import {CAVEMAN_DEFAULT, CAVEMAN_LEVELS, cavemanRule, type CavemanLevel} from '../rules/caveman.ts';
-import {NORMAL_MODE, OFF, readOwnMode, turnOffSiblings, wrapBlock, writeOwnMode} from './shared.ts';
+import {announceMode, NORMAL_MODE, OFF, readOwnMode, turnOffSiblings, wrapBlock, writeOwnMode} from './shared.ts';
 
 // Rules: `normal mode` is the upstream phrase for the same thing, so it must work too; the whole message has to be the phrase.
 export const CAVEMAN_STOP_PHRASES = new Set(['stop caveman', 'caveman off', NORMAL_MODE]);
@@ -27,10 +27,11 @@ export default function (cmd: ModApi): void {
 
 	let mode = readOwnMode(cmd.store, OFF, value => LEVELS.has(value) || value === OFF);
 
-	// Rules: the setter is the single write path (own command, /compress preset) so the session and the store cannot disagree.
+	// Rules: the setter is the single write path (own command, /compress preset) so the session and the store cannot disagree, and it announces on the shared bus so a sibling status line repaints without waiting for the turn boundary.
 	function setMode(next: string): void {
 		mode = next;
 		writeOwnMode(cmd.store, next);
+		announceMode(cmd.events);
 	}
 
 	cmd.expose('setMode', (next: unknown) => {
@@ -59,10 +60,14 @@ export default function (cmd: ModApi): void {
 
 	cmd.hooks({
 		// Rules: a flag is a per-session override applied at bind — getFlag answers the default at factory time.
+		// Rules: the announce matters here too: `compress` paints the footer from its own onSessionStart, and the host gives no ordering guarantee between mods, so without it a `--mod-option caveman=ultra` start can leave the footer showing the pre-flag state until the first turn ends.
 		onSessionStart: () => {
 			const flag = String(cmd.getFlag('caveman') ?? '').trim().toLowerCase();
 			const parsed = flag ? normalizeCavemanLevel(flag) : null;
-			if (parsed) mode = parsed;
+			if (parsed) {
+				mode = parsed;
+				announceMode(cmd.events);
+			}
 		},
 
 		appendSystemPrompt: () => (mode === OFF ? undefined : wrapBlock('caveman', cavemanRule(mode))),

@@ -486,6 +486,38 @@ test('compress: an unknown preset prints usage and changes nothing', () => {
 	assert.match(messageOf(runHandler(fake.commands, 'compress', 'turbo')), /Unknown preset: turbo/);
 });
 
+// Rules: the footer must not wait for a turn boundary. `cmd.store` is per mod, so `compress` cannot read a sibling's write, and `onRunEnd` only fires when the turn ends — a `/caveman ultra` typed at the prompt left the footer reading `compress off` until the next turn finished. Measured before the fix: the status line still said `compress off` while `getMode()` answered `ultra`. The shared bus closes that gap.
+// Rules: one cmd object shared by all four mods, the way the host does it — each mod bound to its own store by name. Four separate fakes would get four separate buses, so the announcement would never be observed and the test would pass without testing anything.
+test('compress: the footer repaints as soon as a sibling mode changes', () => {
+	const fake = createFakeCmd({flags: {'rtk-bin': TEST_BIN}});
+	const mods = [['caveman', caveman], ['ponytail', ponytail], ['rtk', rtk], ['compress', compress]] as const;
+	for (const [name, factory] of mods) {
+		fake.bindStore(name);
+		fake.cmd.name = name;
+		factory(fake.cmd as never);
+	}
+
+	runHandler(fake.commands, 'compress', 'off');
+	assert.equal(fake.statuses.at(-1), 'compress off');
+
+	runHandler(fake.commands, 'caveman', 'ultra');
+	assert.equal((fake.exposed.get('caveman')?.get('getMode') as () => string)(), 'ultra', 'the mode actually changed');
+	assert.equal(fake.statuses.at(-1), 'caveman=ultra pony=off rtk=off', 'and the footer already says so, with no turn end');
+
+	runHandler(fake.commands, 'rtk', 'on');
+	assert.equal(fake.statuses.at(-1), 'caveman=ultra pony=off rtk=on');
+});
+
+// Rules: the bus is optional on the API surface, so a host without it must not break a mode change — the footer then falls back to the turn-boundary repaint.
+test('compress: a host with no event bus still changes modes', () => {
+	const cavemanFake = load(caveman);
+	const compressFake = load(compress);
+	delete (compressFake.cmd as {events?: unknown}).events;
+	delete (cavemanFake.cmd as {events?: unknown}).events;
+	assert.equal(messageOf(runHandler(cavemanFake.commands, 'caveman', 'ultra')), 'Caveman ultra on.');
+	assert.equal((cavemanFake.exposed.get('probe')?.get('getMode') as () => string)(), 'ultra');
+});
+
 // Rules: a shell call rtk already rewrote had its output filtered by rtk, so condensing again spends a second process for nothing — the rewritten-call marker must suppress the shell pass for that exact toolCallId, and only for it.
 test('rtk: a rewritten shell call is not filtered a second time', async () => {
 	const filtered: string[] = [];

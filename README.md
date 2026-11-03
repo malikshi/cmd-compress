@@ -49,6 +49,11 @@ Set one mode on its own when a preset is too blunt:
 
 Or say `stop caveman` / `stop ponytail` as the whole message. `normal mode` — the phrase both upstream projects use — turns every mode off at once, `rtk` included. An ordinary sentence that merely mentions the mode does not disable it.
 
+Two limits on that phrase, both verified against the host rather than assumed:
+
+- It only fires on input the host routes through `transformInput`, which is **real typed input**. Automated turns, slash commands, and `-p` print runs never reach the hook — measured: a headless `cmd -p "normal mode"` sends the text straight to the model and the mod never runs. Use `/compress off` there.
+- `rtk`'s own copy of the phrase is a fallback for a session where caveman and ponytail are not loaded. Whichever mod sees it first turns the siblings off through their exposed `setMode` and answers `handled`, since the host stops the chain at the first `handled`.
+
 ### Presets
 
 | Preset | caveman | ponytail | rtk |
@@ -132,13 +137,13 @@ Each mod is one file, default-exporting a factory that registers a slash command
 | `caveman` | `appendSystemPrompt`, `transformInput` (the stop phrase), `onSessionStart` (the flag) |
 | `ponytail` | `appendSystemPrompt`, `transformInput`, `onSessionStart` |
 | `rtk` | `appendSystemPrompt`, `beforeToolCall` (the rewrite and the deny), `afterToolCall` (grep/glob and the shell auto-detect), `onSessionStart` (flag + version probe) |
-| `compress` | `onSessionStart`, `onRunEnd` (the footer status) |
+| `compress` | `onSessionStart`, `onRunEnd` (the footer status), plus an `events.on` subscription so the footer also repaints the moment a sibling mode changes |
 
 Three details worth knowing if you fork this:
 
 1. **`cmd.store` is namespaced per mod.** Each mod owns one file under `~/.commandcode/mods/.store/` and persists exactly one key, `mode`. `/compress` never writes a sibling's state; it calls that mod's exposed `setMode`, so exactly one mod owns each value.
 2. **`cmd.getFlag` answers the default inside the factory.** The host registers every mod first and applies `--mod-option` values afterwards, so a factory-time read never sees the user's value. Every mode flag is therefore read in `onSessionStart`, and `rtk-bin` is resolved lazily on first use, then cached for the session.
-3. **The injected block is byte-stable per level.** The provider's prompt-prefix cache keys off the system prompt, so a level's text must not change between rounds. A level switch swaps the block rather than appending a second one — the text is wrapped in `<caveman>`, `<ponytail>`, or `<rtk>` for exactly that reason.
+3. **The injected block is byte-stable per level.** The provider's prompt-prefix cache keys off the system prompt, so a level's text must not change between rounds without a durable reason. No strip step is needed: the host rebuilds the append list every round from each mod's `appendSystemPrompt` return, so a level switch swaps the block by returning the new one. Every mode change also emits on the shared `cmd.events` bus, which is how the `/compress` footer repaints immediately instead of waiting for the turn boundary — `cmd.store` is per mod, so a sibling cannot observe the write any other way.
 
 ## Benchmark
 
@@ -181,6 +186,8 @@ The exact, quotable numbers are the filter bytes and the prompt overhead. The li
 - **The extra shell pass costs a process.** Measured here, 11–17 ms per qualifying result on a warm page cache. Below 1200 bytes the filter never runs, and `/rtk-shell=false` turns the pass off while keeping rewrites.
 - **A compressed reply can read as curt.** That is the mode working. `/caveman off` restores normal prose mid-session.
 - **Windows is supported but less exercised than POSIX.** The filter redirect runs through `cmd.exe /d /s /c`, and a pinned path is double-quoted because cmd.exe gives single quotes no meaning. Both are unit-tested on every OS, and a real `cmd.exe` redirect is asserted by the `windows-latest` CI job; the maintainer's own runs are on Linux, so a Windows-specific report matters more here than elsewhere.
+- **A stop phrase needs real typed input.** `normal mode` and `stop caveman` ride `transformInput`, which the host only routes for typed prompts — a headless `-p` run never reaches it, so the phrase goes to the model instead. `/compress off` works everywhere.
+- **The `/compress` footer repaints on a bus event, not by polling.** Each mod emits on `cmd.events` when its mode changes, because `cmd.store` is per mod and a sibling cannot read the write. A host that does not provide `events` degrades to the turn-boundary repaint from `onRunEnd`; the mode change itself always works.
 - **No dollar figure is claimed.** Tersio publishes its own benchmark; this package ports the modes. For the shell half, `/rtk gain` reports what rtk itself saved on your machine, read from its own database rather than estimated.
 
 ## Develop

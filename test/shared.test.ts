@@ -1,9 +1,10 @@
-// shared.test.ts — the per-mod store, prompt-block surgery, and path shortening.
+// shared.test.ts — the per-mod store, prompt-block wrapping, and binary resolution.
 // exports: none (node:test)
 // used_by: npm test
 // related: mods/shared.ts
 // rules: the fake store mirrors the harness store's synchronous get / async set so the serialised writer is exercised.
 // agent: 2026-11-02 initial; per-mod key after learning each mod gets its own store file
+// agent: 2026-11-03 drop the stripBlock/shortPaths tests with the functions: the host rebuilds the append list every round, so neither had a production caller
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,9 +18,7 @@ import {
 	pipeCommand,
 	readOwnMode,
 	writeOwnMode,
-	stripBlock,
 	wrapBlock,
-	shortPaths,
 	resolveBin,
 	windowsPipeScript,
 } from '../mods/shared.ts';
@@ -88,29 +87,6 @@ test('writeOwnMode: a failing set does not break later writes', async () => {
 
 test('wrapBlock: surrounding whitespace is trimmed and the tag is closed', () => {
 	assert.equal(wrapBlock('caveman', '  body  '), '<caveman>\nbody\n</caveman>');
-});
-
-test('stripBlock: a previous block is removed and its neighbours kept', () => {
-	const prompt = `base\n\n<caveman>\nold\n</caveman>\n\ntail`;
-	const stripped = stripBlock(prompt, 'caveman');
-	assert.ok(!stripped.includes('<caveman>'));
-	assert.ok(!stripped.includes('old'));
-	assert.ok(stripped.startsWith('base'));
-	assert.ok(stripped.endsWith('tail'));
-});
-
-test('stripBlock: re-injecting replaces instead of stacking', () => {
-	const once = `base\n\n${wrapBlock('caveman', 'lite rules')}`;
-	const twice = `${stripBlock(once, 'caveman')}\n\n${wrapBlock('caveman', 'ultra rules')}`;
-	assert.equal((twice.match(/<caveman>/g) ?? []).length, 1);
-	assert.ok(twice.includes('ultra rules'));
-	assert.ok(!twice.includes('lite rules'));
-});
-
-test('shortPaths: the workspace prefix is dropped, longer paths keep their tail', () => {
-	assert.equal(shortPaths('edited /repo/src/a.ts', '/repo'), 'edited src/a.ts');
-	assert.equal(shortPaths('/repo/src/a.ts:12: err', '/repo'), 'src/a.ts:12: err');
-	assert.equal(shortPaths('see /etc/hosts', '/repo'), 'see /etc/hosts');
 });
 
 test('resolveBin: a binary that exists on PATH is found, a missing one is null', () => {

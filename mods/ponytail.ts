@@ -7,7 +7,7 @@
 
 import type {ModApi} from '@commandcode/harness';
 import {PONYTAIL_DEFAULT, PONYTAIL_LEVELS, ponytailRule, type PonytailLevel} from '../rules/ponytail.ts';
-import {NORMAL_MODE, OFF, readOwnMode, turnOffSiblings, wrapBlock, writeOwnMode} from './shared.ts';
+import {announceMode, NORMAL_MODE, OFF, readOwnMode, turnOffSiblings, wrapBlock, writeOwnMode} from './shared.ts';
 
 // Rules: `normal mode` is the upstream phrase for the same thing, so it must work too; the whole message has to be the phrase.
 export const PONYTAIL_STOP_PHRASES = new Set(['stop ponytail', 'ponytail off', NORMAL_MODE]);
@@ -27,9 +27,11 @@ export default function (cmd: ModApi): void {
 
 	let mode = readOwnMode(cmd.store, OFF, value => LEVELS.has(value) || value === OFF);
 
+	// Rules: the single write path, announcing on the shared bus so a sibling status line repaints without waiting for the turn boundary.
 	function setMode(next: string): void {
 		mode = next;
 		writeOwnMode(cmd.store, next);
+		announceMode(cmd.events);
 	}
 
 	cmd.expose('setMode', (next: unknown) => {
@@ -55,11 +57,14 @@ export default function (cmd: ModApi): void {
 	});
 
 	cmd.hooks({
-		// Rules: a flag is a per-session override applied at bind — getFlag answers the default at factory time.
+		// Rules: a flag is a per-session override applied at bind — getFlag answers the default at factory time. The announce keeps the `compress` footer correct when the flag starts this mode, since the host gives no cross-mod ordering guarantee for onSessionStart.
 		onSessionStart: () => {
 			const flag = String(cmd.getFlag('ponytail') ?? '').trim().toLowerCase();
 			const parsed = flag ? normalizePonytailLevel(flag) : null;
-			if (parsed) mode = parsed;
+			if (parsed) {
+				mode = parsed;
+				announceMode(cmd.events);
+			}
 		},
 
 		appendSystemPrompt: () => (mode === OFF ? undefined : wrapBlock('ponytail', ponytailRule(mode))),

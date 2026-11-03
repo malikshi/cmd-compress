@@ -359,6 +359,34 @@ test('splitSegments: reassembly preserves every non-whitespace character', () =>
 	}
 });
 
+// Rules: the sticky-anchor rewrite trimmed the blank padding before matching, so a trailing-whitespace notice must still be recognised — the old `[\s]*$` consumed that whitespace, and dropping it there would fold the notice into the body and lose it. Pinned so the optimisation cannot regress the behaviour it replaced.
+test('splitSegments: a notice followed by trailing whitespace is still split off', () => {
+	const split = splitSegments('shell_command', 'body\n\n[Showing results with pagination = limit: 40]   \n  ');
+	assert.equal(split.body, 'body', 'the notice never reaches the body rtk filters');
+	assert.equal(split.tail, '\n\n[Showing results with pagination = limit: 40]');
+});
+
+// Rules: `splitSegments` runs on every large shell result before the filter, so it must be linear. The original trailer pattern began with `\n*` and ended with `[\s]*$`, which made the engine retry every offset and re-scan the tail each time: measured 825 ms at 20k newlines and 9.8 s at 60k, on a result the session is blocked on. A 200k-newline body must stay in the low milliseconds, and the notice must still be found.
+test('splitSegments: a long blank run is handled in linear time, not quadratic', () => {
+	const started = Date.now();
+	const split = splitSegments('shell_command', 'Exit code: 1\nbody\n' + '\n'.repeat(200_000) + '[Showing results with pagination = limit: 40]');
+	const elapsed = Date.now() - started;
+	assert.equal(split.head, 'Exit code: 1\n', 'the exit status is still split as the head');
+	assert.equal(split.body, 'body', 'the body is what is left after the blank run');
+	assert.equal(split.tail, '\n\n[Showing results with pagination = limit: 40]', 'and the notice is still found at the end');
+	assert.ok(elapsed < 200, `200k newlines took ${elapsed}ms; the old pattern took seconds at 60k`);
+});
+
+// Rules: the same shape without a notice must also stay linear — this is the case that made the quadratic path worst, because every attempt failed.
+test('splitSegments: a long blank run with no notice stays linear too', () => {
+	const started = Date.now();
+	const input = `Exit code: 1\n${'x'.repeat(200_000)}\n${'\n'.repeat(100_000)}`;
+	const split = splitSegments('shell_command', input);
+	const elapsed = Date.now() - started;
+	assert.equal(split.tail, '');
+	assert.ok(elapsed < 200, `took ${elapsed}ms`);
+});
+
 // Rules: this file's whole value is running against a real binary. When rtk is absent every test here skips, and a skipped suite looks exactly like a passing one in a summary line — which is how this coverage went quiet before CI installed rtk. The guard turns that silence into a visible note instead of a hidden skip, and CI fails the install step rather than reaching here without the binary.
 test('rtk-shapes: note when the real binary is absent, so the skips are never invisible', t => {
 	if (hasRtk()) {
