@@ -1,6 +1,6 @@
 {
 	"name": "cmd-compress",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Token compression mods for Command Code: terse replies (caveman), lean code (ponytail), condensed shell output (RTK) — one package, four mods.",
 	"keywords": [
 		"cmd-mod",
