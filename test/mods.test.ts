@@ -205,3 +205,19 @@ test('filterNameFor: only the two real tool names map, prototype keys do not', (
 		assert.equal(typeof got, 'undefined', `${hostile} must not leak a prototype value`);
 	}
 });
+
+test('pinBinary: a prefix command before rtk is pinned, and plain programs are not', () => {
+	const bin = '/usr/bin/rtk';
+	for (const prefix of ['time', 'nohup', 'command', 'nice']) {
+		assert.equal(pinBinary(`${prefix} rtk git status`, bin), `${prefix} '${bin}' git status`, prefix);
+	}
+	// timeout carries its own duration argument
+	assert.equal(pinBinary('timeout 5 rtk git status', bin), `timeout 5 '${bin}' git status`);
+	assert.equal(pinBinary('timeout -k 1 5 rtk ls', bin), `timeout -k 1 5 '${bin}' ls`);
+	assert.equal(pinBinary('nice -n 5 rtk ls', bin), `nice -n 5 '${bin}' ls`);
+	// a command that only looks like a prefix is left alone: nothing named rtk follows it
+	assert.equal(pinBinary('timeout 5 ls', bin), 'timeout 5 ls');
+	assert.equal(pinBinary('echo rtk', bin), 'echo rtk');
+	// and rtk as data inside an argument is never touched
+	assert.equal(pinBinary('git commit -m "use rtk"', bin), 'git commit -m "use rtk"');
+});

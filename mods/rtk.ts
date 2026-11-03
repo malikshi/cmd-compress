@@ -133,15 +133,17 @@ export function shouldRewrite(command: string): boolean {
 }
 
 // Rules: `rtk rewrite` answers a bare `rtk …`, which the host shell resolves from ITS PATH. This mod can find rtk in ~/.bun/bin when that directory is not on PATH, so the bare name would run as `rtk: not found` and turn a working command into a failure. Pin each command-position `rtk` to the resolved absolute path.
-// Rules: a command position is the start of a segment (`&&`, `||`, `;`, `|`), the first word after a run of `VAR=value` assignments, and the first word after `env` and its own assignments — rtk emits all three (`FOO=1 rtk ls`, `env FOO=1 rtk git status`). An argument that merely contains the word (`git commit -m "use rtk"`) is data and stays untouched.
+// Rules: a command position is the start of a segment (`&&`, `||`, `;`, `|`), the first word after a run of `VAR=value` assignments, and the first word after a prefix command and its own arguments — rtk emits all three (`FOO=1 rtk ls`, `env FOO=1 rtk git status`, `time rtk git status`, `timeout 5 rtk git status`) because it rewrites the payload of a prefix rather than dropping it. Each prefix is matched explicitly so a program named `timeout` that is not a prefix stays intact. An argument that merely contains the word (`git commit -m "use rtk"`) is data and stays untouched.
 // Rules: the quote style follows the shell that will read it. POSIX shells need single quotes (with `'\''` for an embedded one); cmd.exe has no single-quote meaning at all — it would pass the quote characters through — so Windows gets a double-quoted path instead.
+const PREFIX_COMMAND = '(?:env|nohup|time|nice|command|stdbuf)(?:[ \\t]+-{0,2}[A-Za-z0-9=_,.:/-]+)*[ \\t]+|timeout(?:[ \\t]+-{0,2}[A-Za-z0-9=_,.:/-]+)*[ \\t]+[0-9.]+[A-Za-z]*[ \\t]+';
+
 export function pinBinary(command: string, bin: string, platform: string = process.platform): string {
 	const quoted = platform === 'win32'
 		? `"${bin.replace(/"/g, '""')}"`
 		: `'${bin.replace(/'/g, `'\\''`)}'`;
-	const prefix = '(?:[ \\t]*[A-Za-z_][A-Za-z0-9_]*=\\S+[ \\t]+)*';
+	const assignments = '(?:[ \\t]*[A-Za-z_][A-Za-z0-9_]*=\\S+[ \\t]+)*';
 	return command.replace(
-		new RegExp(`(^|&&|\\|\\||[;|])([ \\t]*(?:env[ \\t]+)?${prefix})rtk(?=[ \\t]|$)`, 'g'),
+		new RegExp(`(^|&&|\\|\\||[;|])([ \\t]*(?:${PREFIX_COMMAND})?${assignments})rtk(?=[ \\t]|$)`, 'g'),
 		(_match, lead: string, before: string) => `${lead}${before}${quoted}`,
 	);
 }
