@@ -64,14 +64,16 @@ The block a mode injects is measured twice: statically (chars/4 of the rules tex
 | Case | Live overhead | Static estimate | Ratio |
 |---|---:|---:|---:|
 | control | +5 to +35 | ~7 | — |
-| caveman lite | +150 | ~137 | 1.09 |
+| caveman lite | +150 | ~231 | 0.65 |
 | caveman full | +455 to +457 | ~465 | 0.98 |
-| caveman ultra | +232 | ~239 | 0.97 |
-| caveman megacave-full | +281 | ~257 | 1.09 |
+| caveman ultra | +232 | ~243 | 0.95 |
+| caveman megacave-full | +281 | ~300 | 0.94 |
 | ponytail full | +536 | ~600 | 0.90 |
 | ponytail ultra | +552 | ~618 | 0.90 |
 | compress balanced | +1,220 to +1,247 | ~1,065 | 1.17 |
 | compress max | +1,009 to +1,040 | ~857 | 1.21 |
+
+The live column is from the run recorded above. The static column is recomputed from the shipped rule text, which has since grown: `lite` gained the language, never-perform and one-term-per-thing clauses, and the megacave registers gained their floor paragraph. Those clauses are the reason `lite` now estimates higher than its live measurement — the two columns describe different revisions of the text, and only the static one reflects what ships today. Re-run `npm run bench` against a live model to refresh the left column.
 
 Single-mode estimates land within 10%. The **preset rows read 17–21% higher** than the sum of their blocks, so two blocks do not simply add — treat the static estimate as a floor for a preset.
 
@@ -91,7 +93,7 @@ This is the result to trust, because it is a measurement of text, not of model b
 
 The cost is a floor: caveman `ultra` saves ~50–70 reply tokens and adds **232** input tokens for its block on every turn. On a one-turn question it loses. It only pays off across many turns with a warm prompt cache, which this bench does not measure.
 
-**Paradox worth stating:** richer instructions make this model write more. Caveman's blocks are *instructions about style*, and this model appears to treat a longer style brief as licence for a longer answer. `ultra` is the shortest block (953 bytes) and the only one that saved — consistent with that explanation, though two runs cannot prove it.
+**Paradox worth stating:** richer instructions make this model write more. Caveman's blocks are *instructions about style*, and this model appears to treat a longer style brief as licence for a longer answer. `ultra` had the shortest block at the time of the run (953 bytes; 973 after the floor was hoisted to every level) and was the only one that saved — consistent with that explanation, though two runs cannot prove it.
 
 ## 4. The pinned-surface control experiment
 
