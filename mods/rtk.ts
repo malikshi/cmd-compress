@@ -21,8 +21,8 @@ export const REWRITE_TIMEOUT_MS = 2000;
 // Rules: below this the extra process costs more than the filter saves.
 export const MIN_FILTER_BYTES = 1200;
 
-// Rules: `rtk rewrite` shipped in 0.23.0; an older binary fails every rewrite open, so say so instead of pretending to work.
-export const MIN_SUPPORTED_RTK_MINOR = 23;
+// Rules: `rtk rewrite` first appears in 0.25.0 — verified against the upstream tree, where v0.24.0 has no Rewrite subcommand and v0.25.0 does. An older binary fails every rewrite open, so say so instead of pretending to work.
+export const MIN_SUPPORTED_RTK_MINOR = 25;
 
 const FILTER_TIMEOUT_MS = 5000;
 
@@ -109,7 +109,8 @@ export type RewriteVerdict =
 	| {kind: 'deny'; reason: string}
 	| {kind: 'pass'};
 
-// Rules: mirrors rtk's documented exit contract — 0 and 3 carry a rewrite, 2 carries a deny (with a message only when an rtk rule, not a host rule, blocked it), everything else passes.
+// Rules: mirrors rtk's exit contract as its own source defines it — 0 AllowRewrite and 3 AskRewrite both carry a rewrite, 2 Deny carries a deny (with a message only when an rtk rule, not a host rule, blocked it), 1 Defer means no equivalent and its stdout is ignored.
+// Rules: exit 3 asks the host to prompt before running the rewritten command. This host resolves permissions before `beforeToolCall` runs, so that signal cannot be forwarded here; the rewrite is applied and the host's own permission model stays the gate.
 export function classifyRewrite(code: number, stdout: string, original: string): RewriteVerdict {
 	const out = stdout.trim();
 	if (code === 0 || code === 3) {

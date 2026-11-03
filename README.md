@@ -87,17 +87,19 @@ curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/main/install.sh | sh
 - **`shell_command` is rewritten** through `rtk rewrite` before it runs, so `git status` executes as `rtk git status`. The full documented exit-code contract is honoured: `0` and `3` carry a rewrite, `1` means no equivalent, and `2` is a deny — a `2` that prints a reason becomes a block carrying that reason, while a silent `2` is a host deny rule rtk only relays and is left to the host to enforce. The emitted `rtk` is **pinned to the absolute path** this mod resolved, because rtk is often installed under `~/.bun/bin`, which the shell may not have on `PATH` — a bare name there would fail as `rtk: not found`.
 - **Shell output with no rewrite is still condensed.** `npm test`, `awk`, and `sed` have no rtk equivalent, yet their output can be cargo-test or pytest shaped. Above 1200 bytes it goes through `rtk pipe` with no `-f`, which auto-detects the format and passes the text through unchanged when nothing matches. A call that *was* rewritten is skipped, since rtk already filtered it.
 - **`grep` and `glob` results are condensed** above 1200 bytes, through `rtk pipe -f grep|find`.
-- **The host's own envelope is never filtered.** A `glob` result opens with `Found N files`; a truncated `grep` closes with `[Showing results with pagination = …]`; `shell_command` opens with `Exit code: 1`. Those lines carry meaning — the count, that the list is truncated, that the command failed — and rtk folds them away as noise. The mod splits them off before the filter and re-attaches them verbatim after it, so only the body is ever condensed.
+- **The host's own envelope is never filtered.** A `glob` result opens with `Found N files`; a truncated `grep` closes with `[Showing results with pagination = …]`; `shell_command` opens with `Exit code: 1`. Those lines carry meaning — the count, that the list is truncated, that the command failed — and rtk folds them away as noise. The mod splits them off before the filter and re-attaches them after it, so only the body is ever condensed: the head byte-for-byte, the tail with its notice text exact and only the blank run before it capped at one line.
 - **Every failure passes through.** A missing binary, an abort, a non-zero exit from the filter, or a result that came back larger than the original leaves the original untouched. No rtk call can hang a tool call: `cmd.exec` ignores a `timeout` option, so each one runs under an `AbortController`.
 - **A failed tool result is never filtered** — the error text reaches the model intact.
-- **A binary older than 0.23.0 turns rewrites off** instead of silently doing nothing, since that is the version `rtk rewrite` shipped in.
+- **A binary older than 0.25.0 turns rewrites off** instead of silently doing nothing, since that is the release that added the `rtk rewrite` subcommand (v0.24.0 has none; v0.25.0 does).
 
 `/rtk gain` reads `rtk gain -f json` and reports the token savings rtk itself recorded, so the claim is measured rather than estimated:
 
 ```bash
 /rtk status   # RTK: on (binary: 1.0.1)
-/rtk gain     # RTK saved 2,024,857 tokens over 10,601 commands (40.9%).
+/rtk gain     # RTK saved 2,035,557 tokens over 10,662 commands (40.9%).
 ```
+
+The figures move as you use rtk; the format and the source (rtk's own ledger) do not.
 
 Turn the grep/glob filter off but keep the rewrite, or turn off the extra shell pass:
 

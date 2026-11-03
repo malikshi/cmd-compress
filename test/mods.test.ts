@@ -131,6 +131,16 @@ test('isSupportedVersion: 0.x needs the minor that shipped rewrite, 1.x always p
 	assert.equal(isSupportedVersion(null), true, 'an unknown version is not a reason to disable');
 });
 
+// Rules: the gate exists because `rtk rewrite` first appears in 0.25.0 — verified against the upstream tree, where v0.24.0 has no Rewrite subcommand. One minor below the floor must be rejected, and the patch digit must not change the answer.
+test('isSupportedVersion: the boundary is exact, and the patch digit is irrelevant', () => {
+	assert.equal(MIN_SUPPORTED_RTK_MINOR, 25, 'the floor is the release that added rewrite');
+	assert.equal(isSupportedVersion(parseRtkVersion('rtk 0.24.99')), false, 'v0.24.0 has no Rewrite subcommand');
+	assert.equal(isSupportedVersion(parseRtkVersion('rtk 0.25.0')), true);
+	assert.equal(isSupportedVersion(parseRtkVersion('rtk 0.25.9')), true);
+	assert.equal(isSupportedVersion(parseRtkVersion('rtk 1.0.0')), true, 'a 1.x never needs the minor check');
+	assert.equal(isSupportedVersion(parseRtkVersion('rtk 2.0.0')), true);
+});
+
 // Rules: the whole exit-code contract in one table — a wrong branch here either runs a denied command or drops a rewrite.
 test('classifyRewrite: maps every documented exit code', () => {
 	assert.deepEqual(classifyRewrite(0, 'rtk git status', 'git status'), {kind: 'rewrite', command: 'rtk git status'});
