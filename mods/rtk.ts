@@ -98,7 +98,7 @@ export function parseRtkVersion(raw: string): RtkVersion | null {
 	return {major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3])};
 }
 
-// Rules: a pre-1.0 binary must reach minor 23; any 1.x already satisfies it.
+// Rules: a pre-1.0 binary must reach minor 25 — the release that introduced the Rewrite subcommand; any 1.x already satisfies it.
 export function isSupportedVersion(version: RtkVersion | null): boolean {
 	if (!version) return true;
 	return version.major > 0 || version.minor >= MIN_SUPPORTED_RTK_MINOR;
