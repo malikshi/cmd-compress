@@ -7,7 +7,7 @@ Token compression mods for [Command Code](https://commandcode.ai/docs/mods): sho
 | **caveman** | The reply voice. Answer first, filler gone, every technical fact kept. | `/caveman [lite\|full\|ultra\|megacave-*\|off]` |
 | **ponytail** | The code you write. Smallest change that fully works; nothing unrequested. | `/ponytail [lite\|full\|ultra\|off]` |
 | **rtk** | Shell output. Rewrites `shell_command` through `rtk rewrite`, condenses output no rewrite covered, and filters grep/glob results. | `/rtk [on\|off\|status\|gain]` |
-| **compress** | All three at once, at one of four presets. | `/compress [off\|lite\|balanced\|max\|status]` |
+| **compress** | All three at once, at one of four presets. | `/compress [off\|medium\|balanced\|max\|status]` |
 
 Every mode is **off by default**. Nothing changes until you turn it on, and the choice persists across sessions in `~/.commandcode/mods/.store/`.
 
@@ -54,11 +54,13 @@ Or say `stop caveman` / `stop ponytail` as the whole message. `normal mode` — 
 | Preset | caveman | ponytail | rtk |
 |---|---|---|---|
 | `off` | off | off | off |
-| `lite` | lite | lite | on |
+| `medium` | lite | lite | on |
 | `balanced` | full | full | on |
 | `max` | ultra | ultra | on |
 
 `rtk` is binary — it is either rewriting or it is not — so every live preset turns it on.
+
+The preset names match the upstream combo reference ([tersio](https://github.com/KurutoDenzeru/tersio): `off | medium | balanced | max`). `lite` still works as an alias for `medium`.
 
 ### Caveman levels
 
@@ -173,16 +175,22 @@ The exact, quotable numbers are the filter bytes and the prompt overhead. The li
 - **The rtk filter is heuristic and declines rather than mangles.** `rtk pipe` refuses anything larger than its input (`never_worse`), so a scattered grep result comes back byte-identical instead of worse — measured at 0.0% on 240 matches across 240 files. A very unusual layout can still read worse; `rtk` mode is off by default and `/rtk off` stops it immediately. The host envelope — header, pagination notice, exit status — is split off before filtering and re-attached verbatim, so those lines are never at risk.
 - **The extra shell pass costs a process.** Measured here, 12–15 ms per qualifying result on a warm page cache. Below 1200 bytes the filter never runs, and `/rtk-shell=false` turns the pass off while keeping rewrites.
 - **A compressed reply can read as curt.** That is the mode working. `/caveman off` restores normal prose mid-session.
+- **Windows is supported but less exercised than POSIX.** The filter redirect runs through `cmd.exe /d /s /c`, and a pinned path is double-quoted because cmd.exe gives single quotes no meaning. Both are unit-tested on every OS, and a real `cmd.exe` redirect is asserted by the `windows-latest` CI job; the maintainer's own runs are on Linux, so a Windows-specific report matters more here than elsewhere.
 - **No dollar figure is claimed.** Tersio publishes its own benchmark; this package ports the modes. For the shell half, `/rtk gain` reports what rtk itself saved on your machine, read from its own database rather than estimated.
 
 ## Develop
 
 ```bash
-npm test          # node:test — rules, store, prompt surgery, every mod's wiring
-npm run verify    # loads each mod through the real Command Code loader
+npm test           # node:test — rules, store, prompt surgery, every mod's wiring
+npm run typecheck  # tsc --noEmit against types/harness.d.ts
+npm run verify     # typecheck, tests, then each mod through the real Command Code loader
 ```
 
+`npm run verify` is the gate CI runs on Linux, macOS, and Windows against Node 22 and 24.
+
 Tests drive each mod through its exported factory against a fake `ModApi` (`test/harness.ts`), so the hooks and command handlers are covered, not just the pure helpers.
+
+Command Code ships no type declarations, so `types/harness.d.ts` is a hand-written slice of the documented mod API. It exists because a hook that returns a field the host never reads is a silent no-op at runtime, but a type error there.
 
 ```
 mods/
@@ -194,9 +202,11 @@ mods/
 rules/
   caveman.ts       the six level blocks
   ponytail.ts      the three level blocks
+types/
+  harness.d.ts     the mod API slice the package compiles against
 bench/            exact (bytes) + live (reply tokens) benchmarks
 docs/             BENCHMARK.md, BENCHMARK-RESULTS.md
-test/              100 tests; 9 of them drive the real rtk binary, the rest use a fake
+test/              107 tests; 9 of them drive the real rtk binary, the rest use a fake
                    ModApi so they run without one
 ```
 

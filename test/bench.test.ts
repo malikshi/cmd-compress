@@ -91,19 +91,19 @@ test('fixtures: the host tool shapes carry their envelope', () => {
 });
 
 test('checkProse: every group must match, a group is an OR', () => {
-	const prompt = PROSE_PROMPTS[0];
+	const prompt = PROSE_PROMPTS[0]!;
 	assert.equal(checkProse('Reusing connections cuts overhead and waiting under concurrency.', prompt), true);
 	assert.equal(checkProse('Connection pooling is good.', prompt), false, 'missing the overhead and concurrency groups');
 });
 
 test('checkProse: the gate is lexical and substring-based, as documented', () => {
-	const prompt = PROSE_PROMPTS[1];
+	const prompt = PROSE_PROMPTS[1]!;
 	// "quer" must match "queries", which a word-boundary regex would miss
 	assert.equal(checkProse('An index turns a query scan into a tree lookup over rows.', prompt), true);
 });
 
 test('checkCode: every requested name must appear', () => {
-	const prompt = CODE_PROMPTS[0];
+	const prompt = CODE_PROMPTS[0]!;
 	assert.equal(checkCode('function chunk() {} function chunkLazy() {}', prompt), true);
 	assert.equal(checkCode('function chunk() {}', prompt), false);
 });

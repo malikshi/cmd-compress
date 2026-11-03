@@ -25,7 +25,7 @@ export function normalizePonytailLevel(raw: string): PonytailLevel | 'off' | nul
 export default function (cmd: ModApi): void {
 	cmd.addFlag('ponytail', {type: 'string', default: '', description: 'Start mode: lite|full|ultra (default: off)'});
 
-	let mode = readOwnMode(cmd.store);
+	let mode = readOwnMode(cmd.store, OFF, value => LEVELS.has(value) || value === OFF);
 
 	function setMode(next: string): void {
 		mode = next;
@@ -64,10 +64,10 @@ export default function (cmd: ModApi): void {
 
 		appendSystemPrompt: () => (mode === OFF ? undefined : wrapBlock('ponytail', ponytailRule(mode))),
 
-		// Rules: `normal mode` ends EVERY mode, so it is answered even when ponytail is already off; caveman normally handles it first, and this is the fallback when caveman is not loaded.
+		// Rules: `normal mode` ends EVERY mode, so it is answered even when ponytail is already off — caveman normally handles it first, and this is the fallback when caveman is not loaded. Gating it on this mod's own mode would leave a lone `rtk` running.
 		transformInput: ({text}) => {
 			const phrase = text.trim().toLowerCase();
-			if (phrase === NORMAL_MODE && mode !== OFF) {
+			if (phrase === NORMAL_MODE) {
 				turnOffSiblings(cmd.use, 'ponytail');
 				setMode(OFF);
 				return {action: 'handled', message: 'All compression modes off.'};

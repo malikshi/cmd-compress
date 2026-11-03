@@ -23,6 +23,7 @@
 		"mods",
 		"rules",
 		"scripts",
+		"types",
 		"README.md",
 		"LICENSE",
 		"ATTRIBUTION.md"
@@ -37,8 +38,13 @@
 	},
 	"scripts": {
 		"test": "node --test test/*.test.ts",
-		"verify": "node --test test/*.test.ts && node scripts/verify-mods.ts",
+		"typecheck": "tsc --noEmit -p tsconfig.json",
+		"verify": "npm run typecheck && node --test test/*.test.ts && node scripts/verify-mods.ts",
 		"bench": "node bench/cli.ts output",
 		"bench:prompt": "node bench/cli.ts prompt"
+	},
+	"devDependencies": {
+		"@types/node": "^22.20.5",
+		"typescript": "^5.6.3"
 	}
 }

@@ -8,7 +8,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import rtk, {splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
-import {createFakeCmd, runHandler} from './harness.ts';
+import {createFakeCmd, firstHook, resultText, runHandler} from './harness.ts';
 
 type ExecRequest = {command: string; args?: string[]; cwd?: string; signal?: AbortSignal};
 
@@ -41,7 +41,7 @@ async function loaded() {
 	const fake = createFakeCmd({exec: realExec});
 	fake.cmd.name = 'probe';
 	rtk(fake.cmd as never);
-	fake.hooks[0].onSessionStart?.();
+	firstHook(fake).onSessionStart?.();
 	await new Promise(resolve => setTimeout(resolve, 150));
 	runHandler(fake.commands, 'rtk', 'on');
 	return fake;
@@ -90,13 +90,13 @@ test('glob: the count and the pagination notice survive condensation', async t =
 	if (!hasRtk()) return t.skip('rtk is not installed here');
 	const fake = await loaded();
 	const input = globOutput(260, 10, ' with pagination = limit: 260, offset: 260');
-	const result = (await fake.hooks[0].afterToolCall?.({
+	const result = (await firstHook(fake).afterToolCall?.({
 		toolName: 'glob',
 		result: [{type: 'text', text: input}],
 		isError: false,
 	})) as {content: Array<{text: string}>} | undefined;
 	assert.ok(result, 'the 4.9 KB result is condensed');
-	const out = result.content[0].text;
+	const out = resultText(result);
 	assert.ok(out.startsWith('Found 260 files with pagination = limit: 260, offset: 260\n'), 'the header is verbatim');
 	assert.ok(out.length < input.length, 'and the body still shrank');
 });
@@ -105,11 +105,7 @@ test('glob: every directory in the input is still named', async t => {
 	if (!hasRtk()) return t.skip('rtk is not installed here');
 	const fake = await loaded();
 	const input = globOutput(260, 10);
-	const out = ((await fake.hooks[0].afterToolCall?.({
-		toolName: 'glob',
-		result: [{type: 'text', text: input}],
-		isError: false,
-	})) as {content: Array<{text: string}>}).content[0].text;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'glob', result: [{type: 'text', text: input}], isError: false}));
 	for (let dir = 0; dir < 10; dir += 1) {
 		assert.ok(out.includes(`./src/d${dir}/`), `dir d${dir} is named`);
 	}
@@ -119,11 +115,7 @@ test('grep: the truncation notice survives, and the match lines still shrink', a
 	if (!hasRtk()) return t.skip('rtk is not installed here');
 	const fake = await loaded();
 	const input = grepOutput(240, 'limit: 240');
-	const out = ((await fake.hooks[0].afterToolCall?.({
-		toolName: 'grep',
-		result: [{type: 'text', text: input}],
-		isError: false,
-	})) as {content: Array<{text: string}>}).content[0].text;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: input}], isError: false}));
 	assert.ok(out.trimEnd().endsWith('[Showing results with pagination = limit: 240]'), 'the notice is the last thing the model reads');
 	assert.ok(out.includes('src/handlers.ts'), 'the file is still named');
 	assert.ok(out.length < input.length);
@@ -147,11 +139,7 @@ test('shell: the exit status survives auto-detect, and the failing test remains'
 		'test result: FAILED. 2 passed; 1 failed; 0 ignored',
 	].join('\n');
 	const padded = `${input}\n${'filler line that the filter folds away\n'.repeat(40)}`;
-	const out = ((await fake.hooks[0].afterToolCall?.({
-		toolName: 'shell_command',
-		result: [{type: 'text', text: padded}],
-		isError: false,
-	})) as {content: Array<{text: string}>}).content[0].text;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'shell_command', result: [{type: 'text', text: padded}], isError: false}));
 	assert.ok(out.startsWith('Exit code: 1 (test failure)\n'), 'the exit status is still the first line');
 	assert.ok(out.includes('fails_here'), 'the failing test is still named');
 	assert.ok(out.length < padded.length, 'and the padding was folded');
@@ -179,11 +167,7 @@ test('glob: the truncation notice survives the real filter path', async t => {
 	const notice = '(Results are truncated: showing 1-100 of 382 matches, sorted by modification time. Consider using a more specific path or pattern, or retry with offset=100 for the next page.)';
 	const paths = Array.from({length: 200}, (_, index) => `  src/d${index % 5}/f${index}.ts`);
 	const input = `Found 100 files\n${paths.join('\n')}\n${notice}`;
-	const out = ((await fake.hooks[0].afterToolCall?.({
-		toolName: 'glob',
-		result: [{type: 'text', text: input}],
-		isError: false,
-	})) as {content: Array<{text: string}>}).content[0].text;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'glob', result: [{type: 'text', text: input}], isError: false}));
 	assert.ok(out.startsWith('Found 100 files\n'), 'the count is verbatim');
 	assert.ok(out.trimEnd().endsWith(notice), 'and the truncation notice is the last thing the model reads');
 	assert.ok(out.length < input.length, 'the body still shrank');
@@ -195,7 +179,7 @@ test('a body under the threshold is left alone even when its header is large', a
 	const input = `Found 3 files\n./a.ts\n./b.ts\n./c.ts`;
 	assert.ok(input.length < MIN_FILTER_BYTES);
 	assert.equal(
-		await fake.hooks[0].afterToolCall?.({toolName: 'glob', result: [{type: 'text', text: input}], isError: false}),
+		await firstHook(fake).afterToolCall?.({toolName: 'glob', result: [{type: 'text', text: input}], isError: false}),
 		undefined,
 	);
 });
@@ -203,7 +187,7 @@ test('a body under the threshold is left alone even when its header is large', a
 test('the rewrite never emits a bare `rtk` the shell cannot resolve', async t => {
 	if (!hasRtk()) return t.skip('rtk is not installed here');
 	const fake = await loaded();
-	const result = (await fake.hooks[0].beforeToolCall?.({
+	const result = (await firstHook(fake).beforeToolCall?.({
 		toolCallId: 'p1',
 		toolName: 'shell_command',
 		input: {command: 'git status'},
@@ -231,11 +215,7 @@ test('a short command whose body is already minimal is not inflated by the filte
 		...Array.from({length: 120}, (_, index) => `  diagnostic line ${index}`),
 	].join('\n');
 	const input = `Exit code: 1 (test failure)\n${body}`;
-	const out = ((await fake.hooks[0].afterToolCall?.({
-		toolName: 'shell_command',
-		result: [{type: 'text', text: input}],
-		isError: false,
-	})) as {content: Array<{text: string}>}).content[0].text;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'shell_command', result: [{type: 'text', text: input}], isError: false}));
 	assert.ok(out.length < input.length, 'the filter still ran');
 	assert.ok(out.startsWith('Exit code: 1 (test failure)\n'), 'and the exit status is still first');
 	assert.ok(out.includes('tests::bad'), 'and the failing test is still named');

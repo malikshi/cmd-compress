@@ -106,6 +106,21 @@ export function runHandler(commands: Map<string, FakeCommand>, name: string, arg
 	return command.handler({args});
 }
 
+// Rules: every mod registers exactly one hooks object, so this is the single place `hooks[0]` is allowed to be non-null; a typed accessor keeps `noUncheckedIndexedAccess` honest without a cast per call site.
+export function firstHook(fake: {hooks: FakeHooks[]}): FakeHooks {
+	const [hook] = fake.hooks;
+	if (!hook) throw new Error('the mod registered no hooks');
+	return hook;
+}
+
+// Rules: an afterToolCall result replaces content with one text block; asserting that shape here keeps `noUncheckedIndexedAccess` honest without a cast at each call site.
+export function resultText(result: unknown): string {
+	const content = (result as {content?: Array<{text?: string}>} | undefined)?.content;
+	const text = content?.[0]?.text;
+	if (typeof text !== 'string') throw new Error('the hook returned no content text');
+	return text;
+}
+
 export function messageOf(result: unknown): string {
 	const typed = result as {message?: string} | undefined;
 	return typed?.message ?? '';

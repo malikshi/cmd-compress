@@ -23,6 +23,21 @@ if (mods.length === 0) {
 
 let failed = false;
 
+// Rules: the loader is `cmd`, which a CI image may not have installed; say so and skip rather than fail a run whose real checks already passed.
+function hasLoader(): boolean {
+	try {
+		execFileSync('cmd', ['--version'], {encoding: 'utf8', timeout: 30_000});
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+if (!hasLoader()) {
+	console.log('verify-mods: the `cmd` binary is not installed here — skipping the loader check');
+	process.exit(0);
+}
+
 for (const entry of mods) {
 	const file = join(root, entry);
 	console.log(`\n=== ${entry}`);

@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"target": "ES2023",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"lib": ["ES2023"],
+		"types": ["node"],
+		"strict": true,
+		"noEmit": true,
+		"noUncheckedIndexedAccess": true,
+		"exactOptionalPropertyTypes": false,
+		"allowImportingTsExtensions": true,
+		"verbatimModuleSyntax": false,
+		"skipLibCheck": true
+	},
+	"include": ["types/**/*.d.ts", "mods/**/*.ts", "rules/**/*.ts", "bench/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"]
+}

@@ -63,7 +63,7 @@ export function readUsage(stdout: string): {usage: Usage; durationMs: number; fi
 	const lines = stdout.split('\n').filter(line => line.trim().startsWith('{'));
 	for (let index = lines.length - 1; index >= 0; index -= 1) {
 		try {
-			const frame = JSON.parse(lines[index]) as {
+			const frame = JSON.parse(lines[index] ?? '') as {
 				type?: string;
 				usage?: Usage;
 				durationMs?: number;

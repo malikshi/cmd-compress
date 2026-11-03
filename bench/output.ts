@@ -125,7 +125,7 @@ function condenseTool(bin: string, filter: string | null, tool: string, input: s
 // Rules: fidelity is asserted, not assumed — a filter that drops a whole file is a failed run and says so.
 function grepFidelity(input: string, output: string): string {
 	const lines = input.split('\n').filter(Boolean);
-	const files = new Set(lines.map(line => line.split(':')[0]));
+	const files = new Set(lines.map(line => line.split(':')[0] ?? ''));
 	const named = [...files].filter(file => output.includes(file)).length;
 	const kept = output.split('\n').filter(line => /^\s*\d+:/.test(line)).length;
 	if (output === input) return `passed through unchanged (${lines.length} matches, ${files.size} files)`;

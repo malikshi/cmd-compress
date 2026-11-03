@@ -14,7 +14,7 @@ import type {ModApi} from '@commandcode/harness';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {readOwnMode, resolveBin, wrapBlock, writeOwnMode, OFF} from './shared.ts';
+import {filterShell, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, wrapBlock, writeOwnMode, OFF} from './shared.ts';
 
 export const REWRITE_TIMEOUT_MS = 2000;
 
@@ -132,8 +132,11 @@ export function shouldRewrite(command: string): boolean {
 
 // Rules: `rtk rewrite` answers a bare `rtk …`, which the host shell resolves from ITS PATH. This mod can find rtk in ~/.bun/bin when that directory is not on PATH, so the bare name would run as `rtk: not found` and turn a working command into a failure. Pin each command-position `rtk` to the resolved absolute path.
 // Rules: a command position is the start of a segment (`&&`, `||`, `;`, `|`), the first word after a run of `VAR=value` assignments, and the first word after `env` and its own assignments — rtk emits all three (`FOO=1 rtk ls`, `env FOO=1 rtk git status`). An argument that merely contains the word (`git commit -m "use rtk"`) is data and stays untouched.
-export function pinBinary(command: string, bin: string): string {
-	const quoted = `'${bin.replace(/'/g, `'\\''`)}'`;
+// Rules: the quote style follows the shell that will read it. POSIX shells need single quotes (with `'\''` for an embedded one); cmd.exe has no single-quote meaning at all — it would pass the quote characters through — so Windows gets a double-quoted path instead.
+export function pinBinary(command: string, bin: string, platform: string = process.platform): string {
+	const quoted = platform === 'win32'
+		? `"${bin.replace(/"/g, '""')}"`
+		: `'${bin.replace(/'/g, `'\\''`)}'`;
 	const prefix = '(?:[ \\t]*[A-Za-z_][A-Za-z0-9_]*=\\S+[ \\t]+)*';
 	return command.replace(
 		new RegExp(`(^|&&|\\|\\||[;|])([ \\t]*(?:env[ \\t]+)?${prefix})rtk(?=[ \\t]|$)`, 'g'),
@@ -162,7 +165,7 @@ export default function (cmd: ModApi): void {
 	cmd.addFlag('rtk-filter', {type: 'boolean', default: true, description: 'Condense grep/glob tool output'});
 	cmd.addFlag('rtk-shell', {type: 'boolean', default: true, description: 'Condense shell output that no rewrite covered'});
 
-	let mode = readOwnMode(cmd.store);
+	let mode = readOwnMode(cmd.store, OFF, value => value === 'on' || value === 'off');
 
 	const bin = resolveBin('rtk');
 
@@ -227,17 +230,13 @@ export default function (cmd: ModApi): void {
 	// Rules: never pass tool output through a heredoc — a line equal to the delimiter would run as shell.
 	// Rules: an omitted filter lets rtk auto-detect; it is an identity pass when nothing matches and `never_worse` refuses anything larger than the input.
 	async function filterThroughRtk(filter: string | null, text: string): Promise<string | null> {
-		if (!bin || process.platform === 'win32') return null;
+		if (!bin) return null;
 		let dir: string | undefined;
 		try {
 			dir = mkdtempSync(join(tmpdir(), 'cmd-compress-'));
 			const file = join(dir, 'in.txt');
 			writeFileSync(file, text, 'utf8');
-			const flags = filter ? `-f ${filter} ` : '';
-			const {stdout, code} = await exec(
-				{command: '/bin/sh', args: ['-c', `"${bin}" pipe ${flags}< "${file}"`]},
-				FILTER_TIMEOUT_MS,
-			);
+			const {stdout, code} = await exec(pipeCommand(bin, filter, file, filterShell()), FILTER_TIMEOUT_MS);
 			if (code !== 0) return null;
 			const out = stdout;
 			if (!out.trim() || out.length >= text.length) return null;
@@ -318,8 +317,16 @@ export default function (cmd: ModApi): void {
 
 		appendSystemPrompt: () => (mode === OFF || !bin || !supported() ? undefined : wrapBlock('rtk', GUIDANCE)),
 
+		// Rules: `normal mode` ends EVERY mode, so a session where rtk is the only mod loaded must still answer it; caveman and ponytail normally handle it first, and the host stops the chain at the first `handled`.
+		transformInput: ({text}) => {
+			if (text.trim().toLowerCase() !== NORMAL_MODE) return undefined;
+			turnOffSiblings(cmd.use, 'rtk');
+			setMode(OFF);
+			return {action: 'handled', message: 'All compression modes off.'};
+		},
+
 		beforeToolCall: async ({toolCallId, toolName, input}) => {
-			if (mode === OFF || toolName !== 'shell_command' || !supported()) return undefined;
+			if (mode === OFF || toolName !== 'shell_command' || !bin || !supported()) return undefined;
 			const command = typeof input.command === 'string' ? input.command : '';
 			if (!shouldRewrite(command)) return undefined;
 			const verdict = await rewrite(command);

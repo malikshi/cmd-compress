@@ -9,14 +9,16 @@ export function median(values: readonly number[]): number {
 	if (values.length === 0) return 0;
 	const sorted = [...values].sort((a, b) => a - b);
 	const mid = Math.floor(sorted.length / 2);
-	return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+	const lower = sorted[mid - 1] ?? 0;
+	const upper = sorted[mid] ?? 0;
+	return sorted.length % 2 === 0 ? (lower + upper) / 2 : upper;
 }
 
 export function percentile(values: readonly number[], p: number): number {
 	if (values.length === 0) return 0;
 	const sorted = [...values].sort((a, b) => a - b);
 	const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
-	return sorted[index];
+	return sorted[index] ?? 0;
 }
 
 // Rules: a shrink is positive; a filter that grew its input reports a negative reduction, never a clamped zero.
@@ -44,7 +46,7 @@ export function table(headers: readonly string[], rows: readonly (readonly strin
 		Math.max(header.length, ...rows.map(row => (row[column] ?? '').length)),
 	);
 	const line = (cells: readonly string[]) =>
-		cells.map((cell, column) => cell.padEnd(widths[column])).join('  ').trimEnd();
+		cells.map((cell, column) => cell.padEnd(widths[column] ?? 0)).join('  ').trimEnd();
 	const divider = widths.map(width => '-'.repeat(width)).join('  ');
 	return [line(headers), divider, ...rows.map(line)].join('\n');
 }

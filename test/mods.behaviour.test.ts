@@ -11,7 +11,7 @@ import caveman, {normalizeCavemanLevel} from '../mods/caveman.ts';
 import ponytail from '../mods/ponytail.ts';
 import rtk from '../mods/rtk.ts';
 import compress from '../mods/compress.ts';
-import {createFakeCmd, runHandler, messageOf} from './harness.ts';
+import {createFakeCmd, firstHook, runHandler, messageOf} from './harness.ts';
 
 type Fake = ReturnType<typeof createFakeCmd>;
 
@@ -56,7 +56,7 @@ test('caveman: a level switch replaces the block instead of stacking', () => {
 test('caveman: the stop phrase turns it off and consumes the message', () => {
 	const fake = load(caveman);
 	runHandler(fake.commands, 'caveman', 'full');
-	const result = fake.hooks[0].transformInput?.({text: 'stop caveman'}) as {action: string};
+	const result = firstHook(fake).transformInput?.({text: 'stop caveman'}) as {action: string};
 	assert.equal(result.action, 'handled');
 	assert.equal(appends(fake), '');
 });
@@ -64,7 +64,7 @@ test('caveman: the stop phrase turns it off and consumes the message', () => {
 test('caveman: an ordinary sentence mentioning the mode does not turn it off', () => {
 	const fake = load(caveman);
 	runHandler(fake.commands, 'caveman', 'full');
-	assert.equal(fake.hooks[0].transformInput?.({text: 'add a normal mode toggle'}), undefined);
+	assert.equal(firstHook(fake).transformInput?.({text: 'add a normal mode toggle'}), undefined);
 });
 
 // Rules: the host stops the transformInput chain at the first `handled`, so `normal mode` must turn the siblings off itself or they keep running.
@@ -83,7 +83,7 @@ test('caveman: "normal mode" turns off every reachable sibling, not just caveman
 	assert.notEqual(appends(cavemanFake), '');
 	assert.notEqual(appends(ponytailFake), '');
 
-	const result = cavemanFake.hooks[0].transformInput?.({text: 'normal mode'}) as {action: string};
+	const result = firstHook(cavemanFake).transformInput?.({text: 'normal mode'}) as {action: string};
 	assert.equal(result.action, 'handled');
 	assert.equal(appends(cavemanFake), '', 'caveman is off');
 	assert.equal(appends(ponytailFake), '', 'ponytail followed through its exposed setMode');
@@ -99,9 +99,38 @@ test('caveman: "normal mode" turns off a sibling that is the only mode running',
 	runHandler(rtkFake.commands, 'rtk', 'on');
 	assert.notEqual(appends(rtkFake), '');
 
-	const result = cavemanFake.hooks[0].transformInput?.({text: 'normal mode'}) as {action: string};
+	const result = firstHook(cavemanFake).transformInput?.({text: 'normal mode'}) as {action: string};
 	assert.equal(result.action, 'handled');
 	assert.equal(appends(rtkFake), '', 'rtk is off even though caveman itself was already off');
+});
+
+// Rules: ponytail is usually loaded and already off, and the host stops the chain at the first `handled` — so a ponytail that gated on its own mode would swallow the phrase and leave rtk running.
+test('ponytail: "normal mode" still reaches a sibling while ponytail is off', () => {
+	const ponytailFake = load(ponytail);
+	const rtkFake = load(rtk);
+	ponytailFake.cmd.use = (mod: string, name: string) => (mod === 'rtk' ? rtkFake.exposed.get('probe')?.get(name) : undefined);
+	const rtkMode = () => rtkFake.exposed.get('probe')?.get('getMode') as (() => string) | undefined;
+
+	runHandler(rtkFake.commands, 'rtk', 'on');
+	assert.equal(rtkMode()?.(), 'on');
+
+	const result = firstHook(ponytailFake).transformInput?.({text: 'normal mode'}) as {action: string};
+	assert.equal(result.action, 'handled');
+	assert.equal(rtkMode()?.(), 'off', 'the sibling was turned off even though ponytail itself was already off');
+});
+
+// Rules: a session may load rtk alone; the phrase has to resolve there too, so rtk answers it rather than passing it to the model.
+test('rtk: "normal mode" turns rtk off when it is the only mod loaded', () => {
+	const fake = load(rtk);
+	const mode = () => fake.exposed.get('probe')?.get('getMode') as (() => string) | undefined;
+
+	runHandler(fake.commands, 'rtk', 'on');
+	assert.equal(mode()?.(), 'on');
+
+	const result = firstHook(fake).transformInput?.({text: 'normal mode'}) as {action: string};
+	assert.equal(result.action, 'handled');
+	assert.equal(mode()?.(), 'off');
+	assert.equal(firstHook(fake).appendSystemPrompt?.(), undefined, 'and the guidance block is gone');
 });
 
 test('caveman: status reports the live mode and unknown levels print usage', () => {
@@ -134,7 +163,7 @@ test('ponytail: /ponytail ultra injects the ultra block with its marker', () => 
 test('ponytail: "stop ponytail" turns it off', () => {
 	const fake = load(ponytail);
 	runHandler(fake.commands, 'ponytail', 'full');
-	fake.hooks[0].transformInput?.({text: 'stop ponytail'});
+	firstHook(fake).transformInput?.({text: 'stop ponytail'});
 	assert.equal(appends(fake), '');
 });
 
@@ -146,7 +175,7 @@ test('rtk: off means no rewrite and no guidance', async () => {
 			return {stdout: 'rtk git status', stderr: '', code: 0};
 		},
 	});
-	const result = await fake.hooks[0].beforeToolCall?.({toolName: 'shell_command', input: {command: 'git status'}});
+	const result = await firstHook(fake).beforeToolCall?.({toolName: 'shell_command', input: {command: 'git status'}});
 	assert.equal(result, undefined);
 	assert.equal(calls, 0);
 	assert.equal(appends(fake), '');
@@ -161,19 +190,32 @@ test('rtk: on rewrites a shell command through rtk and injects guidance', async 
 		},
 	});
 	runHandler(fake.commands, 'rtk', 'on');
-	const result = (await fake.hooks[0].beforeToolCall?.({
+	const result = (await firstHook(fake).beforeToolCall?.({
 		toolName: 'shell_command',
 		input: {command: 'git status'},
 	})) as {input: {command: string}};
 	assert.match(result.input.command, /rtk'? git status$/, 'the rewrite is pinned to the resolved absolute path');
-	assert.match(seen[0], /rewrite git status$/);
+	assert.match(seen[0] ?? '', /rewrite git status$/);
 	assert.match(appends(fake), /<rtk>/);
+});
+
+// Rules: shell_command carries an optional `args` array beside `command`; the rewrite must replace only the command and leave those args for the tool to append, or a rewritten call would drop them.
+test('rtk: a rewrite keeps the call\'s own args intact', async () => {
+	const fake = load(rtk, {exec: async () => ({stdout: 'rtk git status', stderr: '', code: 0})});
+	runHandler(fake.commands, 'rtk', 'on');
+	const result = (await firstHook(fake).beforeToolCall?.({
+		toolName: 'shell_command',
+		input: {command: 'git status', args: ['--porcelain'], timeout: 5000},
+	})) as {input: {command: string; args: string[]; timeout: number}};
+	assert.match(result.input.command, /rtk'? git status$/, 'only the command is rewritten');
+	assert.deepEqual(result.input.args, ['--porcelain'], 'the args survive');
+	assert.equal(result.input.timeout, 5000, 'and every other input field survives');
 });
 
 test('rtk: a command with no rewrite is left untouched', async () => {
 	const fake = load(rtk, {exec: async () => ({stdout: '', stderr: '', code: 1})});
 	runHandler(fake.commands, 'rtk', 'on');
-	const result = await fake.hooks[0].beforeToolCall?.({toolName: 'shell_command', input: {command: 'echo hi'}});
+	const result = await firstHook(fake).beforeToolCall?.({toolName: 'shell_command', input: {command: 'echo hi'}});
 	assert.equal(result, undefined);
 });
 
@@ -186,7 +228,7 @@ test('rtk: an unrelated tool is never rewritten', async () => {
 		},
 	});
 	runHandler(fake.commands, 'rtk', 'on');
-	assert.equal(await fake.hooks[0].beforeToolCall?.({toolName: 'read_file', input: {file_path: 'x'}}), undefined);
+	assert.equal(await firstHook(fake).beforeToolCall?.({toolName: 'read_file', input: {file_path: 'x'}}), undefined);
 	assert.equal(calls, 0);
 });
 
@@ -196,14 +238,14 @@ test('rtk: a large grep result is condensed, a small one is left alone', async (
 		exec: async () => ({stdout: 'src/a.ts:1: hit\n', stderr: '', code: 0}),
 	});
 	runHandler(fake.commands, 'rtk', 'on');
-	const filtered = (await fake.hooks[0].afterToolCall?.({
+	const filtered = (await firstHook(fake).afterToolCall?.({
 		toolName: 'grep',
 		result: [{type: 'text', text: big}],
 		isError: false,
 	})) as {content: Array<{text: string}>};
-	assert.equal(filtered.content[0].text, 'src/a.ts:1: hit\n');
+	assert.equal(filtered.content[0]?.text, 'src/a.ts:1: hit\n');
 
-	const small = await fake.hooks[0].afterToolCall?.({
+	const small = await firstHook(fake).afterToolCall?.({
 		toolName: 'grep',
 		result: [{type: 'text', text: 'tiny'}],
 		isError: false,
@@ -214,7 +256,7 @@ test('rtk: a large grep result is condensed, a small one is left alone', async (
 test('rtk: a failed tool result is never filtered', async () => {
 	const fake = load(rtk, {exec: async () => ({stdout: 'condensed', stderr: '', code: 0})});
 	runHandler(fake.commands, 'rtk', 'on');
-	const result = await fake.hooks[0].afterToolCall?.({
+	const result = await firstHook(fake).afterToolCall?.({
 		toolName: 'grep',
 		result: [{type: 'text', text: 'x'.repeat(4000)}],
 		isError: true,
@@ -234,7 +276,7 @@ test('rtk: hostile grep output reaches the filter as data, not as shell source',
 	runHandler(fake.commands, 'rtk', 'on');
 	const payload = `${'$(touch /tmp/pwned)'.repeat(200)}\nRTK_EOF\n; rm -rf /\n`;
 	assert.ok(payload.length > 1200, 'the payload must exceed the filter threshold');
-	await fake.hooks[0].afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: payload}], isError: false});
+	await firstHook(fake).afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: payload}], isError: false});
 
 	const filterCommand = commands.find(command => command.includes(' pipe '));
 	assert.ok(filterCommand, 'the filter ran');
@@ -249,7 +291,7 @@ test('rtk: exit 2 with a message blocks the call and carries the reason', async 
 		exec: async () => ({stdout: 'pipeline rule forbids push', stderr: '', code: 2}),
 	});
 	runHandler(fake.commands, 'rtk', 'on');
-	const result = (await fake.hooks[0].beforeToolCall?.({
+	const result = (await firstHook(fake).beforeToolCall?.({
 		toolCallId: 'c1',
 		toolName: 'shell_command',
 		input: {command: 'git push origin main'},
@@ -263,7 +305,7 @@ test('rtk: exit 2 without a message passes, because the deny belongs to the host
 	const fake = load(rtk, {exec: async () => ({stdout: '', stderr: '', code: 2})});
 	runHandler(fake.commands, 'rtk', 'on');
 	assert.equal(
-		await fake.hooks[0].beforeToolCall?.({toolCallId: 'c1', toolName: 'shell_command', input: {command: 'git push'}}),
+		await firstHook(fake).beforeToolCall?.({toolCallId: 'c1', toolName: 'shell_command', input: {command: 'git push'}}),
 		undefined,
 	);
 });
@@ -271,7 +313,7 @@ test('rtk: exit 2 without a message passes, because the deny belongs to the host
 test('rtk: exit 3 still supplies a rewrite', async () => {
 	const fake = load(rtk, {exec: async () => ({stdout: 'rtk ls', stderr: '', code: 3})});
 	runHandler(fake.commands, 'rtk', 'on');
-	const result = (await fake.hooks[0].beforeToolCall?.({
+	const result = (await firstHook(fake).beforeToolCall?.({
 		toolCallId: 'c1',
 		toolName: 'shell_command',
 		input: {command: 'ls'},
@@ -291,16 +333,16 @@ test('rtk: unrewritten shell output is still condensed by auto-detect', async ()
 	});
 	runHandler(fake.commands, 'rtk', 'on');
 	assert.equal(
-		await fake.hooks[0].beforeToolCall?.({toolCallId: 'c9', toolName: 'shell_command', input: {command: 'npm test'}}),
+		await firstHook(fake).beforeToolCall?.({toolCallId: 'c9', toolName: 'shell_command', input: {command: 'npm test'}}),
 		undefined,
 	);
-	const filtered = (await fake.hooks[0].afterToolCall?.({
+	const filtered = (await firstHook(fake).afterToolCall?.({
 		toolCallId: 'c9',
 		toolName: 'shell_command',
 		result: [{type: 'text', text: 'x'.repeat(3000)}],
 		isError: false,
 	})) as {content: Array<{text: string}>};
-	assert.equal(filtered.content[0].text, 'FAILURES (1):\n');
+	assert.equal(filtered.content[0]?.text, 'FAILURES (1):\n');
 	assert.match(calls.at(-1) ?? '', / pipe < "/, 'auto-detect runs with no -f');
 });
 
@@ -315,8 +357,8 @@ test('rtk: a shell call rtk rewrote is not filtered twice', async () => {
 		},
 	});
 	runHandler(fake.commands, 'rtk', 'on');
-	await fake.hooks[0].beforeToolCall?.({toolCallId: 'c2', toolName: 'shell_command', input: {command: 'git status'}});
-	await fake.hooks[0].afterToolCall?.({
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'c2', toolName: 'shell_command', input: {command: 'git status'}});
+	await firstHook(fake).afterToolCall?.({
 		toolCallId: 'c2',
 		toolName: 'shell_command',
 		result: [{type: 'text', text: 'x'.repeat(3000)}],
@@ -328,13 +370,13 @@ test('rtk: a shell call rtk rewrote is not filtered twice', async () => {
 test('rtk: a stray result without a matching rewrite is filtered', async () => {
 	const fake = load(rtk, {exec: async () => ({stdout: 'condensed\n', stderr: '', code: 0})});
 	runHandler(fake.commands, 'rtk', 'on');
-	const filtered = (await fake.hooks[0].afterToolCall?.({
+	const filtered = (await firstHook(fake).afterToolCall?.({
 		toolCallId: 'never-seen',
 		toolName: 'shell_command',
 		result: [{type: 'text', text: 'x'.repeat(3000)}],
 		isError: false,
 	})) as {content: Array<{text: string}>};
-	assert.equal(filtered.content[0].text, 'condensed\n');
+	assert.equal(filtered.content[0]?.text, 'condensed\n');
 });
 
 test('rtk: the shell filter has its own off switch', async () => {
@@ -344,7 +386,7 @@ test('rtk: the shell filter has its own off switch', async () => {
 	});
 	runHandler(fake.commands, 'rtk', 'on');
 	assert.equal(
-		await fake.hooks[0].afterToolCall?.({
+		await firstHook(fake).afterToolCall?.({
 			toolCallId: 'c3',
 			toolName: 'shell_command',
 			result: [{type: 'text', text: 'x'.repeat(3000)}],
@@ -364,16 +406,16 @@ test('rtk: every rtk call is bounded by an abort signal', async () => {
 		},
 	});
 	runHandler(fake.commands, 'rtk', 'on');
-	await fake.hooks[0].beforeToolCall?.({toolCallId: 'c4', toolName: 'shell_command', input: {command: 'git status'}});
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'c4', toolName: 'shell_command', input: {command: 'git status'}});
 	assert.ok(signals.length > 0);
 	assert.ok(signals.every(signal => signal instanceof AbortSignal), 'the call carries an AbortSignal');
 });
 
 test('rtk: a too-old binary turns rewrites off and says so', async () => {
 	const fake = load(rtk, {exec: async () => ({stdout: 'rtk 0.22.9', stderr: '', code: 0})});
-	fake.hooks[0].onSessionStart?.();
+	firstHook(fake).onSessionStart?.();
 	await new Promise(resolve => setTimeout(resolve, 0));
-	const result = await fake.hooks[0].beforeToolCall?.({
+	const result = await firstHook(fake).beforeToolCall?.({
 		toolCallId: 'c5',
 		toolName: 'shell_command',
 		input: {command: 'git status'},

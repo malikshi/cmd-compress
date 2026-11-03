@@ -15,9 +15,10 @@ export interface Preset {
 	readonly rtk: string;
 }
 
-// Rules: `off` turns all three off; lite/balanced/max escalate the three live levels together.
+// Rules: the names follow the upstream combo reference (KurutoDenzeru/tersio: off | medium | balanced | max), so a person moving between the two tools types the same word; `lite` stays as an alias because earlier releases of this package taught it.
 export const COMPRESS_PRESETS: Record<string, Preset> = {
 	off: {caveman: 'off', ponytail: 'off', rtk: 'off'},
+	medium: {caveman: 'lite', ponytail: 'lite', rtk: 'on'},
 	lite: {caveman: 'lite', ponytail: 'lite', rtk: 'on'},
 	balanced: {caveman: 'full', ponytail: 'full', rtk: 'on'},
 	max: {caveman: 'ultra', ponytail: 'ultra', rtk: 'on'},
@@ -25,8 +26,8 @@ export const COMPRESS_PRESETS: Record<string, Preset> = {
 
 export function presetFor(raw: string): Preset | null {
 	const key = raw.trim().toLowerCase();
-	if (!key) return COMPRESS_PRESETS.balanced;
-	return key in COMPRESS_PRESETS ? COMPRESS_PRESETS[key] : null;
+	if (!key) return COMPRESS_PRESETS.balanced ?? null;
+	return Object.hasOwn(COMPRESS_PRESETS, key) ? (COMPRESS_PRESETS[key] ?? null) : null;
 }
 
 type Setter = (value: unknown) => boolean;
@@ -49,7 +50,7 @@ export default function (cmd: ModApi): void {
 	cmd.addCommand({
 		name: 'compress',
 		description: 'Set caveman, ponytail and rtk together, or show their state',
-		argumentHint: '[off|lite|balanced|max|status]',
+		argumentHint: '[off|medium|balanced|max|status]',
 		handler: ({args}) => {
 			const arg = args.trim().toLowerCase();
 
@@ -58,7 +59,7 @@ export default function (cmd: ModApi): void {
 			if (arg === 'help') {
 				return {
 					message: [
-						'/compress lite      caveman=lite, ponytail=lite, rtk=on',
+						'/compress medium    caveman=lite, ponytail=lite, rtk=on',
 						'/compress balanced  caveman=full, ponytail=full, rtk=on',
 						'/compress max       caveman=ultra, ponytail=ultra, rtk=on',
 						'/compress off       all three off',
@@ -68,7 +69,7 @@ export default function (cmd: ModApi): void {
 			}
 
 			const preset = presetFor(arg);
-			if (!preset) return {message: `Unknown preset: ${arg}. Use: off | lite | balanced | max | status`};
+			if (!preset) return {message: `Unknown preset: ${arg}. Use: off | medium | balanced | max | status`};
 
 			const missing: ModeName[] = [];
 			for (const name of MODES) {

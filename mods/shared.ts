@@ -30,10 +30,14 @@ interface StoreLike {
 	set(key: string, value: unknown): Promise<void>;
 }
 
-// Rules: a malformed value degrades to the default — a corrupt store must not break a session.
-export function readOwnMode(store: StoreLike, fallback: string = DEFAULT_MODE): string {
+// Rules: a malformed value degrades to the default — a corrupt store must not break a session, and it must not silently ENABLE compression either. An unrecognised level would otherwise reach the rules text, which falls back to the default block: the mode reads "on" while the status line shows garbage.
+export function readOwnMode(
+	store: StoreLike,
+	fallback: string = DEFAULT_MODE,
+	isValid: (value: string) => boolean = () => true,
+): string {
 	const raw = store.get(MODE_KEY);
-	return typeof raw === 'string' && raw ? raw : fallback;
+	return typeof raw === 'string' && raw && isValid(raw) ? raw : fallback;
 }
 
 // Rules: writes are fire-and-forget but serialised per process, so two setters in one tick keep the last value.
@@ -82,6 +86,30 @@ export function stripBlock(prompt: string, tag: string): string {
 }
 
 /* ---------------------------------------------------------------- binaries */
+
+// Rules: the platform's own command shell, since `rtk pipe` reads stdin and the redirect has to be interpreted; Windows `cmd.exe` needs `/d /s /c`, and `/s` strips the outer quote pair, so the caller must wrap the whole line again.
+// Rules: the platform and ComSpec are parameters, not reads of the ambient process, so both branches are reachable from a test on either OS — otherwise the win32 path is code no run ever executes.
+export function filterShell(
+	platform: string = process.platform,
+	comspec: string | undefined = process.env.ComSpec,
+): {command: string; args: string[]; wrap: boolean} {
+	if (platform === 'win32') {
+		return {command: comspec || 'cmd.exe', args: ['/d', '/s', '/c'], wrap: true};
+	}
+	return {command: '/bin/sh', args: ['-c'], wrap: false};
+}
+
+// Rules: `rtk pipe` takes its input on stdin and the host exec has no stdin, so the text is redirected in from a file; this is the one place the shell line is built, and `wrap` re-adds the outer quote pair cmd.exe `/s` strips.
+export function pipeCommand(
+	bin: string,
+	filter: string | null,
+	file: string,
+	shell: {command: string; args: string[]; wrap: boolean},
+): {command: string; args: string[]} {
+	const flags = filter ? `-f ${filter} ` : '';
+	const line = `"${bin}" pipe ${flags}< "${file}"`;
+	return {command: shell.command, args: [...shell.args, shell.wrap ? `"${line}"` : line]};
+}
 
 // Rules: rtk ships to ~/.bun/bin and is often off PATH for GUI hosts, so probe PATH then the managed dir.
 export function resolveBin(

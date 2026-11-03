@@ -25,7 +25,7 @@ export function normalizeCavemanLevel(raw: string): CavemanLevel | 'off' | null 
 export default function (cmd: ModApi): void {
 	cmd.addFlag('caveman', {type: 'string', default: '', description: 'Start mode: lite|full|ultra|megacave-* (default: off)'});
 
-	let mode = readOwnMode(cmd.store);
+	let mode = readOwnMode(cmd.store, OFF, value => LEVELS.has(value) || value === OFF);
 
 	// Rules: the setter is the single write path (own command, /compress preset) so the session and the store cannot disagree.
 	function setMode(next: string): void {
