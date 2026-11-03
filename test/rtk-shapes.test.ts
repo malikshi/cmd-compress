@@ -410,6 +410,7 @@ test('every rtk recovery marker blocks the second pass, so no recall hash is eve
 	const rows = Array.from({length: 40}, (_, index) => `mods/rtk.ts:${index + 1}:export const value${index} = ${index};`).join('\n');
 	const markers = [
 		'100 matches in 4 files:\n\n' + rows,
+		'100 matches in 4F:\n\n' + rows,
 		rows + '\n  +15 more in ./f0.ts',
 		rows + '\n+3 more files',
 		rows + '\n[+12 hidden: rtk recall 9f8e7d]',
@@ -419,6 +420,18 @@ test('every rtk recovery marker blocks the second pass, so no recall hash is eve
 	for (const text of markers) {
 		assert.equal(canRefilterCompressed(text), false, `must skip: ${text.slice(-40)}`);
 	}
+});
+
+// Rules: `pipe_cmd.rs` abbreviates the file count to `NF:` where `search.rs` spells out `N files:`. Measured from the real binary: `rtk pipe -f grep` on 60 rows prints `60 matches in 5F:`. The assertion isolates the marker — the same bare rows are compressible, and prefixing the `NF:` header is what makes them skip. Without this the test would pass on the row-shape check alone and never exercise the marker it exists for.
+test('the abbreviated NF: grouping header is a recovery marker too', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const rows = Array.from({length: 60}, (_, index) => `mods/rtk.ts:${index + 1}:export const value${index} = ${index};`).join('\n');
+	const grouped = execFileSync('rtk', ['pipe', '-f', 'grep'], {encoding: 'utf8', input: `${rows}\n`, timeout: 5000});
+	assert.match(grouped, /matches in \d+F:/, 'the real binary prints the abbreviated header');
+
+	assert.equal(isGrepRows(rows), true, 'the bare rows are a match list');
+	assert.equal(canRefilterCompressed(rows), true, 'so on their own they are compressible');
+	assert.equal(canRefilterCompressed(`60 matches in 5F:\n\n${rows}`), false, 'the NF: header is what marks them as already grouped');
 });
 
 // Rules: a diff, a git log, and a build log all contain colons and digits, so the row test must not fire on them — re-filtering a format rtk did not decline was measured as byte-identical (0 bytes, 12 real commands), which is a wasted process rather than a loss, but still not worth spawning.
@@ -611,6 +624,11 @@ test('the fidelity guard separates a real grouping from a misdetected one', asyn
 	const misdetected = checkFidelity(build, '31 matches in 1 files:\n\n[file]   --> src/lib.rs (31):\n     0: 9', true);
 	assert.equal(misdetected.ok, false, 'a build log grouped as matches is refused');
 	assert.match(misdetected.lost[0] ?? '', /format:/);
+
+	// Rules: the pipe filter's grouping is the other spelling — `NF:` over `[file]` blocks — and it is the shape the measured twenty-error misgroup came back in, so both spellings are pinned.
+	const abbreviated = checkFidelity(build, '31 matches in 1F:\n\n[file]   --> src/lib.rs (31):\n     0: 9', true);
+	assert.equal(abbreviated.ok, false, 'the abbreviated NF: header is recognised as grouping too');
+	assert.match(abbreviated.lost[0] ?? '', /format:/);
 });
 
 // Rules: a grouped result is only suspicious when rtk auto-detected it. A grep or find result is filtered with its own explicit filter, so its grouping is never second-guessed.

@@ -14,7 +14,7 @@ import caveman, {normalizeCavemanLevel} from '../mods/caveman.ts';
 import ponytail from '../mods/ponytail.ts';
 import rtk from '../mods/rtk.ts';
 import compress from '../mods/compress.ts';
-import {createFakeCmd, firstHook, runHandler, messageOf} from './harness.ts';
+import {createFakeCmd, firstHook, runHandler, messageOf, resultText} from './harness.ts';
 
 type Fake = ReturnType<typeof createFakeCmd>;
 
@@ -777,4 +777,35 @@ test('rtk: a real --rtk-bin is still reported as the binary', async () => {
 	await new Promise(resolve => setTimeout(resolve, 20));
 	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /RTK: off/);
 	assert.doesNotMatch(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /NOT FOUND/);
+});
+
+// Rules: Command Code registers `powershell` on Windows, and it renders through the same formatter `shell_command` does. Measured before this fix: the mod did nothing at all for it — no rewrite, no condensing — so every Windows shell result reached the model at full size.
+test('rtk: the powershell shell tool is rewritten and condensed like shell_command', async () => {
+	const seen: string[] = [];
+	const fake = load(rtk, {
+		exec: async request => {
+			seen.push(effectiveLine(request.command, request.args ?? []).trim());
+			if (request.args?.[0] === 'rewrite') return {stdout: 'rtk git status', stderr: '', code: 0};
+			return {stdout: 'condensed body\n', stderr: '', code: 0};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+
+	const rewritten = (await firstHook(fake).beforeToolCall?.({
+		toolCallId: 'ps1',
+		toolName: 'powershell',
+		input: {command: 'git status'},
+	})) as {input: {command: string}} | undefined;
+	assert.ok(rewritten, 'a powershell command is rewritten');
+	assert.match(rewritten.input.command, /rtk['"] git status$/, 'and pinned to the resolved path');
+	assert.match(seen[0] ?? '', /rewrite git status$/);
+
+	const filtered = (await firstHook(fake).afterToolCall?.({
+		toolCallId: 'ps2',
+		toolName: 'powershell',
+		result: [{type: 'text', text: 'Exit code: 1\nx'.repeat(1) + 'y'.repeat(3000)}],
+		isError: false,
+	})) as {content: Array<{text: string}>} | undefined;
+	assert.ok(filtered, 'and its output is condensed too');
+	assert.ok(resultText(filtered).startsWith('Exit code: 1\n'), 'the exit status survives');
 });

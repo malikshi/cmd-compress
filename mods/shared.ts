@@ -1,5 +1,5 @@
 // shared — mode lookup, prompt-block helpers, and binary/path utilities for the four mods.
-// exports: MODES, OFF, DEFAULT_MODE, MODE_EVENT, readOwnMode, writeOwnMode, announceMode, wrapBlock, resolveBin, filterShell, windowsPipeScript, pipeCommand, turnOffSiblings
+// exports: MODES, OFF, DEFAULT_MODE, MODE_EVENT, readOwnMode, writeOwnMode, announceMode, wrapBlock, defaultBinDirs, resolveBin, SHELL_TOOLS, isShellTool, filterShell, windowsPipeScript, pipeCommand, turnOffSiblings
 // used_by: mods/*.ts, test/*.test.ts
 // related: rules/caveman.ts, rules/ponytail.ts
 // rules: cmd.store is namespaced per mod, so a mod persists ONLY its own key; a sibling's mode is read through cmd.use.
@@ -80,6 +80,15 @@ export function announceMode(events: {emit?: (channel: string, data?: unknown) =
 	}
 }
 
+/* ---------------------------------------------------------------- shell tools */
+
+// Rules: Command Code exposes `shell_command` on every platform and `powershell` additionally on Windows (the host registers it behind `isPowerShellToolSupported`, an env override included). Both render through the same `formatResult2`, so both carry the `Exit code:` head and the same trailing notices, and a filter that covers one but not the other leaves every Windows shell result uncondensed.
+export const SHELL_TOOLS: ReadonlySet<string> = new Set(['shell_command', 'powershell']);
+
+export function isShellTool(toolName: string): boolean {
+	return SHELL_TOOLS.has(toolName);
+}
+
 /* ---------------------------------------------------------------- prompt text */
 
 // Rules: no strip step is needed. The host builds the append list fresh every round (`appendSystemPrompt` collects one string per mod and joins them), so a level change swaps the block by simply returning the new one — a previous block can never accumulate, and the `<tag>` wrapper is for readability, not deduplication.
@@ -123,10 +132,18 @@ export function pipeCommand(
 	return {command: shell.command, args: [...shell.args, line]};
 }
 
-// Rules: rtk ships to ~/.bun/bin and is often off PATH for GUI hosts, so probe PATH then the managed dir.
+// Rules: rtk's own installer writes to `$RTK_INSTALL_DIR`, defaulting to ~/.local/bin (install.sh), and `cargo install` writes to ~/.cargo/bin; bun and pnpm put it in their own bin dir. A GUI host often has none of those on PATH, so probe PATH and then every documented install dir. `RTK_INSTALL_DIR` is read first because it is the one the user explicitly chose.
+export function defaultBinDirs(home: string = homedir(), installDir?: string): string[] {
+	const dirs: string[] = [];
+	if (installDir) dirs.push(installDir);
+	dirs.push(join(home, '.local', 'bin'), join(home, '.bun', 'bin'), join(home, '.cargo', 'bin'));
+	return dirs;
+}
+
+// Rules: rtk ships to a managed dir that is often off PATH for GUI hosts, so probe PATH then every documented install location.
 export function resolveBin(
 	name: string,
-	extraDirs: readonly string[] = [join(homedir(), '.bun', 'bin')],
+	extraDirs: readonly string[] = defaultBinDirs(homedir(), process.env.RTK_INSTALL_DIR),
 ): string | null {
 	const exe = process.platform === 'win32' ? `${name}.exe` : name;
 	const dirs = [...(process.env.PATH ?? '').split(delimiter).filter(Boolean), ...extraDirs];

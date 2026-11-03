@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {normalizeCavemanLevel, CAVEMAN_STOP_PHRASES} from '../mods/caveman.ts';
 import {normalizePonytailLevel, PONYTAIL_STOP_PHRASES} from '../mods/ponytail.ts';
 import {COMPRESS_PRESETS, presetFor} from '../mods/compress.ts';
+import {defaultBinDirs, isShellTool} from '../mods/shared.ts';
 import {shouldRewrite, filterNameFor, filterForShape, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText, pinBinary} from '../mods/rtk.ts';
 
 test('normalizeCavemanLevel: on and empty mean the default, off and stop mean off', () => {
@@ -246,4 +247,56 @@ test('pinBinary: a prefix command before rtk is pinned, and plain programs are n
 	assert.equal(pinBinary('echo rtk', bin, posix), 'echo rtk');
 	// and rtk as data inside an argument is never touched
 	assert.equal(pinBinary('git commit -m "use rtk"', bin, posix), 'git commit -m "use rtk"');
+});
+
+// Rules: rtk's own installer writes to `$RTK_INSTALL_DIR`, defaulting to ~/.local/bin (install.sh:18) — not ~/.bun/bin, which the probe assumed. A machine that installed rtk the documented way had the binary, yet the mod reported `binary: NOT FOUND` and injected no guidance. Every documented install dir is probed, and the user's explicit RTK_INSTALL_DIR comes first.
+test('defaultBinDirs: every documented install dir is probed, the explicit one first', () => {
+	assert.deepEqual(defaultBinDirs('/home/u'), ['/home/u/.local/bin', '/home/u/.bun/bin', '/home/u/.cargo/bin']);
+	assert.deepEqual(
+		defaultBinDirs('/home/u', '/opt/rtk/bin'),
+		['/opt/rtk/bin', '/home/u/.local/bin', '/home/u/.bun/bin', '/home/u/.cargo/bin'],
+		'RTK_INSTALL_DIR wins, because it is the one the user chose',
+	);
+});
+
+// Rules: Command Code registers a `powershell` tool on Windows alongside `shell_command`, and both render through the same `formatResult2`. Keying the rewrite and the filter on `shell_command` alone left every Windows shell result with no rewrite and no condensing at all.
+test('isShellTool: both shell tools are covered, nothing else is', () => {
+	assert.equal(isShellTool('shell_command'), true);
+	assert.equal(isShellTool('powershell'), true);
+	for (const other of ['grep', 'glob', 'read_file', 'bash', 'toString', 'constructor']) {
+		assert.equal(isShellTool(other), false, `${other} is not a shell tool`);
+	}
+});
+
+// Rules: rtk rewrites a wrapper's SCRIPT, so `bash -c "git status"` comes back as `bash -c "rtk git status"` — the inner `rtk` is inside quotes, which the main scan treats as data. Measured: with rtk installed outside the host shell's PATH, that rewrote a working command into `bash: rtk: command not found`.
+test('pinBinary: a shell wrapper\'s script is pinned, since rtk rewrites inside it', () => {
+	const bin = '/opt/rtk';
+	const posix = 'linux';
+	assert.equal(pinBinary('bash -c "rtk git status"', bin, posix), `bash -c "'${bin}' git status"`);
+	assert.equal(pinBinary('zsh -c "rtk git status"', bin, posix), `zsh -c "'${bin}' git status"`);
+	assert.equal(pinBinary('bash -c "rtk git status && rtk ls"', bin, posix), `bash -c "'${bin}' git status && '${bin}' ls"`);
+
+	// the prefixes rtk also emits in front of a wrapper
+	assert.equal(pinBinary('env FOO=1 bash -c "rtk git status"', bin, posix), `env FOO=1 bash -c "'${bin}' git status"`);
+	assert.equal(pinBinary('nohup bash -c "rtk git status"', bin, posix), `nohup bash -c "'${bin}' git status"`);
+	assert.equal(pinBinary('timeout 5 bash -c "rtk git status"', bin, posix), `timeout 5 bash -c "'${bin}' git status"`);
+	// `-c` may be combined with other single-letter flags
+	assert.equal(pinBinary('bash -ec "rtk git status"', bin, posix), `bash -ec "'${bin}' git status"`);
+});
+
+// Rules: a single-quoted script cannot hold `'\''`, so it is re-emitted in double quotes — but only when the script expands nothing, or the requote would change what it does. `sh -c 'echo $HOME; rtk x'` must reach the shell byte-identical.
+test('pinBinary: a wrapper script that expands is left alone rather than requoted', () => {
+	const bin = '/opt/rtk';
+	const posix = 'linux';
+	assert.equal(pinBinary("sh -c 'echo $HOME; rtk x'", bin, posix), "sh -c 'echo $HOME; rtk x'", 'a $ inside single quotes stays put');
+	assert.equal(pinBinary('sh -c "echo $HOME; rtk x"', bin, posix), `sh -c "echo $HOME; '${bin}' x"`, 'a double-quoted script keeps its expansion and is still pinned');
+});
+
+// Rules: the wrapper pass must not touch ordinary quoting — a `rtk` that is data stays data, and a script with no rtk in it is returned untouched.
+test('pinBinary: a wrapper with no rtk, and rtk as data, are untouched', () => {
+	const bin = '/opt/rtk';
+	const posix = 'linux';
+	assert.equal(pinBinary('bash -c "echo hi"', bin, posix), 'bash -c "echo hi"');
+	assert.equal(pinBinary('git commit -m "use rtk"', bin, posix), 'git commit -m "use rtk"');
+	assert.equal(pinBinary('echo "x | rtk y"', bin, posix), 'echo "x | rtk y"');
 });

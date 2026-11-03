@@ -5,20 +5,21 @@
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
 // rules: exit 2 is a deny from rtk's own contract: a message on stdout names the rule that blocked it, so it becomes a block; empty means a Claude-only deny rule the host does not own, so it passes.
 // rules: the host's own envelope — a `Found N files` header, a pagination notice, an `Exit code:` line — is split off before filtering and re-attached after. The head is re-attached byte-for-byte; the tail keeps its notice text exactly, with the blank run before it capped at one line. rtk folds those as noise; they carry the count, the truncation, and the failure.
-// rules: the emitted `rtk` is pinned to the resolved absolute path. rtk often lives in ~/.bun/bin, which the host shell may not have on PATH, so a bare name would turn a working command into `rtk: not found`. The pin is a quote-aware single pass, because rtk emits `&`, newlines, and prefix commands, and a quoted argument may contain both `rtk` and a separator.
+// rules: the emitted `rtk` is pinned to the resolved absolute path. rtk ships to ~/.local/bin (its installer default), ~/.bun/bin or ~/.cargo/bin, and a GUI host often has none of them on PATH, so a bare name would turn a working command into `rtk: not found`. The pin is a quote-aware single pass, because rtk emits `&`, newlines, and prefix commands, and a quoted argument may contain both `rtk` and a separator. The one quoted form it does reach into is a shell wrapper's script (`bash -c "rtk …"`), which rtk rewrites and which is a command line in its own right.
+// rules: `shell_command` and `powershell` are both shell tools with the same result envelope, so every path keys off `isShellTool`, not the one name — a Windows session would otherwise get no rewrite and no condensing at all.
 // rules: a rewritten shell call is skipped unless rtk left its faithful baseline — no recovery marker and a majority of `path:line:text` rows — because rtk's own never-worse guard declines to compress multi-file grep output by default.
 // rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
 // agent: 2026-11-02 ported from rtk-ai/rtk hooks/pi/rtk.ts and tersio extensions/rtk; honour exit 2 as a deny, add auto-detect output condensing, drop the ignored exec `timeout` for an AbortController, add gain + version reporting
 // agent: 2026-11-03 envelope-preserving filter (splitSegments + condense), pinBinary against off-PATH rtk, drop the dead `rg` mapping, consume the rewritten-call marker before every early return
 // agent: 2026-11-03 re-filter a rewritten call only when rtk declined to compress it (recovery-marker + grep-row gate, measured +33% on multi-file grep, 12 ms, 0 bytes on 12 real commands)
 // agent: 2026-11-03 pinBinary rewritten as a quote-aware scan after measuring two live bugs: `&` and newline separators it emits were left bare (a rewrite then failed as `rtk: not found` off PATH), and a `rtk` inside a quoted argument was rewritten, corrupting the argument
-// agent: 2026-11-03 an explicit rtk-bin is verified before it is reported; a typo used to print that path as the binary and inject guidance for rewrites that could never run
+// agent: 2026-11-03 inspect rtk 1.1.0 against the mod: cover the `powershell` shell tool, accept rtk's abbreviated `NF:` grouping header in both the recovery and fidelity markers, and probe every documented install dir (rtk's own installer writes ~/.local/bin, not ~/.bun/bin)
 
 import type {ModApi} from '@commandcode/harness';
 import {accessSync, constants, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {announceMode, filterShell, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, wrapBlock, writeOwnMode, OFF} from './shared.ts';
+import {announceMode, filterShell, isShellTool, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, wrapBlock, writeOwnMode, OFF} from './shared.ts';
 
 export const REWRITE_TIMEOUT_MS = 2000;
 
@@ -84,8 +85,8 @@ export function findTrailer(text: string): {index: number; match: string; blank:
 // Rules: `glob` prints `Found N files` and then one indented path per line. The find filter reads that header line as a path, so it is split off rather than fed in.
 const GLOB_HEAD = /^Found \d+ files?[^\n]*\n/;
 
-// Rules: every form rtk emits when it actually compressed something, taken from its own source (`core/tee.rs`, `core/runner.rs`, `cmds/system/search.rs`, `cmds/js/lint_cmd.rs`): the grouped-search header, a per-file or per-run elision count, and the three recall hints. A result carrying one of these has already been reduced and may hold a recall hash the filter would drop, so it is never fed back in.
-const RECOVERY_MARKER = /\bmatches in \d+ files?:|\+\d+ more|\+ \.\.\. more files|hidden: rtk recall |\[full output:/;
+// Rules: every form rtk emits when it actually compressed something, taken from its own source (`core/tee.rs`, `core/runner.rs`, `cmds/system/search.rs`, `cmds/system/pipe_cmd.rs`, `cmds/js/lint_cmd.rs`): the grouped-search header (two spellings — `N matches in M files:` from `search.rs`, `N matches in MF:` from `pipe_cmd.rs`), a per-file or per-run elision count, and the three recall hints. A result carrying one of these has already been reduced and may hold a recall hash the filter would drop, so it is never fed back in.
+const RECOVERY_MARKER = /\bmatches in \d+(?: files?|F):|\+\d+ more|\+ \.\.\. more files|hidden: rtk recall |\[full output:/;
 
 // Rules: rtk's search filter prints its faithful baseline whenever capping would not shrink the output, which is the normal case for a multi-file grep (measured 4,026 -> 4,026 bytes). That baseline is exempt from the filter by construction, so a shell call rtk rewrote can still arrive uncompressed.
 // Rules: the rows are recognised by shape — `path:line:text` — and a majority is required, so a diff, a log, or a build log that happens to contain one such line is not mistaken for a match list.
@@ -133,7 +134,7 @@ export function splitSegments(toolName: string, text: string): Segments {
 		const tail = tailFrom(trailer);
 		return head ? {head: head[0], body: body.slice(head[0].length), tail} : {head: '', body, tail};
 	}
-	if (toolName === 'shell_command') {
+	if (isShellTool(toolName)) {
 		const head = SHELL_HEAD.exec(text);
 		if (head) return {head: head[0], body: text.slice(head[0].length), tail: ''};
 	}
@@ -154,9 +155,10 @@ export function stripAnsi(text: string): string {
 
 /* --------------------------------------------------------------- fidelity */
 
-// Rules: rtk's byte guard (`never_worse`) only asks whether the output got smaller, never whether it still says the same thing, and its auto-detect can pick the wrong filter. Measured against the real binary: a cargo-style block of 20 `error[E0xx]: cannot find value …` lines plus context came back from `rtk pipe` as 156 bytes reading `20 matches in 1F: [file] --> src/lib.rs (20):` — every one of the 20 error messages was gone, with no recovery hint. The same text is what an agent needs to fix a build.
+// Rules: rtk's own byte guard (`never_worse`) only asks whether the output got smaller, never whether it still says the same thing, and its auto-detect can pick the wrong filter. Measured against the real binary: a cargo-style block of 20 `error[E0xx]: cannot find value …` lines plus context came back from `rtk pipe` as 156 bytes reading `20 matches in 1F:` then `[file] --> src/lib.rs (20):` — every one of the 20 error messages was gone, with no recovery hint. The same text is what an agent needs to fix a build.
 // Rules: the guard targets that failure, not an ideal of lossless compression. A readable filter summarises on purpose — `FAILURES (1): 1. tests::fails_here` is a good result — so the check is format-shaped instead of atom-by-atom: when rtk auto-detected and produced its grep/find grouping while the original was neither `path:line:text` rows nor a path list, the guess was wrong and the original is kept. Negation loss is refused too, since that inverts meaning and no legitimate summariser drops one.
 const NEGATION = /\b(?:not|no|never|without|cannot|can't|don't|doesn't|didn't|isn't|aren't|won't|wouldn't|shouldn't|couldn't|neither|nor)\b/gi;
+// Rules: the guard catches rtk's grouped form — a `N matches in M files:` header or a `[file] path:` block header — because that is what its grep/find filters emit when they summarise.
 const GROUPING_MARKER = /^\s*(?:\d+ matches in \d+ files?:|\d+ files? in \d+ dirs?:)$|^\[file\]\s/m;
 
 function countOf(text: string, pattern: RegExp): number {
@@ -260,7 +262,7 @@ export function shouldRewrite(command: string): boolean {
 	return true;
 }
 
-// Rules: `rtk rewrite` answers a bare `rtk …`, which the host shell resolves from ITS PATH. This mod can find rtk in ~/.bun/bin when that directory is not on PATH, so the bare name would run as `rtk: not found` and turn a working command into a failure. Pin each command-position `rtk` to the resolved absolute path.
+// Rules: `rtk rewrite` answers a bare `rtk …`, which the host shell resolves from ITS PATH. This mod can find rtk in a managed install dir that is not on PATH, so the bare name would run as `rtk: not found` and turn a working command into a failure. Pin each command-position `rtk` to the resolved absolute path.
 // Rules: the scan walks the line once, tracking quote state, so a `rtk` inside a quoted argument is data and stays untouched (`git commit -m "use rtk"`, `echo "x | rtk y"`). A regex with an alternation over the separators cannot do this: it has no idea whether the separator it just matched sits inside a quote, and pinning there corrupts the argument (`echo "x | rtk y"` became `echo "x | '/opt/rtk' y"`).
 // Rules: a command position is the start of a segment (`&&`, `||`, `;`, `|`, `&`) or a new line — rtk rewrites a multi-line block and `&` backgrounding, so both arrive from the binary itself — and either a line start, a line start after a run of `VAR=value` assignments, or one after a prefix command and its own arguments. Prefix commands are matched explicitly (`env`, `nohup`, `time`, `nice`, `command`, `exec`, `builtin`, `stdbuf`, `timeout` with its own duration) because rtk peels them rather than dropping them, and a program that merely shares the name must stay intact.
 // Rules: the quote style follows the shell that will read it. POSIX shells need single quotes (with `'\''` for an embedded one); cmd.exe has no single-quote meaning at all — it would pass the quote characters through — so Windows gets a double-quoted path instead.
@@ -315,19 +317,83 @@ function skipPrefixes(line: string, start: number): number {
 	}
 }
 
+// Rules: rtk rewrites a shell wrapper's script rather than the wrapper, so `bash -c "git status"` comes back as `bash -c "rtk git status"` — the `rtk` sits INSIDE a quoted argument, where the main scan treats it as data and leaves it bare. Measured: with rtk installed outside the host shell's `PATH`, that rewrote a working command into `bash: rtk: command not found`. The script is pinned instead, and the quote style is converted when needed so the inner single quotes survive.
+const SHELL_WRAPPERS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish']);
+
+// Rules: the closing quote, with backslash escapes honoured only inside double quotes — a single-quoted POSIX string has no escapes at all.
+function findClosingQuote(text: string, open: number, quote: string): number {
+	for (let index = open + 1; index < text.length; index += 1) {
+		if (quote === '"' && text[index] === '\\') {
+			index += 1;
+			continue;
+		}
+		if (text[index] === quote) return index;
+	}
+	return -1;
+}
+
+// Rules: a script that EXPANDS — `$`, a backtick, or a backslash — cannot be moved into double quotes without changing what it does, so a single-quoted one that expands is left exactly as rtk emitted it rather than silently altered. A double-quoted script already accepts the inner single quotes unchanged.
+function hasExpansion(script: string): boolean {
+	return /[$`\\]/.test(script);
+}
+
+// Rules: rtk emits `env FOO=1 bash -c …`, `nohup bash -c …` and `timeout 5 bash -c …`, so the wrapper is found at a command position AFTER the prefixes are skipped, and `-c` may be combined with other single-letter flags (`-ec`).
+// Rules: `-c` must be a real flag of the wrapper, not the tail of a word, so the scan reads whole flags and checks for the letter.
+function wrapperScriptAt(text: string, start: number): {scriptStart: number; scriptEnd: number; quote: string} | null {
+	const word = /^[A-Za-z_][\w.-]*/.exec(text.slice(start))?.[0];
+	if (!word || !SHELL_WRAPPERS.has(word)) return null;
+	let index = start + word.length;
+	let sawC = false;
+	for (;;) {
+		const at = skipSpaces(text, index);
+		const flag = /^--?[A-Za-z][\w-]*/.exec(text.slice(at))?.[0];
+		if (!flag) {
+			index = at;
+			break;
+		}
+		if (!flag.startsWith('--') && flag.slice(1).includes('c')) sawC = true;
+		index = at + flag.length;
+	}
+	if (!sawC) return null;
+	const open = skipSpaces(text, index);
+	const quote = text[open];
+	if (quote !== '"' && quote !== "'") return null;
+	const close = findClosingQuote(text, open, quote);
+	if (close === -1) return null;
+	return {scriptStart: open + 1, scriptEnd: close, quote};
+}
+
 export function pinBinary(command: string, bin: string, platform: string = process.platform): string {
 	const quoted = platform === 'win32'
 		? `"${bin.replace(/"/g, '""')}"`
 		: `'${bin.replace(/'/g, `'\\''`)}'`;
+	// Rules: the wrapper pass runs first, then the normal scan. It recurses through the public entry so a nested wrapper is pinned too, and so `win32` quoting is not duplicated here.
+	const pin = (text: string) => pinBinary(text, bin, platform);
 	let out = '';
 	let index = 0;
 	// Rules: the command position is true at the start of the string and again after a separator, so the scan carries one flag instead of re-deriving it from a lookbehind.
 	let atCommand = true;
 	while (index < command.length) {
 		const char = command[index] ?? '';
+		// Rules: a wrapper's script is a command line in its own right, so `rtk` inside it is at a command position even though the quotes make it an argument here. Measured: `bash -c "rtk git status"` left the inner `rtk` bare, so with rtk outside the host shell's PATH a working command became `bash: rtk: command not found`.
+		if (atCommand && platform !== 'win32') {
+			const script = wrapperScriptAt(command, index);
+			if (script) {
+				const inner = command.slice(script.scriptStart, script.scriptEnd);
+				const pinnedInner = pin(inner);
+				const requote = script.quote === '"' || !hasExpansion(inner);
+				if (pinnedInner !== inner && requote) {
+					// Rules: the script is re-emitted inside double quotes, because a single-quoted container cannot hold the `'\''` escaping a POSIX path may need. `scriptStart` is one past the opening quote, so the replacement begins at that quote.
+					out += `${command.slice(index, script.scriptStart - 1)}"${pinnedInner}"`;
+					index = script.scriptEnd + 1;
+					atCommand = false;
+					continue;
+				}
+			}
+		}
 		if (char === "'" || char === '"') {
 			// Rules: copy the quoted span verbatim — no pinning, no separator state inside it.
-			const end = command.indexOf(char, index + 1);
+			const end = findClosingQuote(command, index, char);
 			const stop = end === -1 ? command.length : end + 1;
 			out += command.slice(index, stop);
 			index = stop;
@@ -390,7 +456,7 @@ export function guidanceText(): string {
 
 export default function (cmd: ModApi): void {
 	cmd.addFlag('rtk', {type: 'string', default: '', description: 'Start mode: on|off (default: off)'});
-	cmd.addFlag('rtk-bin', {type: 'string', default: '', description: 'Absolute path to the rtk binary (default: probe PATH then ~/.bun/bin)'});
+	cmd.addFlag('rtk-bin', {type: 'string', default: '', description: 'Absolute path to the rtk binary (default: probe PATH, then ~/.local/bin, ~/.bun/bin, ~/.cargo/bin)'});
 	cmd.addFlag('rtk-filter', {type: 'boolean', default: true, description: 'Condense grep/glob tool output'});
 	cmd.addFlag('rtk-shell', {type: 'boolean', default: true, description: 'Condense shell output that no rewrite covered'});
 
@@ -625,7 +691,7 @@ export default function (cmd: ModApi): void {
 
 		beforeToolCall: async ({toolCallId, toolName, input}) => {
 			const bin = binPath();
-			if (mode === OFF || toolName !== 'shell_command' || !bin || !supported()) return undefined;
+			if (mode === OFF || !isShellTool(toolName) || !bin || !supported()) return undefined;
 			const command = typeof input.command === 'string' ? input.command : '';
 			if (!shouldRewrite(command)) return undefined;
 			const verdict = await rewrite(command);
@@ -660,7 +726,7 @@ export default function (cmd: ModApi): void {
 			}
 
 			// Shell output rtk did not rewrite still gets auto-detected: `npm test` has no rewrite but cargo-style output does.
-			if (toolName !== 'shell_command') return undefined;
+			if (!isShellTool(toolName)) return undefined;
 			if (cmd.getFlag('rtk-shell') === false) return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
 			// Rules: a rewritten call is skipped because rtk already filtered it — except when rtk declined and left its faithful baseline, which `canRefilterCompressed` recognises. Anything carrying a recovery hint stays skipped, so a recall hash is never dropped.
 			// Rules: the shape test reads the plain text. `path:line:text` rows with an escape before the column still match the row pattern, but a styled `+3 more files` marker would not — testing the raw bytes could let a marked result through the second pass and drop its recall hash.
