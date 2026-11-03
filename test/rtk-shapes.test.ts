@@ -220,3 +220,28 @@ test('a short command whose body is already minimal is not inflated by the filte
 	assert.ok(out.startsWith('Exit code: 1 (test failure)\n'), 'and the exit status is still first');
 	assert.ok(out.includes('tests::bad'), 'and the failing test is still named');
 });
+
+// Rules: splitSegments feeds the filter from the body only, so it must be lossless in content — the envelope is re-attached, never dropped. Whitespace may collapse (the host's blank-line run before a notice is capped at one), but no non-whitespace character may disappear.
+test('splitSegments: reassembly preserves every non-whitespace character', () => {
+	const bodies = ['', 'x', 'a\nb\n', '\n\n\n', 'Exit code: 1'];
+	const heads = ['', 'Found 3 files\n', 'Exit code: 1\n', 'Signal: SIGKILL\n', 'Exit code: 1\nSignal: SIGKILL\n'];
+	const tails = ['', '\n[Showing results with pagination = limit: 240]', '\n\n(Results are truncated: showing 1-3 of 9)', '\nCommand aborted'];
+	const strip = (value: string) => value.replace(/\s+/g, '');
+	for (const tool of ['glob', 'grep', 'shell_command', 'read_file']) {
+		for (const head of heads) {
+			for (const body of bodies) {
+				for (const tail of tails) {
+					const input = head + body + tail;
+					const split = splitSegments(tool, input);
+					assert.equal(strip(split.head + split.body + split.tail), strip(input), `${tool} ${JSON.stringify(input)}`);
+					// whatever head is extracted must be the input's own leading bytes, never a rewrite
+					assert.ok(input.startsWith(split.head), `${tool}: the head is a verbatim prefix`);
+					assert.ok(split.head === '' || head.startsWith(split.head), `${tool}: the head comes from the envelope`);
+					// the tail keeps its notice text exactly; only the blank run before it is capped at one
+					assert.equal(strip(split.tail), strip(tail), 'the tail notice text is never rewritten');
+					assert.ok(!split.tail.startsWith('\n\n\n'), 'a blank-line run is capped, never carried');
+				}
+			}
+		}
+	}
+});

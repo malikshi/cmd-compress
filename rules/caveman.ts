@@ -113,8 +113,8 @@ export const CAVEMAN_RULES: Record<CavemanLevel, string> = {
 	'megacave-ultra': MEGACAVE_ULTRA,
 };
 
-// Rules: an unknown level falls back to the default block; never throw inside a prompt hook.
+// Rules: an unknown level falls back to the default block; never throw inside a prompt hook. `in` cannot be used — it walks the prototype chain, so `toString` would pass the check, index to a function instead of a string, and throw out of appendSystemPrompt; `__proto__` would return an object. Own-key lookup only.
 export function cavemanRule(level: string | undefined): string {
-	if (level && level in CAVEMAN_RULES) return CAVEMAN_RULES[level as CavemanLevel];
+	if (level && Object.hasOwn(CAVEMAN_RULES, level)) return CAVEMAN_RULES[level as CavemanLevel];
 	return CAVEMAN_RULES[CAVEMAN_DEFAULT];
 }

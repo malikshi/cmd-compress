@@ -68,3 +68,14 @@ test('ponytail: ultra alone pushes back on the request', () => {
 test('ponytail: an unknown level falls back to the default block', () => {
 	assert.equal(ponytailRule('review'), PONYTAIL_RULES[PONYTAIL_DEFAULT]);
 });
+
+// Rules: the rule text is built inside appendSystemPrompt, which must never throw — so every prototype name a person might type must answer the fallback string, not a function, an object, or an exception.
+test('both rule lookups: prototype names fall back instead of throwing or returning a non-string', () => {
+	const probes = ['toString', 'constructor', '__proto__', 'hasOwnProperty', 'valueOf', 'toLocaleString'];
+	for (const probe of probes) {
+		assert.equal(typeof cavemanRule(probe), 'string', `caveman ${probe}`);
+		assert.equal(cavemanRule(probe), CAVEMAN_RULES[CAVEMAN_DEFAULT], `caveman ${probe} falls back`);
+		assert.equal(typeof ponytailRule(probe), 'string', `ponytail ${probe}`);
+		assert.equal(ponytailRule(probe), PONYTAIL_RULES[PONYTAIL_DEFAULT], `ponytail ${probe} falls back`);
+	}
+});

@@ -468,3 +468,32 @@ test('compress: an unknown preset prints usage and changes nothing', () => {
 	const fake = load(compress);
 	assert.match(messageOf(runHandler(fake.commands, 'compress', 'turbo')), /Unknown preset: turbo/);
 });
+
+// Rules: a shell call rtk already rewrote had its output filtered by rtk, so condensing again spends a second process for nothing — the rewritten-call marker must suppress the shell pass for that exact toolCallId, and only for it.
+test('rtk: a rewritten shell call is not filtered a second time', async () => {
+	const filtered: string[] = [];
+	const fake = load(rtk, {
+		exec: async request => {
+			if (request.args?.[0] === 'rewrite') return {stdout: 'rtk git status', stderr: '', code: 0};
+			filtered.push(request.args?.join(' ') ?? '');
+			return {stdout: 'condensed output\n', stderr: '', code: 0};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	const big = `Exit code: 0\n${'line of shell output\n'.repeat(200)}`;
+
+	// this call was rewritten: the marker is set by beforeToolCall
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'r1', toolName: 'shell_command', input: {command: 'git status'}});
+	const afterRewrite = await firstHook(fake).afterToolCall?.({toolCallId: 'r1', toolName: 'shell_command', result: [{type: 'text', text: big}], isError: false});
+	assert.equal(afterRewrite, undefined, 'no second pass for a rewritten call');
+	assert.equal(filtered.length, 0, 'and no filter process was spawned');
+
+	// an unrelated call with a fresh id still gets the pass
+	const fresh = await firstHook(fake).afterToolCall?.({toolCallId: 'r2', toolName: 'shell_command', result: [{type: 'text', text: big}], isError: false});
+	assert.ok(fresh, 'a call rtk did not rewrite still gets condensed');
+	assert.equal(filtered.length, 1);
+
+	// and the marker is consumed, so replaying the same id does not suppress the pass forever
+	const replay = await firstHook(fake).afterToolCall?.({toolCallId: 'r1', toolName: 'shell_command', result: [{type: 'text', text: big}], isError: false});
+	assert.ok(replay, 'the marker was consumed, so a reused id is not suppressed');
+});

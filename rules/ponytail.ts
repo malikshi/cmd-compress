@@ -53,8 +53,8 @@ ${LEAN_CORE}`;
 
 export const PONYTAIL_RULES: Record<PonytailLevel, string> = {lite: LITE, full: FULL, ultra: ULTRA};
 
-// Rules: an unknown level falls back to the default block; never throw inside a prompt hook.
+// Rules: an unknown level falls back to the default block; never throw inside a prompt hook. Own-key lookup only — `in` walks the prototype chain, so `toString` would index to a function and throw, and `__proto__` would return an object.
 export function ponytailRule(level: string | undefined): string {
-	if (level && level in PONYTAIL_RULES) return PONYTAIL_RULES[level as PonytailLevel];
+	if (level && Object.hasOwn(PONYTAIL_RULES, level)) return PONYTAIL_RULES[level as PonytailLevel];
 	return PONYTAIL_RULES[PONYTAIL_DEFAULT];
 }

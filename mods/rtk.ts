@@ -4,7 +4,7 @@
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
 // rules: exit 2 is a deny from rtk's own contract: a message on stdout names the rule that blocked it, so it becomes a block; empty means a Claude-only deny rule the host does not own, so it passes.
-// rules: the host's own envelope — a `Found N files` header, a pagination notice, an `Exit code:` line — is split off before filtering and re-attached verbatim. rtk folds those as noise; they carry the count, the truncation, and the failure.
+// rules: the host's own envelope — a `Found N files` header, a pagination notice, an `Exit code:` line — is split off before filtering and re-attached after. The head is re-attached byte-for-byte; the tail keeps its notice text exactly, with the blank run before it capped at one line. rtk folds those as noise; they carry the count, the truncation, and the failure.
 // rules: the emitted `rtk` is pinned to the resolved absolute path. rtk often lives in ~/.bun/bin, which the host shell may not have on PATH, so a bare name would turn a working command into `rtk: not found`.
 // agent: 2026-11-02 ported from rtk-ai/rtk hooks/pi/rtk.ts and tersio extensions/rtk
 // agent: 2026-11-02 honour exit 2 as a deny, add auto-detect output condensing for unrewritten shell calls, drop the ignored exec `timeout` for an AbortController, add gain + version reporting
