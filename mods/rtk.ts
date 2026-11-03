@@ -187,7 +187,7 @@ export default function (cmd: ModApi): void {
 		const label = `${version.major}.${version.minor}.${version.patch}`;
 		return supported() ? `binary: ${label}` : `binary: ${label} (too old — need >= 0.${MIN_SUPPORTED_RTK_MINOR}.0)`;
 	};
-	// Rules: the guidance block must be byte-stable across rounds or the provider's prompt-prefix cache misses every turn. `version` starts null and `isSupportedVersion(null)` is true, so the answer flips only once a probe says the binary is too old; awaiting the probe before deciding makes that flip happen before the first round instead of between two.
+	// Rules: one probe per session. onSessionStart runs fire-and-forget, so the first round would otherwise spawn a second `rtk --version` while the first is still in flight; memoising keeps it to one.
 	const versionSettled = () => {
 		versionProbe ??= readVersion();
 		return versionProbe;
