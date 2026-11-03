@@ -7,6 +7,7 @@
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import caveman, {normalizeCavemanLevel} from '../mods/caveman.ts';
 import ponytail from '../mods/ponytail.ts';
 import rtk from '../mods/rtk.ts';
@@ -31,6 +32,19 @@ function sessionStart(fake: Fake) {
 
 function appends(fake: Fake) {
 	return fake.hooks.map(hook => hook.appendSystemPrompt?.()).filter(Boolean).join('\n');
+}
+
+// Rules: on Windows the redirect lives in a batch file rather than on the command line, so a test that only inspects argv sees no `pipe` at all — that is the design, not a failure. This reads the effective line either way: argv on POSIX, the script contents on Windows, and it must run inside the fake exec because the temp dir is deleted as soon as the call returns.
+function effectiveLine(command: string, args: string[]): string {
+	const joined = [command, ...args].join(' ');
+	if (process.platform !== 'win32') return joined;
+	const tail = args.at(-1) ?? '';
+	if (!/\.cmd$/i.test(tail)) return joined;
+	try {
+		return `${joined} || ${readFileSync(tail, 'utf8')}`;
+	} catch {
+		return joined;
+	}
 }
 
 test('caveman: off by default, so nothing reaches the prompt', () => {
@@ -188,7 +202,7 @@ test('rtk: on rewrites a shell command through rtk and injects guidance', async 
 	const seen: string[] = [];
 	const fake = load(rtk, {
 		exec: async request => {
-			seen.push(`${request.command} ${(request.args ?? []).join(' ')}`.trim());
+			seen.push(effectiveLine(request.command, request.args ?? []).trim());
 			return {stdout: 'rtk git status', stderr: '', code: 0};
 		},
 	});
@@ -272,7 +286,7 @@ test('rtk: hostile grep output reaches the filter as data, not as shell source',
 	const commands: string[] = [];
 	const fake = load(rtk, {
 		exec: async request => {
-			commands.push([request.command, ...(request.args ?? [])].join(' '));
+			commands.push(effectiveLine(request.command, request.args ?? []));
 			return {stdout: 'ok\n', stderr: '', code: 0};
 		},
 	});
@@ -321,7 +335,7 @@ test('rtk: exit 3 still supplies a rewrite', async () => {
 		toolName: 'shell_command',
 		input: {command: 'ls'},
 	})) as {input: {command: string}};
-	assert.match(result.input.command, /rtk'? ls$/, 'the rewrite is pinned to the resolved absolute path');
+	assert.match(result.input.command, /rtk['"] ls$/, 'the rewrite is pinned to the resolved absolute path, quoted for this shell');
 });
 
 // Rules: `npm test` has no rewrite, so the only way its output is ever condensed is the auto-detect pass.
@@ -329,7 +343,7 @@ test('rtk: unrewritten shell output is still condensed by auto-detect', async ()
 	const calls: string[] = [];
 	const fake = load(rtk, {
 		exec: async request => {
-			calls.push([request.command, ...(request.args ?? [])].join(' '));
+			calls.push(effectiveLine(request.command, request.args ?? []));
 			if (request.args?.[0] === 'rewrite') return {stdout: '', stderr: '', code: 1};
 			return {stdout: 'FAILURES (1):\n', stderr: '', code: 0};
 		},
