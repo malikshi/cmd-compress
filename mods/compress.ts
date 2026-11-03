@@ -77,7 +77,8 @@ export default function (cmd: ModApi): void {
 				if (!setMode) missing.push(name);
 				else setMode(preset[name]);
 			}
-			const summary = `compress ${arg}: ${line(preset as unknown as Record<ModeName, string>)}`;
+			// Rules: report the state that is actually in effect, not the preset that was requested — with a sibling missing the two differ, and printing the preset beside "not loaded" claims a change that did not happen.
+			const summary = `compress ${arg}: ${line(snapshot())}`;
 			return {message: missing.length ? `${summary} (not loaded: ${missing.join(', ')})` : summary};
 		},
 	});

@@ -599,3 +599,12 @@ test('rtk: a too-old binary that answers before round one injects no guidance', 
 	await new Promise(resolve => setTimeout(resolve, 20));
 	assert.equal(appends(fake), '', 'the probe answered before the first round, so the decision already knows');
 });
+
+test('compress: a missing sibling is reported as unchanged, never as applied', () => {
+	// no siblings loaded at all: the preset cannot reach any mode, so the line must not claim it did.
+	const fake = load(compress, {});
+	const message = messageOf(runHandler(fake.commands, 'compress', 'max'));
+	assert.match(message, /not loaded: caveman, ponytail, rtk/);
+	assert.match(message, /caveman=\?/, 'an unloaded mode reads as unknown, not as the preset value');
+	assert.doesNotMatch(message, /caveman=ultra/, 'nothing was applied, so nothing may be reported as applied');
+});
