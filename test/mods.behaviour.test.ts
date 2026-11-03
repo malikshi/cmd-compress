@@ -497,3 +497,73 @@ test('rtk: a rewritten shell call is not filtered a second time', async () => {
 	const replay = await firstHook(fake).afterToolCall?.({toolCallId: 'r1', toolName: 'shell_command', result: [{type: 'text', text: big}], isError: false});
 	assert.ok(replay, 'the marker was consumed, so a reused id is not suppressed');
 });
+
+
+test('caveman: a level set in one session is read back in the next from the same store', async () => {
+	// a second session is the same factory run against a store that already holds a mode.
+	const store = new Map<string, unknown>([['mode', 'ultra']]);
+	const fake = createFakeCmd({
+		exec: async () => ({stdout: '', stderr: '', code: 0}),
+	});
+	fake.cmd.name = 'caveman';
+	fake.cmd.store = {
+		get: (key: string) => store.get(key),
+		set: async (key: string, value: unknown) => {
+			store.set(key, value);
+		},
+	} as never;
+	caveman(fake.cmd as never);
+
+	const getMode = fake.exposed.get('caveman')?.get('getMode') as (() => string) | undefined;
+	assert.equal(getMode?.(), 'ultra', 'the stored level is the session start mode');
+	assert.match(appends(fake), /Caveman ultra active/);
+});
+
+test('compress: a preset applied in one session survives into the next', async () => {
+	// one store per mod, shared across both "sessions", which is how the host persists them.
+	const make = (name: string, data: Map<string, unknown>) => {
+		const fake = createFakeCmd({exec: async () => ({stdout: '', stderr: '', code: 0})});
+		fake.cmd.name = name;
+		fake.cmd.store = {
+			get: (key: string) => data.get(key),
+			set: async (key: string, value: unknown) => {
+				data.set(key, value);
+			},
+		} as never;
+		return fake;
+	};
+
+	const stores = {caveman: new Map<string, unknown>(), ponytail: new Map<string, unknown>(), rtk: new Map<string, unknown>()};
+
+	// session one: all three load, then the preset is applied through their setters
+	const sessionOne = {
+		caveman: make('caveman', stores.caveman),
+		ponytail: make('ponytail', stores.ponytail),
+		rtk: make('rtk', stores.rtk),
+	};
+	caveman(sessionOne.caveman.cmd as never);
+	ponytail(sessionOne.ponytail.cmd as never);
+	rtk(sessionOne.rtk.cmd as never);
+	const driver = createFakeCmd({exec: async () => ({stdout: '', stderr: '', code: 0})});
+	driver.cmd.name = 'compress';
+	driver.cmd.use = (name: string, key: string) => sessionOne[name as keyof typeof sessionOne]?.exposed.get(name)?.get(key);
+	compress(driver.cmd as never);
+	runHandler(driver.commands, 'compress', 'balanced');
+	await new Promise(resolve => setTimeout(resolve, 0));
+
+	// session two: fresh factories over the same stores
+	const sessionTwo = {
+		caveman: make('caveman', stores.caveman),
+		ponytail: make('ponytail', stores.ponytail),
+		rtk: make('rtk', stores.rtk),
+	};
+	caveman(sessionTwo.caveman.cmd as never);
+	ponytail(sessionTwo.ponytail.cmd as never);
+	rtk(sessionTwo.rtk.cmd as never);
+
+	const mode = (which: keyof typeof sessionTwo) =>
+		(sessionTwo[which].exposed.get(which)?.get('getMode') as (() => string) | undefined)?.();
+	assert.equal(mode('caveman'), 'full', 'caveman restored the preset level');
+	assert.equal(mode('ponytail'), 'full', 'ponytail restored the preset level');
+	assert.equal(mode('rtk'), 'on', 'rtk restored the preset level');
+});
