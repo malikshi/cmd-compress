@@ -14,7 +14,7 @@ import type {ModApi} from '@commandcode/harness';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {filterShell, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, wrapBlock, writeOwnMode, OFF} from './shared.ts';
+import {filterShell, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, wrapBlock, writeOwnMode, OFF} from './shared.ts';
 
 export const REWRITE_TIMEOUT_MS = 2000;
 
@@ -252,7 +252,14 @@ export default function (cmd: ModApi): void {
 			dir = mkdtempSync(join(tmpdir(), 'cmd-compress-'));
 			const file = join(dir, 'in.txt');
 			writeFileSync(file, text, 'utf8');
-			const {stdout, code} = await exec(pipeCommand(bin, filter, file, filterShell()), FILTER_TIMEOUT_MS);
+			const shell = filterShell();
+			// Rules: cmd.exe re-parses its /c line and nested quotes do not survive it, so the redirect goes in a batch file and only that path reaches the command line.
+			let scriptPath: string | undefined;
+			if (shell.wrap) {
+				scriptPath = join(dir, 'run.cmd');
+				writeFileSync(scriptPath, windowsPipeScript(bin, filter, file), 'utf8');
+			}
+			const {stdout, code} = await exec(pipeCommand(bin, filter, file, shell, scriptPath), FILTER_TIMEOUT_MS);
 			if (code !== 0) return null;
 			const out = stdout;
 			if (!out.trim() || out.length >= text.length) return null;

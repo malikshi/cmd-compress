@@ -206,18 +206,20 @@ test('filterNameFor: only the two real tool names map, prototype keys do not', (
 	}
 });
 
+// Rules: the platform is pinned to POSIX here. pinBinary defaults to process.platform, so leaving it implicit made these assertions pass on Linux and measure Windows quoting on a Windows runner — the CI logs showed exactly that.
 test('pinBinary: a prefix command before rtk is pinned, and plain programs are not', () => {
 	const bin = '/usr/bin/rtk';
+	const posix = 'linux';
 	for (const prefix of ['time', 'nohup', 'command', 'nice']) {
-		assert.equal(pinBinary(`${prefix} rtk git status`, bin), `${prefix} '${bin}' git status`, prefix);
+		assert.equal(pinBinary(`${prefix} rtk git status`, bin, posix), `${prefix} '${bin}' git status`, prefix);
 	}
 	// timeout carries its own duration argument
-	assert.equal(pinBinary('timeout 5 rtk git status', bin), `timeout 5 '${bin}' git status`);
-	assert.equal(pinBinary('timeout -k 1 5 rtk ls', bin), `timeout -k 1 5 '${bin}' ls`);
-	assert.equal(pinBinary('nice -n 5 rtk ls', bin), `nice -n 5 '${bin}' ls`);
+	assert.equal(pinBinary('timeout 5 rtk git status', bin, posix), `timeout 5 '${bin}' git status`);
+	assert.equal(pinBinary('timeout -k 1 5 rtk ls', bin, posix), `timeout -k 1 5 '${bin}' ls`);
+	assert.equal(pinBinary('nice -n 5 rtk ls', bin, posix), `nice -n 5 '${bin}' ls`);
 	// a command that only looks like a prefix is left alone: nothing named rtk follows it
-	assert.equal(pinBinary('timeout 5 ls', bin), 'timeout 5 ls');
-	assert.equal(pinBinary('echo rtk', bin), 'echo rtk');
+	assert.equal(pinBinary('timeout 5 ls', bin, posix), 'timeout 5 ls');
+	assert.equal(pinBinary('echo rtk', bin, posix), 'echo rtk');
 	// and rtk as data inside an argument is never touched
-	assert.equal(pinBinary('git commit -m "use rtk"', bin), 'git commit -m "use rtk"');
+	assert.equal(pinBinary('git commit -m "use rtk"', bin, posix), 'git commit -m "use rtk"');
 });

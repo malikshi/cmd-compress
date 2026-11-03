@@ -197,7 +197,7 @@ test('rtk: on rewrites a shell command through rtk and injects guidance', async 
 		toolName: 'shell_command',
 		input: {command: 'git status'},
 	})) as {input: {command: string}};
-	assert.match(result.input.command, /rtk'? git status$/, 'the rewrite is pinned to the resolved absolute path');
+	assert.match(result.input.command, /rtk['"] git status$/, 'the rewrite is pinned to the resolved absolute path, quoted for this shell');
 	assert.match(seen[0] ?? '', /rewrite git status$/);
 	assert.match(appends(fake), /<rtk>/);
 });
@@ -210,7 +210,7 @@ test('rtk: a rewrite keeps the call\'s own args intact', async () => {
 		toolName: 'shell_command',
 		input: {command: 'git status', args: ['--porcelain'], timeout: 5000},
 	})) as {input: {command: string; args: string[]; timeout: number}};
-	assert.match(result.input.command, /rtk'? git status$/, 'only the command is rewritten');
+	assert.match(result.input.command, /rtk['"] git status$/, 'only the command is rewritten, quoted for this shell');
 	assert.deepEqual(result.input.args, ['--porcelain'], 'the args survive');
 	assert.equal(result.input.timeout, 5000, 'and every other input field survives');
 });

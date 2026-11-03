@@ -87,7 +87,7 @@ export function stripBlock(prompt: string, tag: string): string {
 
 /* ---------------------------------------------------------------- binaries */
 
-// Rules: the platform's own command shell, since `rtk pipe` reads stdin and the redirect has to be interpreted; Windows `cmd.exe` needs `/d /s /c`, and `/s` strips the outer quote pair, so the caller must wrap the whole line again.
+// Rules: the platform's own command shell, since `rtk pipe` reads stdin and the redirect has to be interpreted. `wrap` marks the platform whose shell re-parses its own /c line and therefore cannot be handed nested quoting.
 // Rules: the platform and ComSpec are parameters, not reads of the ambient process, so both branches are reachable from a test on either OS — otherwise the win32 path is code no run ever executes.
 export function filterShell(
 	platform: string = process.platform,
@@ -99,16 +99,26 @@ export function filterShell(
 	return {command: '/bin/sh', args: ['-c'], wrap: false};
 }
 
-// Rules: `rtk pipe` takes its input on stdin and the host exec has no stdin, so the text is redirected in from a file; this is the one place the shell line is built, and `wrap` re-adds the outer quote pair cmd.exe `/s` strips.
+// Rules: cmd.exe re-parses its /c line, and nested quotes do not survive that second pass — measured on windows-latest CI, where `""…\rtk.cmd" pipe -f grep < "…\in.txt""` was rejected with "is not recognized as an internal or external command". A batch file removes the second parse: the script holds the real line once, and cmd.exe is asked only to run one path.
+export function windowsPipeScript(bin: string, filter: string | null, file: string): string {
+	const flags = filter ? `-f ${filter} ` : '';
+	return `@echo off\r\n"${bin}" pipe ${flags}< "${file}"\r\n`;
+}
+
+// Rules: `rtk pipe` takes its input on stdin and the host exec has no stdin, so the text is redirected in from a file; this is the one place the shell line is built. When the shell wraps (cmd.exe) the caller passes the batch file it wrote, and only that path reaches the command line.
 export function pipeCommand(
 	bin: string,
 	filter: string | null,
 	file: string,
 	shell: {command: string; args: string[]; wrap: boolean},
+	scriptPath?: string,
 ): {command: string; args: string[]} {
 	const flags = filter ? `-f ${filter} ` : '';
 	const line = `"${bin}" pipe ${flags}< "${file}"`;
-	return {command: shell.command, args: [...shell.args, shell.wrap ? `"${line}"` : line]};
+	if (shell.wrap) {
+		return {command: shell.command, args: [...shell.args, scriptPath ?? line]};
+	}
+	return {command: shell.command, args: [...shell.args, line]};
 }
 
 // Rules: rtk ships to ~/.bun/bin and is often off PATH for GUI hosts, so probe PATH then the managed dir.

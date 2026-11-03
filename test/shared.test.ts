@@ -21,6 +21,7 @@ import {
 	wrapBlock,
 	shortPaths,
 	resolveBin,
+	windowsPipeScript,
 } from '../mods/shared.ts';
 
 function fakeStore(initial: Record<string, unknown> = {}) {
@@ -123,15 +124,15 @@ test('filterShell: POSIX runs /bin/sh -c unwrapped', () => {
 	assert.deepEqual(filterShell('darwin', undefined), {command: '/bin/sh', args: ['-c'], wrap: false});
 });
 
-// Rules: this is the branch that cannot run on this host, so the assertion is on the exact argv cmd.exe receives — /d /s /c, ComSpec honoured, and wrap set so the caller re-quotes the line `/s` would strip.
-test('filterShell: Windows uses cmd.exe /d /s /c and asks for the line to be wrapped', () => {
+// Rules: this is the branch that cannot run on this host, so the assertion is on the exact argv cmd.exe receives — /d /s /c, ComSpec honoured, and wrap set so the caller knows to use the batch file.
+// Rules: the fallback case passes '' rather than undefined. undefined triggers the default parameter and reads the runner's real ComSpec, which made this assertion pass on Linux and compare against a real Windows path on windows-latest.
+test('filterShell: Windows uses cmd.exe /d /s /c and asks for the batch-file route', () => {
 	assert.deepEqual(filterShell('win32', 'C:\\Windows\\system32\\cmd.exe'), {
 		command: 'C:\\Windows\\system32\\cmd.exe',
 		args: ['/d', '/s', '/c'],
 		wrap: true,
 	});
-	assert.equal(filterShell('win32', undefined).command, 'cmd.exe', 'a missing ComSpec falls back to the name');
-	assert.equal(filterShell('win32', '').command, 'cmd.exe', 'an empty ComSpec does too');
+	assert.equal(filterShell('win32', '').command, 'cmd.exe', 'an empty ComSpec falls back to the name');
 });
 
 test('pipeCommand: POSIX passes the redirect line bare to sh -c', () => {
@@ -143,14 +144,23 @@ test('pipeCommand: POSIX passes the redirect line bare to sh -c', () => {
 	assert.deepEqual(pipeCommand('rtk', null, '/tmp/in.txt', shell).args[1], '"rtk" pipe < "/tmp/in.txt"', 'no -f when auto-detecting');
 });
 
-// Rules: cmd.exe `/s` strips the FIRST and LAST quote of the whole string, so the builder adds one outer pair; the result is `""bin" pipe … < "file""`, and peeling the outer pair back off leaves the line the shell must interpret.
-test('pipeCommand: Windows wraps the whole line so /s has an outer pair to strip', () => {
+// Rules: cmd.exe re-parses its /c line and nested quotes do not survive that second pass. Measured on windows-latest: `""…rtk.cmd" pipe -f grep < "…in.txt""` was rejected with "is not recognized as an internal or external command". The builder therefore hands cmd.exe a batch file path and nothing else, and the script carries the real line.
+test('pipeCommand: Windows is handed the batch file, not a re-quoted line', () => {
 	const shell = {command: 'cmd.exe', args: ['/d', '/s', '/c'], wrap: true};
-	const built = pipeCommand('C:\\rtk.exe', 'find', 'C:\\tmp\\in.txt', shell);
-	const line = built.args.at(-1)!;
-	assert.equal(line, '""C:\\rtk.exe" pipe -f find < "C:\\tmp\\in.txt""');
-	assert.equal(line.slice(1, -1), '"C:\\rtk.exe" pipe -f find < "C:\\tmp\\in.txt"', 'stripping the outer pair leaves the real line');
-	assert.deepEqual(built.args.slice(0, 3), ['/d', '/s', '/c'], 'the flags come before the quoted line');
+	const script = 'C:\\tmp\\run.cmd';
+	const built = pipeCommand('C:\\rtk.exe', 'find', 'C:\\tmp\\in.txt', shell, script);
+	assert.deepEqual(built.args, ['/d', '/s', '/c', script], 'only the script path reaches the command line');
+	assert.doesNotMatch(built.args.at(-1) ?? '', /"".*""/, 'no nested quote pair is left for cmd.exe to re-parse');
+});
+
+// Rules: the script is where the real line lives, so its exact contents are pinned — a missing `<` or a stray quote here fails at runtime with no other signal.
+test('windowsPipeScript: the batch file holds the real redirect once', () => {
+	assert.equal(
+		windowsPipeScript('C:\\rtk.exe', 'grep', 'C:\\tmp\\in.txt'),
+		'@echo off\r\n"C:\\rtk.exe" pipe -f grep < "C:\\tmp\\in.txt"\r\n',
+	);
+	assert.match(windowsPipeScript('C:\\rtk.exe', null, 'C:\\tmp\\in.txt'), /pipe < /, 'no -f when auto-detecting');
+	assert.match(windowsPipeScript('C:\\rtk.exe', 'find', 'C:\\a b\\in.txt'), /in\.txt"/, 'a path with a space stays quoted');
 });
 
 // Rules: the argv the builder makes must really run; on POSIX the shell form is executable here, so this proves the generated line is not merely well-shaped. The stand-in binary mirrors rtk's own contract — it takes `pipe [-f name]` and reads stdin — so the redirect and the flag order are exercised exactly as production builds them.
@@ -172,47 +182,27 @@ test('pipeCommand: the POSIX line actually redirects into the binary through sh'
 	}
 });
 
-// Rules: the Windows branch cannot be executed on a Linux dev box, so it is asserted exactly where it does run — CI's windows-latest job. This is the same real-process check as the POSIX one: cmd.exe must honour /d /s /c and the outer quote pair, and the redirect must reach the binary's stdin.
+// Rules: the Windows branch cannot be executed on a Linux dev box, so it runs where it does — CI's windows-latest job. This is the same real-process check as the POSIX one: the batch file must run under cmd.exe and the redirect must reach the binary's stdin.
 // Rules: skipped (not vacuous) elsewhere, and the skip is visible in the TAP output, so a green Linux run never implies the Windows path was covered.
-test('pipeCommand: the Windows line actually redirects through cmd.exe', t => {
+test('pipeCommand: the Windows batch file actually redirects through cmd.exe', t => {
 	if (process.platform !== 'win32') return t.skip('cmd.exe only — covered by the windows-latest CI job');
 	const dir = mkdtempSync(join(tmpdir(), 'cmd-compress-test-'));
 	const file = join(dir, 'in.txt');
 	const standIn = join(dir, 'rtk.cmd');
 	writeFileSync(file, 'hello from stdin\n', 'utf8');
-	// an rtk stand-in: it ignores `pipe [-f name]` and copies stdin, so only the redirect and the quoting are under test
+	// an rtk stand-in: it ignores `pipe [-f name]` and copies stdin, so only the redirect is under test
 	writeFileSync(standIn, '@echo off\r\nmore\r\n', 'utf8');
 	const shell = filterShell();
 	try {
-		const built = pipeCommand(standIn, 'grep', file, shell);
-		const stdout = execFileSync(built.command, built.args, {encoding: 'utf8'});
-		assert.equal(stdout.replace(/\r\n/g, '\n'), 'hello from stdin\n', 'cmd.exe delivered the redirected file to stdin');
-		assert.equal(shell.wrap, true, 'the wrap flag the builder relied on is the one cmd.exe needs');
+		for (const filter of ['grep', 'find', null]) {
+			const script = join(dir, 'run.cmd');
+			writeFileSync(script, windowsPipeScript(standIn, filter, file), 'utf8');
+			const built = pipeCommand(standIn, filter, file, shell, script);
+			const stdout = execFileSync(built.command, built.args, {encoding: 'utf8'});
+			assert.equal(stdout.replace(/\r\n/g, '\n'), 'hello from stdin\n', `cmd.exe delivered the redirected file to stdin (filter=${filter})`);
+		}
 	} finally {
 		rmSync(dir, {recursive: true, force: true});
 	}
 });
 
-// Rules: cmd.exe `/s` removes the first quote and the last quote of the whole string. Modelling that rule — not the builder — lets this host prove the line the shell will actually interpret, so the Windows path is checked by computation here and by a real cmd.exe in the windows-latest CI job rather than asserted alone.
-function cmdStripOuterQuotes(line: string): string {
-	const first = line.indexOf('"');
-	const last = line.lastIndexOf('"');
-	return first < 0 || last <= first ? line : line.slice(first + 1, last);
-}
-
-test('pipeCommand: the Windows line survives the outer-quote strip cmd.exe performs', () => {
-	const shell = {command: 'C:\\Windows\\system32\\cmd.exe', args: ['/d', '/s', '/c'], wrap: true};
-	const cases: Array<[string, string | null, string]> = [
-		['C:\\rtk.exe', 'find', 'C:\\tmp\\in.txt'],
-		['C:\\rtk.exe', null, 'C:\\tmp\\in.txt'],
-		// paths with spaces are the case that breaks a naive quoter
-		['C:\\Users\\a b\\.bun\\bin\\rtk.exe', 'grep', 'C:\\Users\\a b\\AppData\\Local\\Temp\\x y\\in.txt'],
-	];
-	for (const [bin, filter, file] of cases) {
-		const built = pipeCommand(bin, filter, file, shell);
-		const interpreted = cmdStripOuterQuotes(built.args.at(-1) ?? '');
-		const flags = filter ? `-f ${filter} ` : '';
-		const expected = `"${bin}" pipe ${flags}< "${file}"`;
-		assert.equal(interpreted, expected, `cmd.exe would run: ${interpreted}`);
-	}
-});
