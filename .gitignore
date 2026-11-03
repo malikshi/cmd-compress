@@ -3,4 +3,5 @@ node_modules/
 .commandcode/settings.local.json
 .commandcode/mods/.registry/
 *.log
+*.tgz
 .DS_Store
