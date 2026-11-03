@@ -49,6 +49,22 @@ The raw rows above are rtk's fixture, not what this host produces. A `glob` resu
 | grep tool, count mode | total-occurrences notice | 17,228 | 14,420 | **16.3%** | trailer kept |
 | shell tool | `Exit code: 1` head | 2,769 | 324 | **88.3%** | header kept |
 | shell tool, timed out | header + timeout notice | 5,889 | 340 | **94.2%** | header kept, trailer kept |
+| shell tool, declined grep baseline | none — rtk refused to group | 8,081 | 514 | **93.6%** | no envelope |
+
+### The declined baseline
+
+rtk's search filter prints its **faithful baseline** whenever capping would not shrink the output. That is the normal case for a multi-file grep: `grep -rn export mods` measured 4,026 → 4,026 bytes through `rtk grep`, so a command rtk rewrote still reached the model at full size. The mod now recognises that baseline — no recovery marker, and a majority of `path:line:text` rows — and runs one more filter pass over it.
+
+| Command | rtk grep | After 2nd pass | Recovered |
+|---|---:|---:|---:|
+| `grep -rn export mods` | 4,206 | 2,691 | **36.0%** |
+| `grep -rn function mods` | 3,723 | 2,475 | **33.5%** |
+| `grep -rn Rules: …/contract` | 1,984 | 1,325 | **33.2%** |
+| `rtk grep -rn export mods` | 4,206 | 2,691 | **36.0%** |
+
+The gate has to exist because the opposite is destructive: one blind second pass over rtk-grouped output **deleted all 9 `rtk recall` hints** from it, and a recall hash is unrecoverable once its hint is gone. So anything carrying `matches in N files:`, `+N more`, `+ … more files`, `[+N hidden: rtk recall …]` or `[full output: rtk recall …]` is left byte-identical to what rtk emitted.
+
+Cost is bounded: the second pass measured **12 ms** median (`rtk pipe` on a 5 KB result), and it is skipped entirely below the 1,200-byte threshold and for every non-match-list shape. Twelve real rewritten commands (`git status`, `git log`, `git diff`, `npm test`, `npx tsc`, `ls`, `find`, `git branch`, `du`) measured **0 bytes changed** — the gate does not fire on them at all.
 
 A live headless run against a fixture repo confirms it outside the bench: a `glob` of 380 files came back as `Found 100 files` plus rtk's grouped body and the host's own truncation notice intact — **1,771 → 471 bytes**, every directory named.
 

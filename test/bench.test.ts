@@ -8,7 +8,8 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {estimateTokens, formatPct, median, percentile, reduction, table} from '../bench/lib/stats.ts';
-import {makeGrepClustered, makeGrepScattered, makeFindOutput, REWRITE_COMMANDS, makeGlobToolOutput, makeGlobToolTruncated, makeGrepToolTruncated, makeGrepFilesModeOutput, makeGrepCountModeOutput, makeShellToolOutput, makeShellAbortOutput} from '../bench/lib/fixtures.ts';
+import {makeGrepClustered, makeGrepScattered, makeFindOutput, REWRITE_COMMANDS, makeGlobToolOutput, makeGlobToolTruncated, makeGrepToolTruncated, makeGrepFilesModeOutput, makeGrepCountModeOutput, makeShellToolOutput, makeShellAbortOutput, makeDeclinedBaseline} from '../bench/lib/fixtures.ts';
+import {canRefilterCompressed} from '../mods/rtk.ts';
 import {CODE_PROMPTS, PROSE_PROMPTS, checkCode, checkProse} from '../bench/lib/prompts.ts';
 import {readUsage, writePromptResult} from '../bench/prompt.ts';
 import {writeOutputResult} from '../bench/output.ts';
@@ -96,6 +97,14 @@ test('fixtures: the corrected shapes carry their own envelope', () => {
 	assert.match(makeGrepCountModeOutput(), /Found 400 total occurrences across 40 files with pagination = limit: 400, offset: 400\.\n$/);
 	assert.match(makeShellAbortOutput(), /^Exit code: 124\n/);
 	assert.match(makeShellAbortOutput(), /Command timed out after 120000ms \(exit code 124\)\. .*\n$/);
+});
+
+// Rules: the declined baseline is the one rewritten shape that reaches the second pass, so its fixture must actually satisfy the gate — otherwise the row measures a path production skips and reports a saving nobody gets.
+test('fixtures: the declined-baseline row is a shape the second pass really takes', () => {
+	const baseline = makeDeclinedBaseline();
+	assert.equal(canRefilterCompressed(baseline), true, 'the gate production uses accepts this fixture');
+	assert.ok(baseline.length > 1200, 'and it is over the filter threshold');
+	assert.match(baseline, /^mods\/rtk\.ts:1:export /, 'match rows, no header, no recovery marker');
 });
 
 test('checkProse: every group must match, a group is an OR', () => {

@@ -122,6 +122,13 @@ export function makeGrepCountModeOutput(files = 40, perFile = 10): string {
 	return `${rows.join('\n')}\n\nFound ${files * perFile} total occurrences across ${files} files with pagination = limit: ${files * perFile}, offset: ${files * perFile}.\n`;
 }
 
+// Rules: rtk's search filter prints its faithful baseline when capping would not shrink the output, so a multi-file grep reaches the model at full size. The mod's second pass is measured against exactly that shape: match rows, no recovery marker, no envelope.
+export function makeDeclinedBaseline(files = 6, perFile = 25): string {
+	return Array.from({length: files}, (_, file) =>
+		Array.from({length: perFile}, (_, hit) => `mods/rtk.ts:${file * perFile + hit + 1}:export const value${hit} = compute(input);`).join('\n'),
+	).join('\n');
+}
+
 export function makeShellAbortOutput(): string {
 	const body = [
 		'running 3 tests',

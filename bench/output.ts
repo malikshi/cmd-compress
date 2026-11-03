@@ -13,7 +13,7 @@ import {join} from 'node:path';
 import {CAVEMAN_LEVELS, cavemanRule} from '../rules/caveman.ts';
 import {PONYTAIL_LEVELS, ponytailRule} from '../rules/ponytail.ts';
 import {resolveBin} from '../mods/shared.ts';
-import {filterForShape, splitSegments} from '../mods/rtk.ts';
+import {canRefilterCompressed, filterForShape, splitSegments} from '../mods/rtk.ts';
 import {
 	makeFindOutput,
 	makeGlobToolOutput,
@@ -25,6 +25,7 @@ import {
 	makeGrepCountModeOutput,
 	makeShellToolOutput,
 	makeShellAbortOutput,
+	makeDeclinedBaseline,
 	REWRITE_COMMANDS,
 } from './lib/fixtures.ts';
 import {estimateTokens, formatBytes, formatPct, median, percentile, reduction} from './lib/stats.ts';
@@ -98,6 +99,7 @@ export const ENVELOPE_CASES = [
 	{case: 'grep tool, count mode', filter: 'grep', tool: 'grep', shape: '400 hits + total-occurrences notice', build: () => makeGrepCountModeOutput()},
 	{case: 'shell tool', filter: null, tool: 'shell_command', shape: 'cargo failure + Exit code head', build: () => makeShellToolOutput()},
 	{case: 'shell tool, timed out', filter: null, tool: 'shell_command', shape: 'pytest failure + timeout notice', build: () => makeShellAbortOutput()},
+	{case: 'shell tool, declined grep baseline', filter: null, tool: 'shell_command', shape: 'multi-file match rows rtk refused to group', build: () => makeDeclinedBaseline(), rewritten: true},
 ] as const;
 
 // Rules: rtk pipe takes stdin only, so the fixture is redirected from a temp file rather than interpolated into a command line.
@@ -117,7 +119,9 @@ function pipeThrough(bin: string, filter: string | null, input: string): string 
 }
 
 // Rules: this mirrors the mod's own condense() step exactly — pick the filter from the shape, split the host envelope off, filter only the body, put the envelope back. Measuring a path production does not run is what let the envelope bug through.
-function condenseTool(bin: string, filter: string | null, tool: string, input: string): {stdout: string; fidelity: string} | null {
+// Rules: a rewritten shell call is skipped unless rtk left its faithful baseline, so the cases say which they model. An unrewritten call (`npm test`) is filtered unconditionally; a rewritten one goes through the same gate production uses.
+function condenseTool(bin: string, filter: string | null, tool: string, input: string, rewritten = false): {stdout: string; fidelity: string} | null {
+	if (rewritten && !canRefilterCompressed(input)) return null;
 	const shapeFilter = filterForShape(tool, filter, input);
 	const {head, body, tail} = splitSegments(tool, input);
 	const filtered = pipeThrough(bin, shapeFilter, body);
@@ -238,7 +242,7 @@ export function runOutputBench(): OutputBenchResult {
 			let fidelity = 'unmeasured';
 			for (let index = 0; index < FILTER_SAMPLES; index += 1) {
 				const started = process.hrtime.bigint();
-				const result = condenseTool(bin, testCase.filter, testCase.tool, input);
+				const result = condenseTool(bin, testCase.filter, testCase.tool, input, 'rewritten' in testCase && testCase.rewritten);
 				samples.push(Number(process.hrtime.bigint() - started) / 1_000_000);
 				if (!result) break;
 				output = result.stdout;

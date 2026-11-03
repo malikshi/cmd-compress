@@ -7,7 +7,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile, execFileSync} from 'node:child_process';
-import rtk, {splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
+import rtk, {canRefilterCompressed, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
 import {createFakeCmd, firstHook, resultText, runHandler} from './harness.ts';
 
 type ExecRequest = {command: string; args?: string[]; cwd?: string; signal?: AbortSignal};
@@ -366,4 +366,71 @@ test('rtk-shapes: note when the real binary is absent, so the skips are never in
 		return;
 	}
 	t.diagnostic('rtk is not installed — this file skipped all of its real-binary tests. Run `node scripts/install-rtk.mjs`.');
+});
+
+/* ------------------------------------------- the declined-baseline second pass */
+
+// Rules: rtk's search filter emits its faithful baseline whenever capping would not shrink the output, so a multi-file grep arrives uncompressed even though rtk handled it. Measured on the real binary: 4,026 -> 4,026 bytes for `grep -rn export mods`, and 1,348 bytes recoverable by one more pass.
+test('a declined multi-file grep is recognised as compressible', () => {
+	const rows = Array.from({length: 40}, (_, index) => `mods/rtk.ts:${index + 1}:export const value${index} = ${index};`).join('\n');
+	assert.equal(isGrepRows(rows), true);
+	assert.equal(canRefilterCompressed(rows), true, 'no recovery marker and match-list rows, so a second pass is safe');
+});
+
+// Rules: the guard exists because a blind second pass DELETED all 9 `rtk recall` hints from grouped output in measurement — the filter folds lines it cannot parse, and a recall hash is unrecoverable once its hint is gone. Every marker rtk emits is pinned here, taken from its own source rather than guessed.
+test('every rtk recovery marker blocks the second pass, so no recall hash is ever dropped', () => {
+	const rows = Array.from({length: 40}, (_, index) => `mods/rtk.ts:${index + 1}:export const value${index} = ${index};`).join('\n');
+	const markers = [
+		'100 matches in 4 files:\n\n' + rows,
+		rows + '\n  +15 more in ./f0.ts',
+		rows + '\n+3 more files',
+		rows + '\n[+12 hidden: rtk recall 9f8e7d]',
+		rows + '\n[full output: rtk recall 9f8e7d]',
+		rows + '\n... +5 more files',
+	];
+	for (const text of markers) {
+		assert.equal(canRefilterCompressed(text), false, `must skip: ${text.slice(-40)}`);
+	}
+});
+
+// Rules: a diff, a git log, and a build log all contain colons and digits, so the row test must not fire on them — re-filtering a format rtk did not decline was measured as byte-identical (0 bytes, 12 real commands), which is a wasted process rather than a loss, but still not worth spawning.
+test('output that is not a match list is never re-filtered', () => {
+	const samples: Array<[string, string]> = [
+		['diff', '+++ b/mods/rtk.ts\n--- a/mods/rtk.ts\n@@ -1,4 +1,4 @@\n-const a = 1;\n+const a = 2;'],
+		['git log', 'f7e35e0 chore: release 0.1.1\nd18dfed fix(rtk): stop deleting host envelopes'],
+		['build log', '> tsc --noEmit\n\nsrc/a.ts(12,5): error TS2322: Type string is not assignable'],
+		['json', '{\n  "name": "cmd-compress",\n  "version": "0.1.1"\n}'],
+	];
+	for (const [name, text] of samples) {
+		assert.equal(canRefilterCompressed(text), false, `${name} must not be re-filtered`);
+	}
+});
+
+// Rules: end to end through the real hooks, the whole point is that a rewritten call normally skips and this one does not.
+test('shell: a rewritten call carrying rtk\'s declined baseline is condensed, a marked one is not', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	const rows = Array.from({length: 60}, (_, index) => `mods/rtk.ts:${index + 1}:export const value${index} = ${index};`).join('\n');
+	const before = await firstHook(fake).beforeToolCall?.({toolCallId: 'declined', toolName: 'shell_command', input: {command: 'grep -rn export mods'}});
+	assert.ok(before, 'the command rewrites, so the second pass is gated');
+
+	const declined = await firstHook(fake).afterToolCall?.({
+		toolCallId: 'declined',
+		toolName: 'shell_command',
+		result: [{type: 'text', text: rows}],
+		isError: false,
+	});
+	const declinedText = resultText(declined);
+	assert.ok(declinedText && declinedText.length < rows.length, 'the declined baseline was condensed after all');
+	assert.ok(declinedText.includes('mods/rtk.ts'), 'and the file is still named');
+
+	const marked = `100 matches in 2 files:\n\n${rows}\n[+12 hidden: rtk recall 9f8e7d]`;
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'marked', toolName: 'shell_command', input: {command: 'grep -rn export mods'}});
+	const kept = await firstHook(fake).afterToolCall?.({
+		toolCallId: 'marked',
+		toolName: 'shell_command',
+		result: [{type: 'text', text: marked}],
+		isError: false,
+	});
+	assert.equal(kept, undefined, 'a result with a recovery hint is left exactly as rtk emitted it');
 });

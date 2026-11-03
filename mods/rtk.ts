@@ -1,14 +1,16 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, filterNameFor, filterForShape, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
+// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, filterNameFor, filterForShape, isGrepRows, canRefilterCompressed, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
 // used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
 // rules: exit 2 is a deny from rtk's own contract: a message on stdout names the rule that blocked it, so it becomes a block; empty means a Claude-only deny rule the host does not own, so it passes.
 // rules: the host's own envelope — a `Found N files` header, a pagination notice, an `Exit code:` line — is split off before filtering and re-attached after. The head is re-attached byte-for-byte; the tail keeps its notice text exactly, with the blank run before it capped at one line. rtk folds those as noise; they carry the count, the truncation, and the failure.
 // rules: the emitted `rtk` is pinned to the resolved absolute path. rtk often lives in ~/.bun/bin, which the host shell may not have on PATH, so a bare name would turn a working command into `rtk: not found`.
+// rules: a rewritten shell call is skipped unless rtk left its faithful baseline — no recovery marker and a majority of `path:line:text` rows — because rtk's own never-worse guard declines to compress multi-file grep output by default.
 // agent: 2026-11-02 ported from rtk-ai/rtk hooks/pi/rtk.ts and tersio extensions/rtk
 // agent: 2026-11-02 honour exit 2 as a deny, add auto-detect output condensing for unrewritten shell calls, drop the ignored exec `timeout` for an AbortController, add gain + version reporting
 // agent: 2026-11-03 envelope-preserving filter (splitSegments + condense), pinBinary against off-PATH rtk, drop the dead `rg` mapping, consume the rewritten-call marker before every early return
+// agent: 2026-11-03 re-filter a rewritten call only when rtk declined to compress it (recovery-marker + grep-row gate, measured +33% on multi-file grep, 12 ms, 0 bytes on 12 real commands)
 
 import type {ModApi} from '@commandcode/harness';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -60,6 +62,25 @@ const SHELL_HEAD = /^(?:(?:(?:Exit code|Signal):[^\n]*\n)(?:\([^)\n]*\)\n)?)+/;
 
 // Rules: `glob` prints `Found N files` and then one indented path per line. The find filter reads that header line as a path, so it is split off rather than fed in.
 const GLOB_HEAD = /^Found \d+ files?[^\n]*\n/;
+
+// Rules: every form rtk emits when it actually compressed something, taken from its own source (`core/tee.rs`, `core/runner.rs`, `cmds/system/search.rs`, `cmds/js/lint_cmd.rs`): the grouped-search header, a per-file or per-run elision count, and the three recall hints. A result carrying one of these has already been reduced and may hold a recall hash the filter would drop, so it is never fed back in.
+const RECOVERY_MARKER = /\bmatches in \d+ files?:|\+\d+ more|\+ \.\.\. more files|hidden: rtk recall |\[full output:/;
+
+// Rules: rtk's search filter prints its faithful baseline whenever capping would not shrink the output, which is the normal case for a multi-file grep (measured 4,026 -> 4,026 bytes). That baseline is exempt from the filter by construction, so a shell call rtk rewrote can still arrive uncompressed.
+// Rules: the rows are recognised by shape — `path:line:text` — and a majority is required, so a diff, a log, or a build log that happens to contain one such line is not mistaken for a match list.
+const GREP_ROW = /^[^\s:][^:\n]*:\d+:[^\n]*$/;
+export function isGrepRows(text: string): boolean {
+	const lines = text.split('\n').filter(line => line.trim());
+	if (lines.length < 2) return false;
+	let rows = 0;
+	for (const line of lines) if (GREP_ROW.test(line)) rows += 1;
+	return rows / lines.length >= 0.5;
+}
+
+// Rules: a rewritten call is normally left alone because rtk already filtered it. The exception is the baseline rtk declined to compress: it carries no recovery hint, so a second pass recovers rows it refused to group instead of discarding information.
+export function canRefilterCompressed(text: string): boolean {
+	return !RECOVERY_MARKER.test(text) && isGrepRows(text);
+}
 
 // Rules: `grep` is not one shape. Its default `files_with_matches` mode prints a plain path list under a `Found N files` header, which the grep filter passes through untouched (measured 4,448 → 4,448 bytes) while the find filter condenses it (→ 630). Content mode is the opposite: `path:line:text` rows, where grep wins. So the filter is chosen from the body's shape, not from the tool name alone.
 export function filterForShape(toolName: string, filter: string | null, text: string): string | null {
@@ -410,7 +431,8 @@ export default function (cmd: ModApi): void {
 			// Shell output rtk did not rewrite still gets auto-detected: `npm test` has no rewrite but cargo-style output does.
 			if (toolName !== 'shell_command') return undefined;
 			if (cmd.getFlag('rtk-shell') === false) return undefined;
-			if (alreadyRewritten) return undefined;
+			// Rules: a rewritten call is skipped because rtk already filtered it — except when rtk declined and left its faithful baseline, which `canRefilterCompressed` recognises. Anything carrying a recovery hint stays skipped, so a recall hash is never dropped.
+			if (alreadyRewritten && !canRefilterCompressed(text)) return undefined;
 			const filtered = await condense(toolName, null, text);
 			return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 		},
