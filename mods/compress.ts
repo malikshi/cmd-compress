@@ -43,6 +43,14 @@ export default function (cmd: ModApi): void {
 		return {caveman: read('caveman'), ponytail: read('ponytail'), rtk: read('rtk')};
 	}
 
+	// Rules: `rtk=on` alone overstates the session. The rtk mod stores the request, but it condenses nothing when the binary is missing or too old, and this one line is where a person reads all three. The state is annotated rather than replaced, so the requested mode stays visible, and the annotation names the actual reason because the two failures need different fixes.
+	function snapshotWithAvailability(): Record<ModeName, string> {
+		const state = snapshot();
+		const inactive = cmd.use('rtk', 'inactiveReason') as (() => string | null) | undefined;
+		const reason = state.rtk === 'off' ? null : inactive?.();
+		return reason ? {...state, rtk: `${state.rtk} (${reason})`} : state;
+	}
+
 	function line(state: Record<ModeName, string>): string {
 		return `caveman=${state.caveman} | ponytail=${state.ponytail} | rtk=${state.rtk}`;
 	}
@@ -54,7 +62,7 @@ export default function (cmd: ModApi): void {
 		handler: ({args}) => {
 			const arg = args.trim().toLowerCase();
 
-			if (!arg || arg === 'status') return {message: `compress: ${line(snapshot())}`};
+			if (!arg || arg === 'status') return {message: `compress: ${line(snapshotWithAvailability())}`};
 
 			if (arg === 'help') {
 				return {
@@ -78,7 +86,7 @@ export default function (cmd: ModApi): void {
 				else setMode(preset[name]);
 			}
 			// Rules: report the state that is actually in effect, not the preset that was requested — with a sibling missing the two differ, and printing the preset beside "not loaded" claims a change that did not happen.
-			const summary = `compress ${arg}: ${line(snapshot())}`;
+			const summary = `compress ${arg}: ${line(snapshotWithAvailability())}`;
 			return {message: missing.length ? `${summary} (not loaded: ${missing.join(', ')})` : summary};
 		},
 	});

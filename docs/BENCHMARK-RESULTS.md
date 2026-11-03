@@ -50,6 +50,7 @@ The raw rows above are rtk's fixture, not what this host produces. A `glob` resu
 | shell tool | `Exit code: 1` head | 2,769 | 324 | **88.3%** | header kept |
 | shell tool, timed out | header + timeout notice | 5,889 | 340 | **94.2%** | header kept, trailer kept |
 | shell tool, declined grep baseline | none — rtk refused to group | 8,081 | 514 | **93.6%** | no envelope |
+| shell tool, coloured build | `Exit code: 2` head + 40 SGR-coloured `tsc` errors | 5,274 | 3,474 | **34.1%** | header kept |
 
 ### The declined baseline
 
@@ -76,7 +77,10 @@ Those rows exist because an earlier build lost or skipped every one of them. Eac
 - **The interpreted exit code was lost.** `formatResult2` writes `(No matches found)` on its own line under `Exit code: 1`; that line went into the body and was folded.
 - **`grep`'s default mode compressed nothing.** The tool defaults to `files_with_matches`, a path list under a `Found N files` header. The mod forced `-f grep`, which returns that shape byte-identical (4,448 → 4,448); the shape now selects the find filter instead (→ 620).
 
-Rewrite: 12 of 12 commands rewritten, ~77 ms mean, ~82 ms p95.
+- **Colour survived every filter, and the host's spill pointer did not.** `rtk pipe` returns every ANSI escape intact: 10,110 bytes of coloured test output came back at 10,110 bytes with 720 escapes still in it, while the escape-free text is 6,750 bytes. The strip is now unconditional and measured at **34.1%** on a 40-error `tsc` shape. Separately, a result the host truncated in the middle carries `[... output truncated: …]` and `[full output saved to: …]` there — measured, rtk deleted both when it compressed a 2,951-byte pytest result down to 296 bytes, so the pointer is now lifted out and re-attached.
+- **rtk's auto-detect can destroy a build failure.** Its `never_worse` guard only compares sizes. A cargo-shaped block of twenty `error[E0xx]: cannot find value …` lines (1,919 bytes) came back as 156 bytes of grep grouping — `20 matches in 1F: [file] --> src/lib.rs (20): 0: 5 1: 5 …` — with every error message gone and no recovery hint. That is a wrong format guess, not compression. A format-shaped fidelity guard now refuses a grouping whose input was neither a match list nor a path list, and refuses any result that dropped a negation; the original then reaches the model unchanged.
+
+Rewrite: 12 of 12 commands rewritten, ~78 ms mean, ~84 ms p95.
 
 **The scattered row is the important one.** It saves nothing, and that is not a bug: rtk's `never_worse` guard refuses a regrouping larger than its input. Reporting only the clustered case would have claimed 80% as if it were universal. The honest claim is *"a shell result that groups by file gets much smaller; a result with one hit per file is unchanged."*
 

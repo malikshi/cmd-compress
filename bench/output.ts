@@ -13,7 +13,7 @@ import {join} from 'node:path';
 import {CAVEMAN_LEVELS, cavemanRule} from '../rules/caveman.ts';
 import {PONYTAIL_LEVELS, ponytailRule} from '../rules/ponytail.ts';
 import {resolveBin} from '../mods/shared.ts';
-import {canRefilterCompressed, filterForShape, splitSegments} from '../mods/rtk.ts';
+import {canRefilterCompressed, filterForShape, splitSegments, stripAnsi} from '../mods/rtk.ts';
 import {
 	makeFindOutput,
 	makeGlobToolOutput,
@@ -26,6 +26,7 @@ import {
 	makeShellToolOutput,
 	makeShellAbortOutput,
 	makeDeclinedBaseline,
+	makeColoredBuildOutput,
 	REWRITE_COMMANDS,
 } from './lib/fixtures.ts';
 import {estimateTokens, formatBytes, formatPct, median, percentile, reduction} from './lib/stats.ts';
@@ -100,6 +101,7 @@ export const ENVELOPE_CASES = [
 	{case: 'shell tool', filter: null, tool: 'shell_command', shape: 'cargo failure + Exit code head', build: () => makeShellToolOutput()},
 	{case: 'shell tool, timed out', filter: null, tool: 'shell_command', shape: 'pytest failure + timeout notice', build: () => makeShellAbortOutput()},
 	{case: 'shell tool, declined grep baseline', filter: null, tool: 'shell_command', shape: 'multi-file match rows rtk refused to group', build: () => makeDeclinedBaseline(), rewritten: true},
+	{case: 'shell tool, coloured build', filter: null, tool: 'shell_command', shape: '40 tsc errors with SGR colour', build: () => makeColoredBuildOutput()},
 ] as const;
 
 // Rules: rtk pipe takes stdin only, so the fixture is redirected from a temp file rather than interpolated into a command line.
@@ -118,14 +120,21 @@ function pipeThrough(bin: string, filter: string | null, input: string): string 
 	}
 }
 
-// Rules: this mirrors the mod's own condense() step exactly — pick the filter from the shape, split the host envelope off, filter only the body, put the envelope back. Measuring a path production does not run is what let the envelope bug through.
+// Rules: this mirrors the mod's own condense() step exactly — pick the filter from the shape, split the host envelope off, strip colour, filter only the body, put the envelope back. Measuring a path production does not run is what let the envelope bug through.
 // Rules: a rewritten shell call is skipped unless rtk left its faithful baseline, so the cases say which they model. An unrewritten call (`npm test`) is filtered unconditionally; a rewritten one goes through the same gate production uses.
 function condenseTool(bin: string, filter: string | null, tool: string, input: string, rewritten = false): {stdout: string; fidelity: string} | null {
-	if (rewritten && !canRefilterCompressed(input)) return null;
+	const plain = stripAnsi(input);
+	const strippedAsEnvelope = splitSegments(tool, plain);
+	if (rewritten && !canRefilterCompressed(plain)) {
+		return plain.length < input.length ? {stdout: plain, fidelity: 'colour stripped, rtk left the baseline'} : null;
+	}
 	const shapeFilter = filterForShape(tool, filter, input);
 	const {head, body, tail} = splitSegments(tool, input);
-	const filtered = pipeThrough(bin, shapeFilter, body);
-	if (filtered === null) return null;
+	const filtered = pipeThrough(bin, shapeFilter, stripAnsi(body));
+	if (filtered === null) {
+		if (plain.length >= input.length) return null;
+		return {stdout: `${strippedAsEnvelope.head}${strippedAsEnvelope.body}${strippedAsEnvelope.tail}`, fidelity: 'colour stripped, filter declined'};
+	}
 	const composed = `${head}${filtered}${tail}`;
 	const keptHead = head === '' || composed.startsWith(head);
 	const keptTail = tail === '' || composed.endsWith(tail);

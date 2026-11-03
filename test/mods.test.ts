@@ -76,11 +76,27 @@ test('pinBinary: every command-position rtk becomes the absolute path', () => {
 	assert.equal(pinBinary('rtk a || rtk b; rtk c', '/opt/rtk', 'linux'), "'/opt/rtk' a || '/opt/rtk' b; '/opt/rtk' c");
 });
 
-// Rules: a quoted argument that mentions rtk is data, not a command — pinning it would corrupt the command line.
+// Rules: a quoted argument that mentions rtk is data, not a command — pinning it would corrupt the command line. The old regex decided this from the separator it had just matched, with no idea whether that separator sat inside a quote: measured, `echo "x | rtk y"` became `echo "x | '/opt/rtk' y"` and `echo 'a; rtk b'` became `echo 'a; '/opt/rtk' b'`.
 test('pinBinary: rtk inside an argument is left untouched', () => {
 	assert.equal(pinBinary('git commit -m "use rtk"', '/opt/rtk', 'linux'), 'git commit -m "use rtk"');
 	assert.equal(pinBinary('grep rtk README.md', '/opt/rtk', 'linux'), 'grep rtk README.md');
 	assert.equal(pinBinary('echo rtk', '/opt/rtk', 'linux'), 'echo rtk');
+	assert.equal(pinBinary('echo "x | rtk y"', '/opt/rtk', 'linux'), 'echo "x | rtk y"', 'a separator inside a double-quoted argument is data');
+	assert.equal(pinBinary("echo 'a; rtk b'", '/opt/rtk', 'linux'), "echo 'a; rtk b'", 'and so is one inside a single-quoted argument');
+	assert.equal(pinBinary('git log --grep="rtk & z"', '/opt/rtk', 'linux'), 'git log --grep="rtk & z"');
+});
+
+// Rules: rtk rewrites a multi-line block and `&` backgrounding, so both separators arrive from the binary itself. The old pattern only knew `&&`, `||`, `;`, and `|`, so the second command in `rtk ls\nrtk pwd` (and in `rtk a & rtk b`) stayed a bare `rtk` — measured: with rtk installed outside the host shell's PATH, that half of the line failed as `rtk: not found` while the first half worked.
+test('pinBinary: newline and & separators pin every command position', () => {
+	assert.equal(pinBinary('rtk ls\nrtk pwd', '/opt/rtk', 'linux'), "'/opt/rtk' ls\n'/opt/rtk' pwd");
+	assert.equal(pinBinary('rtk a & rtk b', '/opt/rtk', 'linux'), "'/opt/rtk' a & '/opt/rtk' b");
+	assert.equal(pinBinary('A=1\nrtk ls', '/opt/rtk', 'linux'), "A=1\n'/opt/rtk' ls", 'a line start after an assignment line');
+});
+
+// Rules: a whole-word test, so a program that merely shares the prefix is not rewritten into a broken line.
+test('pinBinary: only a whole rtk word is pinned', () => {
+	assert.equal(pinBinary('rtk-wrapper x', '/opt/rtk', 'linux'), 'rtk-wrapper x');
+	assert.equal(pinBinary('myrtk y', '/opt/rtk', 'linux'), 'myrtk y');
 });
 
 test('pinBinary: a path containing a single quote stays shell-safe', () => {

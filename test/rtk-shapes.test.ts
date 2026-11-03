@@ -462,3 +462,172 @@ test('shell: a rewritten call carrying rtk\'s declined baseline is condensed, a 
 	});
 	assert.equal(kept, undefined, 'a result with a recovery hint is left exactly as rtk emitted it');
 });
+
+/* ------------------------------------------------------------ colour */
+
+// Rules: a test runner or build tool emits colour by default, and rtk's filters pass every escape through — measured on 10,110 bytes of realistic coloured test output, `rtk pipe` returned all 10,110 bytes with all 720 escapes intact, while the same text without them was 6,750 bytes (33.2% smaller). Colour carries nothing the model reads, so the mod removes it even when the rtk pass declines.
+test('a coloured result loses its escapes and keeps every fact', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	const rows = Array.from({length: 120}, (_, index) =>
+		`\u001B[1;31mFAILED\u001B[0m tests::case_${index} \u001B[2m(src/lib.rs:${index})\u001B[0m`,
+	);
+	const input = `Exit code: 1\n${rows.join('\n')}\n`;
+	const before = input.length;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'shell_command', result: [{type: 'text', text: input}], isError: false}));
+	assert.ok(!out.includes('\u001B['), 'no escape survives');
+	assert.ok(out.startsWith('Exit code: 1\n'), 'the exit status is still first');
+	assert.ok(out.includes('tests::case_119'), 'and the last failing test is still named');
+	assert.ok(out.length < before, 'and the result is smaller');
+});
+
+// Rules: the strip must not be a rewrite. `stripAnsi` is the whole change for a result below the spawn floor, so it is asserted on its own — including that an ordinary result is returned byte-identical, and that an OSC hyperlink or title is removed rather than left half-consumed.
+test('stripAnsi removes colour, cursor, and OSC sequences, and leaves plain text alone', async () => {
+	const {stripAnsi} = await import('../mods/rtk.ts');
+	assert.equal(stripAnsi('plain text\n'), 'plain text\n');
+	assert.equal(stripAnsi('\u001B[31mred\u001B[0m'), 'red');
+	assert.equal(stripAnsi('\u001B[1;38;5;196mbold\u001B[m'), 'bold');
+	assert.equal(stripAnsi('\u001B]8;;https://x.dev\u0007link\u001B]8;;\u0007'), 'link', 'an OSC hyperlink is consumed whole');
+	assert.equal(stripAnsi('\u001B]0;title\u0007body'), 'body', 'so is an OSC title');
+	assert.equal(stripAnsi('a\u001B[2Kb'), 'ab', 'a cursor clear is stripped');
+	assert.equal(stripAnsi('keep \u001B not an escape'), 'keep \u001B not an escape', 'a lone ESC is not swallowed');
+});
+
+// Rules: the colour strip runs below the byte floor too. A short coloured result used to be returned untouched because the floor gated every path, so a 900-byte failing-test summary reached the model with escapes and no filter could help it.
+test('a short coloured result is still stripped below the spawn floor', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	const input = `Exit code: 1\n\u001B[31mFAILED\u001B[0m tests::short_case\n`;
+	assert.ok(input.length < MIN_FILTER_BYTES, 'below the floor');
+	const result = await firstHook(fake).afterToolCall?.({toolName: 'shell_command', result: [{type: 'text', text: input}], isError: false});
+	const out = resultText(result);
+	assert.equal(out, 'Exit code: 1\nFAILED tests::short_case\n');
+});
+
+// Rules: colour is stripped from a grep result too, not only from shell output — a coloured `rg` piped through the mod took the explicit-filter branch, which never applied the strip.
+test('a coloured grep result is stripped, and its count survives', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	const rows = Array.from({length: 200}, (_, index) => `\u001B[35msrc/a.ts:${index + 1}:\u001B[0m  \u001B[33mconst x\u001B[0m = 1;`);
+	const input = `${rows.join('\n')}\n\n[Showing results with pagination = limit: 200]`;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: input}], isError: false}));
+	assert.ok(!out.includes('\u001B['), 'no escape survives the grep branch');
+	assert.ok(out.trimEnd().endsWith('[Showing results with pagination = limit: 200]'), 'the notice is still last');
+});
+
+/* ------------------------------------------------------------ spill pointer */
+
+// Rules: the host truncates a large foreground result in the MIDDLE and puts a two-line pointer there, not at the end. Measured against the real binary: a 2,951-byte pytest result carrying that pair came back from `rtk pipe` at 296 bytes with BOTH lines gone, so the model lost its only route to the rest of the output.
+test('the host spill pointer survives a compressed shell result', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	const truncation = '[... output truncated: 900000 chars total, showing first 12000 and last part ...]';
+	const pointer = '[full output saved to: /tmp/cmd-foreground-abc.log — read it with read_file (offset/limit) or grep]';
+	const body = [
+		'test result: FAILED. 120 passed; 1 failed; 0 ignored',
+		'',
+		'failures:',
+		'    tests::fails_here',
+		truncation,
+		pointer,
+		'',
+		'---- tests::fails_here stdout ----',
+		"thread 'tests::fails_here' panicked at src/lib.rs:42:5:",
+		'assertion `left == right` failed',
+		'  left: 1',
+		' right: 2',
+		...Array.from({length: 60}, (_, index) => `    note line ${index} that a filter folds away`),
+	];
+	const input = `Exit code: 1 (test failure)\n${body.join('\n')}`;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'shell_command', result: [{type: 'text', text: input}], isError: false}));
+	assert.ok(out.includes(pointer), 'the pointer to the full output is still there');
+	assert.ok(out.includes(truncation), 'and so is the truncation notice');
+	assert.ok(out.startsWith('Exit code: 1 (test failure)\n'), 'the exit status is still first');
+	assert.ok(out.includes('fails_here'), 'and the failing test is still named');
+	assert.ok(out.length < input.length, 'and the body still shrank');
+});
+
+// Rules: the extractor is the whole guarantee, so it is asserted directly — both pointer forms, the "could not be persisted" fallback, and a body that happens to contain a similar but different bracket.
+test('extractSpillNotices lifts both pointer forms and nothing else', async () => {
+	const {extractSpillNotices} = await import('../mods/rtk.ts');
+	const truncation = '[... output truncated: 900000 chars total, showing first 12000 and last part ...]';
+	const saved = '[full output saved to: /tmp/x.log — read it with read_file (offset/limit) or grep]';
+	const failed = '[full output could not be persisted]';
+
+	const one = extractSpillNotices(`a\n${truncation}\n${saved}\nb`);
+	assert.equal(one.body, 'a\n\n\nb', 'the lines are blanked, so the body keeps its shape');
+	assert.equal(one.notices, `${truncation}\n${saved}`);
+
+	const two = extractSpillNotices(`x\n${failed}\ny`);
+	assert.equal(two.notices, failed);
+	assert.equal(two.body, 'x\n\ny');
+
+	const none = extractSpillNotices('[not a pointer] plain [full output stays here]');
+	assert.equal(none.notices, '', 'an unrelated bracket is not a pointer');
+	assert.equal(none.body, '[not a pointer] plain [full output stays here]');
+});
+
+// Rules: the same mid-result pointer arrives on a grep result, and `condense` is shared — this pins that the grep path goes through it rather than around it.
+test('the spill pointer survives a condensed grep result too', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	const truncation = '[... output truncated: 900000 chars total, showing first 12000 and last part ...]';
+	const pointer = '[full output saved to: /tmp/x.log — read it with read_file (offset/limit) or grep]';
+	const lines = Array.from({length: 250}, (_, index) => `src/a${index % 5}.ts:${index + 1}:  const value = compute(input);`);
+	lines.splice(120, 0, truncation, pointer);
+	const input = `Found 250 files\n${lines.join('\n')}`;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: input}], isError: false}));
+	assert.ok(out.includes(pointer), 'the pointer survived the grep path');
+	assert.ok(out.startsWith('Found 250 files\n'), 'and the count is still the first line');
+	assert.ok(out.length < input.length, 'and the body shrank');
+});
+
+/* ------------------------------------------------------------ fidelity guard */
+
+// Rules: `never_worse` only checks byte size. Measured against the real binary, a cargo failure of 20 `error[E0xx]` lines (1,919 bytes) came back as 156 bytes of grep grouping — `20 matches in 1F: [file] --> src/lib.rs (20): 0: 5 …` — with every error message gone and no recovery hint. The guard recognises a scan that grouped non-match output and keeps the original.
+test('a build failure rtk mis-groups as grep output keeps its error messages', async t => {
+	if (!hasRtk()) return t.skip('rtk is not installed here');
+	const fake = await loaded();
+	const cargo = Array.from({length: 20}, (_, index) =>
+		`error[E0${index}]: cannot find value \`x${index}\` in this scope\n  --> src/lib.rs:${index}:5`,
+	).join('\n') + '\n' + Array.from({length: 200}, (_, index) => `  note ${index}`).join('\n');
+	const input = `Exit code: 1\n${cargo}`;
+	const result = await firstHook(fake).afterToolCall?.({toolName: 'shell_command', result: [{type: 'text', text: input}], isError: false});
+	// The guard refuses the filter, and with no colour to strip the result is byte-identical, so the hook leaves it alone.
+	assert.equal(result, undefined, 'the original reaches the model unchanged');
+});
+
+// Rules: the guard must not reject a genuine grouping — a real path list grouped by the find filter is the documented win, and refusing it would turn the filter off for the shape it exists for.
+test('the fidelity guard separates a real grouping from a misdetected one', async () => {
+	const {checkFidelity} = await import('../mods/rtk.ts');
+	const rows = Array.from({length: 40}, (_, index) => `src/a${index % 4}.ts:${index + 1}:  const x = compute();`).join('\n');
+	const grouped = '40 matches in 4 files:\n\nsrc/a0.ts (10):\n     1: const x = compute();';
+	assert.equal(checkFidelity(rows, grouped, true).ok, true, 'a match list grouped is correct');
+
+	const paths = Array.from({length: 40}, (_, index) => `./src/d${index % 4}/f${index}.ts`).join('\n');
+	assert.equal(checkFidelity(paths, '40 files in 4 dirs:\n./src/d0/ (10)\n  +6', true).ok, true, 'a path list grouped is correct');
+
+	const build = ['error[E0308]: mismatched types', '  --> src/lib.rs:5:9', ...Array.from({length: 30}, (_, index) => `  note ${index}`)].join('\n');
+	const misdetected = checkFidelity(build, '31 matches in 1 files:\n\n[file]   --> src/lib.rs (31):\n     0: 9', true);
+	assert.equal(misdetected.ok, false, 'a build log grouped as matches is refused');
+	assert.match(misdetected.lost[0] ?? '', /format:/);
+});
+
+// Rules: a grouped result is only suspicious when rtk auto-detected it. A grep or find result is filtered with its own explicit filter, so its grouping is never second-guessed.
+test('the guard only second-guesses an auto-detected filter', async () => {
+	const {checkFidelity} = await import('../mods/rtk.ts');
+	const build = ['error[E0308]: mismatched types', ...Array.from({length: 30}, (_, index) => `  note ${index}`)].join('\n');
+	const grouped = '31 matches in 1 files:\n\n[file]   --> src/lib.rs (31):\n     0: 9';
+	assert.equal(checkFidelity(build, grouped, false).ok, true, 'an explicit filter result is accepted');
+	assert.equal(checkFidelity(build, grouped, true).ok, false, 'the same result auto-detected is refused');
+});
+
+// Rules: losing a negation inverts meaning, which is the DeepShrink thesis this guard borrows — no legitimate summariser drops one, so it is refused on every path.
+test('a filter that drops a negation is refused', async () => {
+	const {checkFidelity} = await import('../mods/rtk.ts');
+	const original = 'Do not run this command. Never delete the cache.';
+	assert.equal(checkFidelity(original, 'Do not run this command. Never delete the cache.', false).ok, true);
+	const report = checkFidelity(original, 'Do run this command. Delete the cache.', false);
+	assert.equal(report.ok, false);
+	assert.match(report.lost[0] ?? '', /negation/);
+});

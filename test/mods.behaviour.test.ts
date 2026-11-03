@@ -7,7 +7,9 @@
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {readFileSync} from 'node:fs';
+import {chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import caveman, {normalizeCavemanLevel} from '../mods/caveman.ts';
 import ponytail from '../mods/ponytail.ts';
 import rtk from '../mods/rtk.ts';
@@ -17,7 +19,12 @@ import {createFakeCmd, firstHook, runHandler, messageOf} from './harness.ts';
 type Fake = ReturnType<typeof createFakeCmd>;
 
 // Rules: the mod resolves its binary with resolveBin, which probes PATH and ~/.bun/bin. With no rtk installed every hook is a no-op, so the suite would pass on a machine that has rtk and fail in CI — measured: 14 failures under an empty HOME. Seeding rtk-bin pins the factory to a fixed path, so the fake exec is the only thing consulted and the suite is hermetic anywhere.
-const TEST_BIN = '/opt/rtk/bin/rtk';
+// Rules: the pinned path must EXIST and be executable. The factory verifies an explicit rtk-bin before it reports a version or injects the guidance block — a typo there used to be reported as the binary — so a fictional path would make every status test report NOT FOUND. A real empty-file stub keeps the check honest without a real rtk.
+const TEST_DIR = mkdtempSync(join(tmpdir(), 'rtk-bin-'));
+const TEST_BIN = join(TEST_DIR, 'rtk');
+writeFileSync(TEST_BIN, '#!/bin/sh\nexit 1\n', {mode: 0o755});
+chmodSync(TEST_BIN, 0o755);
+process.on('exit', () => rmSync(TEST_DIR, {recursive: true, force: true}));
 
 function load(factory: (cmd: never) => void, options: Parameters<typeof createFakeCmd>[0] = {}) {
 	const fake = createFakeCmd({...options, flags: {'rtk-bin': TEST_BIN, ...options.flags}});
@@ -30,8 +37,10 @@ function sessionStart(fake: Fake) {
 	for (const hook of fake.hooks) hook.onSessionStart?.();
 }
 
-function appends(fake: Fake) {
-	return fake.hooks.map(hook => hook.appendSystemPrompt?.()).filter(Boolean).join('\n');
+// Rules: the host awaits this hook, so the helper does too — a mod that waits for its version probe would otherwise be compared as `[object Promise]`.
+async function appends(fake: Fake) {
+	const parts = await Promise.all(fake.hooks.map(hook => hook.appendSystemPrompt?.()));
+	return parts.filter(Boolean).join('\n');
 }
 
 // Rules: on Windows the redirect lives in a batch file rather than on the command line, so a test that only inspects argv sees no `pipe` at all — that is the design, not a failure. This reads the effective line either way: argv on POSIX, the script contents on Windows, and it must run inside the fake exec because the temp dir is deleted as soon as the call returns.
@@ -47,35 +56,35 @@ function effectiveLine(command: string, args: string[]): string {
 	}
 }
 
-test('caveman: off by default, so nothing reaches the prompt', () => {
+test('caveman: off by default, so nothing reaches the prompt', async () => {
 	const fake = load(caveman);
-	assert.equal(appends(fake), '');
+	assert.equal(await appends(fake), '');
 });
 
-test('caveman: /caveman full turns it on and injects one block', () => {
+test('caveman: /caveman full turns it on and injects one block', async () => {
 	const fake = load(caveman);
 	assert.match(messageOf(runHandler(fake.commands, 'caveman', 'full')), /Caveman full on/);
-	const prompt = appends(fake);
+	const prompt = await appends(fake);
 	assert.match(prompt, /^<caveman>/);
 	assert.match(prompt, /Caveman full active/);
 	assert.equal((prompt.match(/<caveman>/g) ?? []).length, 1);
 });
 
-test('caveman: a level switch replaces the block instead of stacking', () => {
+test('caveman: a level switch replaces the block instead of stacking', async () => {
 	const fake = load(caveman);
 	runHandler(fake.commands, 'caveman', 'lite');
 	runHandler(fake.commands, 'caveman', 'megacave-ultra');
-	const prompt = appends(fake);
+	const prompt = await appends(fake);
 	assert.match(prompt, /Caveman megacave-ultra active/);
 	assert.doesNotMatch(prompt, /Caveman lite active/);
 });
 
-test('caveman: the stop phrase turns it off and consumes the message', () => {
+test('caveman: the stop phrase turns it off and consumes the message', async () => {
 	const fake = load(caveman);
 	runHandler(fake.commands, 'caveman', 'full');
 	const result = firstHook(fake).transformInput?.({text: 'stop caveman'}) as {action: string};
 	assert.equal(result.action, 'handled');
-	assert.equal(appends(fake), '');
+	assert.equal(await appends(fake), '');
 });
 
 test('caveman: an ordinary sentence mentioning the mode does not turn it off', () => {
@@ -85,7 +94,7 @@ test('caveman: an ordinary sentence mentioning the mode does not turn it off', (
 });
 
 // Rules: the host stops the transformInput chain at the first `handled`, so `normal mode` must turn the siblings off itself or they keep running.
-test('caveman: "normal mode" turns off every reachable sibling, not just caveman', () => {
+test('caveman: "normal mode" turns off every reachable sibling, not just caveman', async () => {
 	const cavemanFake = load(caveman);
 	const ponytailFake = load(ponytail);
 	const rtkFake = load(rtk);
@@ -97,28 +106,28 @@ test('caveman: "normal mode" turns off every reachable sibling, not just caveman
 	runHandler(cavemanFake.commands, 'caveman', 'full');
 	runHandler(ponytailFake.commands, 'ponytail', 'ultra');
 	runHandler(rtkFake.commands, 'rtk', 'on');
-	assert.notEqual(appends(cavemanFake), '');
-	assert.notEqual(appends(ponytailFake), '');
+	assert.notEqual(await appends(cavemanFake), '');
+	assert.notEqual(await appends(ponytailFake), '');
 
 	const result = firstHook(cavemanFake).transformInput?.({text: 'normal mode'}) as {action: string};
 	assert.equal(result.action, 'handled');
-	assert.equal(appends(cavemanFake), '', 'caveman is off');
-	assert.equal(appends(ponytailFake), '', 'ponytail followed through its exposed setMode');
-	assert.equal(appends(rtkFake), '', 'rtk followed too');
+	assert.equal(await appends(cavemanFake), '', 'caveman is off');
+	assert.equal(await appends(ponytailFake), '', 'ponytail followed through its exposed setMode');
+	assert.equal(await appends(rtkFake), '', 'rtk followed too');
 });
 
 // Rules: the phrase must work when caveman and ponytail are already off, so a lone `rtk` cannot outlive it.
-test('caveman: "normal mode" turns off a sibling that is the only mode running', () => {
+test('caveman: "normal mode" turns off a sibling that is the only mode running', async () => {
 	const cavemanFake = load(caveman);
 	const rtkFake = load(rtk);
 	cavemanFake.cmd.use = (mod: string, name: string) => (mod === 'rtk' ? rtkFake.exposed.get('probe')?.get(name) : undefined);
 
 	runHandler(rtkFake.commands, 'rtk', 'on');
-	assert.notEqual(appends(rtkFake), '');
+	assert.notEqual(await appends(rtkFake), '');
 
 	const result = firstHook(cavemanFake).transformInput?.({text: 'normal mode'}) as {action: string};
 	assert.equal(result.action, 'handled');
-	assert.equal(appends(rtkFake), '', 'rtk is off even though caveman itself was already off');
+	assert.equal(await appends(rtkFake), '', 'rtk is off even though caveman itself was already off');
 });
 
 // Rules: ponytail is usually loaded and already off, and the host stops the chain at the first `handled` — so a ponytail that gated on its own mode would swallow the phrase and leave rtk running.
@@ -137,7 +146,7 @@ test('ponytail: "normal mode" still reaches a sibling while ponytail is off', ()
 });
 
 // Rules: a session may load rtk alone; the phrase has to resolve there too, so rtk answers it rather than passing it to the model.
-test('rtk: "normal mode" turns rtk off when it is the only mod loaded', () => {
+test('rtk: "normal mode" turns rtk off when it is the only mod loaded', async () => {
 	const fake = load(rtk);
 	const mode = () => fake.exposed.get('probe')?.get('getMode') as (() => string) | undefined;
 
@@ -147,7 +156,7 @@ test('rtk: "normal mode" turns rtk off when it is the only mod loaded', () => {
 	const result = firstHook(fake).transformInput?.({text: 'normal mode'}) as {action: string};
 	assert.equal(result.action, 'handled');
 	assert.equal(mode()?.(), 'off');
-	assert.equal(firstHook(fake).appendSystemPrompt?.(), undefined, 'and the guidance block is gone');
+	assert.equal(await firstHook(fake).appendSystemPrompt?.(), undefined, 'and the guidance block is gone');
 });
 
 test('caveman: status reports the live mode and unknown levels print usage', () => {
@@ -157,11 +166,11 @@ test('caveman: status reports the live mode and unknown levels print usage', () 
 	assert.match(messageOf(runHandler(fake.commands, 'caveman', 'nope')), /Unknown caveman level/);
 });
 
-test('caveman: a per-session flag applies at session start, not at factory time', () => {
+test('caveman: a per-session flag applies at session start, not at factory time', async () => {
 	const fake = load(caveman, {flags: {caveman: 'lite'}});
-	assert.equal(appends(fake), '');
+	assert.equal(await appends(fake), '');
 	sessionStart(fake);
-	assert.match(appends(fake), /Caveman lite active/);
+	assert.match(await appends(fake), /Caveman lite active/);
 });
 
 test('caveman: normalizeCavemanLevel maps aliases and rejects review', () => {
@@ -169,19 +178,19 @@ test('caveman: normalizeCavemanLevel maps aliases and rejects review', () => {
 	assert.equal(normalizeCavemanLevel('MEGACAVE-FULL'), 'megacave-full');
 });
 
-test('ponytail: /ponytail ultra injects the ultra block with its marker', () => {
+test('ponytail: /ponytail ultra injects the ultra block with its marker', async () => {
 	const fake = load(ponytail);
 	runHandler(fake.commands, 'ponytail', 'ultra');
-	const prompt = appends(fake);
+	const prompt = await appends(fake);
 	assert.match(prompt, /PONYTAIL MODE ACTIVE — level: ultra/);
 	assert.match(prompt, /questions the request/);
 });
 
-test('ponytail: "stop ponytail" turns it off', () => {
+test('ponytail: "stop ponytail" turns it off', async () => {
 	const fake = load(ponytail);
 	runHandler(fake.commands, 'ponytail', 'full');
 	firstHook(fake).transformInput?.({text: 'stop ponytail'});
-	assert.equal(appends(fake), '');
+	assert.equal(await appends(fake), '');
 });
 
 test('rtk: off means no rewrite and no guidance', async () => {
@@ -195,7 +204,7 @@ test('rtk: off means no rewrite and no guidance', async () => {
 	const result = await firstHook(fake).beforeToolCall?.({toolName: 'shell_command', input: {command: 'git status'}});
 	assert.equal(result, undefined);
 	assert.equal(calls, 0);
-	assert.equal(appends(fake), '');
+	assert.equal(await appends(fake), '');
 });
 
 test('rtk: on rewrites a shell command through rtk and injects guidance', async () => {
@@ -213,7 +222,7 @@ test('rtk: on rewrites a shell command through rtk and injects guidance', async 
 	})) as {input: {command: string}};
 	assert.match(result.input.command, /rtk['"] git status$/, 'the rewrite is pinned to the resolved absolute path, quoted for this shell');
 	assert.match(seen[0] ?? '', /rewrite git status$/);
-	assert.match(appends(fake), /<rtk>/);
+	assert.match(await appends(fake), /<rtk>/);
 });
 
 // Rules: shell_command carries an optional `args` array beside `command`; the rewrite must replace only the command and leave those args for the tool to append, or a rewritten call would drop them.
@@ -439,7 +448,7 @@ test('rtk: a too-old binary turns rewrites off and says so', async () => {
 	});
 	assert.equal(result, undefined, 'no rewrite from a binary below the supported minor');
 	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /too old/);
-	assert.equal(appends(fake), '', 'no guidance promising rewrites that cannot happen');
+	assert.equal(await appends(fake), '', 'no guidance promising rewrites that cannot happen');
 });
 
 test('rtk: /rtk gain reports the stored savings, and says so when it cannot read them', async () => {
@@ -456,7 +465,7 @@ test('rtk: /rtk gain reports the stored savings, and says so when it cannot read
 	assert.match(messageOf(await runHandler(broken.commands, 'rtk', 'gain')), /Could not read rtk gain/);
 });
 
-test('compress: the preset reaches all three mods and status reads them back', () => {
+test('compress: the preset reaches all three mods and status reads them back', async () => {
 	const cavemanFake = load(caveman);
 	const ponytailFake = load(ponytail);
 	const rtkFake = load(rtk);
@@ -471,14 +480,14 @@ test('compress: the preset reaches all three mods and status reads them back', (
 	const applied = messageOf(runHandler(compressFake.commands, 'compress', 'max'));
 	assert.match(applied, /caveman=ultra \| ponytail=ultra \| rtk=on/);
 	assert.match(messageOf(runHandler(compressFake.commands, 'compress', 'status')), /caveman=ultra/);
-	assert.match(appends(cavemanFake), /Caveman ultra active/);
-	assert.match(appends(ponytailFake), /level: ultra/);
-	assert.match(appends(rtkFake), /<rtk>/);
+	assert.match(await appends(cavemanFake), /Caveman ultra active/);
+	assert.match(await appends(ponytailFake), /level: ultra/);
+	assert.match(await appends(rtkFake), /<rtk>/);
 
 	runHandler(compressFake.commands, 'compress', 'off');
-	assert.equal(appends(cavemanFake), '');
-	assert.equal(appends(ponytailFake), '');
-	assert.equal(appends(rtkFake), '');
+	assert.equal(await appends(cavemanFake), '');
+	assert.equal(await appends(ponytailFake), '');
+	assert.equal(await appends(rtkFake), '');
 });
 
 test('compress: an unknown preset prints usage and changes nothing', () => {
@@ -565,7 +574,7 @@ test('caveman: a level set in one session is read back in the next from the same
 
 	const getMode = fake.exposed.get('caveman')?.get('getMode') as (() => string) | undefined;
 	assert.equal(getMode?.(), 'ultra', 'the stored level is the session start mode');
-	assert.match(appends(fake), /Caveman ultra active/);
+	assert.match(await appends(fake), /Caveman ultra active/);
 });
 
 test('compress: a preset applied in one session survives into the next', async () => {
@@ -628,10 +637,10 @@ test('rtk: the guidance block is byte-stable across rounds, so the prompt cache 
 		});
 		runHandler(fake.commands, 'rtk', 'on');
 		const hook = firstHook(fake);
-		const firstRound = hook.appendSystemPrompt?.();
+		const firstRound = await hook.appendSystemPrompt?.();
 		sessionStart(fake);
 		await new Promise(resolve => setTimeout(resolve, 20));
-		const secondRound = hook.appendSystemPrompt?.();
+		const secondRound = await hook.appendSystemPrompt?.();
 		assert.equal(firstRound, secondRound, `${version}: the block changed between rounds`);
 	}
 });
@@ -646,7 +655,73 @@ test('rtk: a too-old binary that answers before round one injects no guidance', 
 	runHandler(fake.commands, 'rtk', 'on');
 	sessionStart(fake);
 	await new Promise(resolve => setTimeout(resolve, 20));
-	assert.equal(appends(fake), '', 'the probe answered before the first round, so the decision already knows');
+	assert.equal(await appends(fake), '', 'the probe answered before the first round, so the decision already knows');
+});
+
+// Rules: measured before this fix — `onSessionStart` starts the version probe without awaiting, so the first round decided on `null`, and `isSupportedVersion(null)` grants the benefit of the doubt. An rtk 0.0.1 session was handed a guidance block telling the model to use rewrites that can never run, and the wrong answer was cached for the session. The probe is now awaited, so the first round already knows.
+test('rtk: a probe still in flight does not grant an unsupported binary its guidance', async () => {
+	const fake = load(rtk, {
+		exec: async request => {
+			if (request.args?.[0] === '--version') return {stdout: 'rtk 0.0.1', stderr: '', code: 0};
+			return {stdout: '', stderr: '', code: 1};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	sessionStart(fake);
+	assert.equal(await appends(fake), '', 'the very first round must already know the binary is too old');
+	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /too old/);
+});
+
+test('rtk: a supported binary still gets its guidance on the first round', async () => {
+	const fake = load(rtk, {
+		exec: async request => {
+			if (request.args?.[0] === '--version') return {stdout: 'rtk 1.0.1', stderr: '', code: 0};
+			return {stdout: '', stderr: '', code: 1};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	sessionStart(fake);
+	assert.match(await appends(fake), /<rtk>/, 'awaiting the probe must not swallow the block it approves');
+});
+
+// Rules: the compress line is where a person reads all three modes at once. `rtk=on` alone overstates the session when the rtk mod cannot condense anything, so the state is annotated while the requested mode stays visible.
+test('compress: rtk=on is annotated when the rtk mod cannot condense', () => {
+	const fake = createFakeCmd({flags: {'rtk-bin': '/nonexistent/rtk'}});
+	for (const [name, factory] of [['caveman', caveman], ['ponytail', ponytail], ['rtk', rtk], ['compress', compress]] as const) {
+		fake.bindStore(name);
+		fake.cmd.name = name;
+		factory(fake.cmd as never);
+	}
+	assert.match(messageOf(runHandler(fake.commands, 'compress', 'max')), /rtk=on \(no binary\)/);
+	assert.match(messageOf(runHandler(fake.commands, 'compress', 'status')), /rtk=on \(no binary\)/);
+});
+
+// Rules: the two failures need different fixes, so the annotation names which one happened. `no binary` means install it; `too old` means upgrade it, and saying the wrong one sends a person to the wrong fix.
+test('compress: an rtk that is too old is annotated with its own reason', async () => {
+	const fake = createFakeCmd({
+		flags: {'rtk-bin': TEST_BIN},
+		exec: async request => (request.args?.[0] === '--version' ? {stdout: 'rtk 0.20.0', stderr: '', code: 0} : {stdout: '', stderr: '', code: 1}),
+	});
+	for (const [name, factory] of [['caveman', caveman], ['ponytail', ponytail], ['rtk', rtk], ['compress', compress]] as const) {
+		fake.bindStore(name);
+		fake.cmd.name = name;
+		factory(fake.cmd as never);
+	}
+	sessionStart(fake);
+	await new Promise(resolve => setTimeout(resolve, 20));
+	assert.match(messageOf(runHandler(fake.commands, 'compress', 'max')), /rtk=on \(rtk too old/);
+});
+
+test('compress: a usable rtk stays unannotated', () => {
+	const fake = createFakeCmd({flags: {'rtk-bin': TEST_BIN}});
+	for (const [name, factory] of [['caveman', caveman], ['ponytail', ponytail], ['rtk', rtk], ['compress', compress]] as const) {
+		fake.bindStore(name);
+		fake.cmd.name = name;
+		factory(fake.cmd as never);
+	}
+	const line = messageOf(runHandler(fake.commands, 'compress', 'max'));
+	assert.match(line, /rtk=on/);
+	assert.doesNotMatch(line, /no binary/);
 });
 
 test('compress: a missing sibling is reported as unchanged, never as applied', () => {
@@ -686,4 +761,20 @@ test('rtk: --rtk-bin set after load is honoured on the first hook call', async (
 	runHandler(fake.commands, 'rtk', 'on');
 	await firstHook(fake).beforeToolCall?.({toolCallId: 'b2', toolName: 'shell_command', input: {command: 'git status'}});
 	assert.equal(seen.at(-1), '/late/applied/rtk', 'the value present at first use wins, not the one at factory time');
+});
+
+// Rules: measured before this fix — a typo'd --mod-option rtk-bin= pointed at nothing, and /rtk status still printed that path as the binary while the guidance block promised rewrites. A path that is not an executable file must report NOT FOUND and inject nothing, or the model is told about a capability the session does not have.
+test('rtk: a nonexistent --rtk-bin reports NOT FOUND and injects no guidance', async () => {
+	const fake = load(rtk, {flags: {'rtk-bin': '/nonexistent/rtk'}});
+	await new Promise(resolve => setTimeout(resolve, 20));
+	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /binary: NOT FOUND/);
+	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'on')), /binary was not found/);
+	assert.equal(await appends(fake), '', 'no rewrite can happen, so nothing may claim one can');
+});
+
+test('rtk: a real --rtk-bin is still reported as the binary', async () => {
+	const fake = load(rtk, {flags: {'rtk-bin': TEST_BIN}});
+	await new Promise(resolve => setTimeout(resolve, 20));
+	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /RTK: off/);
+	assert.doesNotMatch(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /NOT FOUND/);
 });

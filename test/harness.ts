@@ -37,7 +37,8 @@ export function createEventBus(): _ModEventBus {
 }
 
 export interface FakeHooks {
-	appendSystemPrompt?: () => string | undefined;
+	// Rules: the real host awaits this hook (measured in the bundled cli.mjs: `await o.appendSystemPrompt(...)`), so the fake must too, or a mod that waits for its probe would look synchronous here and wrong in production.
+	appendSystemPrompt?: () => string | undefined | Promise<string | undefined>;
 	transformInput?: (arg: {text: string}) => unknown;
 	beforeToolCall?: (arg: {toolCallId?: string; toolName: string; input: Record<string, unknown>}) => Promise<unknown>;
 	afterToolCall?: (arg: {toolCallId?: string; toolName: string; result: unknown; isError: boolean}) => Promise<unknown>;

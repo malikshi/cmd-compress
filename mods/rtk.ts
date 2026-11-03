@@ -1,19 +1,21 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, canRefilterCompressed, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
+// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, canRefilterCompressed, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, guidanceText
 // used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
 // rules: exit 2 is a deny from rtk's own contract: a message on stdout names the rule that blocked it, so it becomes a block; empty means a Claude-only deny rule the host does not own, so it passes.
 // rules: the host's own envelope — a `Found N files` header, a pagination notice, an `Exit code:` line — is split off before filtering and re-attached after. The head is re-attached byte-for-byte; the tail keeps its notice text exactly, with the blank run before it capped at one line. rtk folds those as noise; they carry the count, the truncation, and the failure.
-// rules: the emitted `rtk` is pinned to the resolved absolute path. rtk often lives in ~/.bun/bin, which the host shell may not have on PATH, so a bare name would turn a working command into `rtk: not found`.
+// rules: the emitted `rtk` is pinned to the resolved absolute path. rtk often lives in ~/.bun/bin, which the host shell may not have on PATH, so a bare name would turn a working command into `rtk: not found`. The pin is a quote-aware single pass, because rtk emits `&`, newlines, and prefix commands, and a quoted argument may contain both `rtk` and a separator.
 // rules: a rewritten shell call is skipped unless rtk left its faithful baseline — no recovery marker and a majority of `path:line:text` rows — because rtk's own never-worse guard declines to compress multi-file grep output by default.
-// agent: 2026-11-02 ported from rtk-ai/rtk hooks/pi/rtk.ts and tersio extensions/rtk
-// agent: 2026-11-02 honour exit 2 as a deny, add auto-detect output condensing for unrewritten shell calls, drop the ignored exec `timeout` for an AbortController, add gain + version reporting
+// rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
+// agent: 2026-11-02 ported from rtk-ai/rtk hooks/pi/rtk.ts and tersio extensions/rtk; honour exit 2 as a deny, add auto-detect output condensing, drop the ignored exec `timeout` for an AbortController, add gain + version reporting
 // agent: 2026-11-03 envelope-preserving filter (splitSegments + condense), pinBinary against off-PATH rtk, drop the dead `rg` mapping, consume the rewritten-call marker before every early return
 // agent: 2026-11-03 re-filter a rewritten call only when rtk declined to compress it (recovery-marker + grep-row gate, measured +33% on multi-file grep, 12 ms, 0 bytes on 12 real commands)
+// agent: 2026-11-03 pinBinary rewritten as a quote-aware scan after measuring two live bugs: `&` and newline separators it emits were left bare (a rewrite then failed as `rtk: not found` off PATH), and a `rtk` inside a quoted argument was rewritten, corrupting the argument
+// agent: 2026-11-03 an explicit rtk-bin is verified before it is reported; a typo used to print that path as the binary and inject guidance for rewrites that could never run
 
 import type {ModApi} from '@commandcode/harness';
-import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
+import {accessSync, constants, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {announceMode, filterShell, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, wrapBlock, writeOwnMode, OFF} from './shared.ts';
@@ -138,8 +140,86 @@ export function splitSegments(toolName: string, text: string): Segments {
 	return {head: '', body: text, tail: ''};
 }
 
-export type RtkVersion = {major: number; minor: number; patch: number};
+/* --------------------------------------------------------------- ansi */
 
+// Rules: a test runner or a build tool emits colour by default, and rtk's filters pass the escapes straight through — measured on 10,110 bytes of realistic coloured test output, rtk returned all 10,110 bytes with all 720 escapes intact, while the same text without them was 6,750 bytes (33.2% smaller). Colour carries nothing the model reads, so it is removed before anything else.
+// Rules: only text-carrying sequences are matched — CSI (colour, cursor), OSC (titles, hyperlinks, clipboard writes) and the two-byte escapes. Anything else is left alone rather than eaten by a pattern wide enough to swallow real output.
+// eslint-disable-next-line no-control-regex
+const ANSI = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001B]*(?:\u0007|\u001B\\)|[@-Z\\-_])/g;
+
+// Rules: the fast path matters — every large result goes through here, and most have no escape at all.
+export function stripAnsi(text: string): string {
+	return text.includes('\u001B') ? text.replace(ANSI, '') : text;
+}
+
+/* --------------------------------------------------------------- fidelity */
+
+// Rules: rtk's byte guard (`never_worse`) only asks whether the output got smaller, never whether it still says the same thing, and its auto-detect can pick the wrong filter. Measured against the real binary: a cargo-style block of 20 `error[E0xx]: cannot find value …` lines plus context came back from `rtk pipe` as 156 bytes reading `20 matches in 1F: [file] --> src/lib.rs (20):` — every one of the 20 error messages was gone, with no recovery hint. The same text is what an agent needs to fix a build.
+// Rules: the guard targets that failure, not an ideal of lossless compression. A readable filter summarises on purpose — `FAILURES (1): 1. tests::fails_here` is a good result — so the check is format-shaped instead of atom-by-atom: when rtk auto-detected and produced its grep/find grouping while the original was neither `path:line:text` rows nor a path list, the guess was wrong and the original is kept. Negation loss is refused too, since that inverts meaning and no legitimate summariser drops one.
+const NEGATION = /\b(?:not|no|never|without|cannot|can't|don't|doesn't|didn't|isn't|aren't|won't|wouldn't|shouldn't|couldn't|neither|nor)\b/gi;
+const GROUPING_MARKER = /^\s*(?:\d+ matches in \d+ files?:|\d+ files? in \d+ dirs?:)$|^\[file\]\s/m;
+
+function countOf(text: string, pattern: RegExp): number {
+	pattern.lastIndex = 0;
+	let count = 0;
+	for (const _match of text.matchAll(pattern)) count += 1;
+	return count;
+}
+
+export interface FidelityReport {
+	readonly ok: boolean;
+	readonly lost: readonly string[];
+}
+
+export function checkFidelity(original: string, filtered: string, autoDetected: boolean): FidelityReport {
+	const lost: string[] = [];
+
+	const negationsIn = countOf(original, NEGATION);
+	const negationsOut = countOf(filtered, NEGATION);
+	if (negationsOut < negationsIn) lost.push(`negation: ${negationsIn} -> ${negationsOut}`);
+
+	if (autoDetected && GROUPING_MARKER.test(filtered)) {
+		const rows = isGrepRows(original);
+		const paths = pathLineRatio(original);
+		if (!rows && paths < 0.5) lost.push('format: rtk grouped a result that was not a match list or a path list');
+	}
+
+	return {ok: lost.length === 0, lost};
+}
+
+// Rules: a find result is one path per line, so the majority test is what tells a genuine path list from a build log that happens to contain a couple of paths.
+function pathLineRatio(text: string): number {
+	const lines = text.split('\n').filter(line => line.trim());
+	if (lines.length < 2) return 0;
+	const paths = lines.filter(line => /^\s*(?:\.{0,2}\/|[\w.-]+\/)[^\s:]*$/.test(line)).length;
+	return paths / lines.length;
+}
+
+/* --------------------------------------------------------------- spill */
+
+// Rules: the host's envelope is not only at the edges. A large foreground result is truncated in the MIDDLE and given a two-line pointer there: `[... output truncated: N chars total, showing first X and last part ...]` then `[full output saved to: <path> — read it with read_file (offset/limit) or grep]` (or `[full output could not be persisted]`). Measured: a 2,951-byte pytest result carrying that pair came back from `rtk pipe` at 296 bytes with BOTH lines gone, so the model could never find the rest. The pair is lifted out before filtering and re-attached after it.
+const TRUNCATION_NOTICE = /^\[\.\.\. output truncated: [^\]\n]*\]$/;
+const SPILL_NOTICE = /^\[full output (?:saved to: [^\]\n]*|could not be persisted)\]$/;
+
+function isSpillNotice(line: string): boolean {
+	return TRUNCATION_NOTICE.test(line) || SPILL_NOTICE.test(line);
+}
+
+// Rules: split out of the body so rtk cannot fold them, and returned as one block so the caller can re-attach the pointer the model needs.
+// Rules: a notice's line is blanked, not dropped: dropping it would join the two halves the host truncated between, and a filter that reads position (a diff hunk, a numbered list) would then see a different body.
+export function extractSpillNotices(text: string): {body: string; notices: string} {
+	const kept: string[] = [];
+	const notices: string[] = [];
+	for (const line of text.split('\n')) {
+		if (isSpillNotice(line)) {
+			notices.push(line);
+			kept.push('');
+		} else kept.push(line);
+	}
+	return {body: kept.join('\n'), notices: notices.join('\n')};
+}
+
+export type RtkVersion = {major: number; minor: number; patch: number};
 // Rules: output is `rtk 1.0.1`; anything unparseable is null so the caller stays quiet rather than inventing a version.
 export function parseRtkVersion(raw: string): RtkVersion | null {
 	const match = raw.trim().match(/(\d+)\.(\d+)\.(\d+)/);
@@ -181,19 +261,115 @@ export function shouldRewrite(command: string): boolean {
 }
 
 // Rules: `rtk rewrite` answers a bare `rtk …`, which the host shell resolves from ITS PATH. This mod can find rtk in ~/.bun/bin when that directory is not on PATH, so the bare name would run as `rtk: not found` and turn a working command into a failure. Pin each command-position `rtk` to the resolved absolute path.
-// Rules: a command position is the start of a segment (`&&`, `||`, `;`, `|`), the first word after a run of `VAR=value` assignments, and the first word after a prefix command and its own arguments — rtk emits all three (`FOO=1 rtk ls`, `env FOO=1 rtk git status`, `time rtk git status`, `timeout 5 rtk git status`) because it rewrites the payload of a prefix rather than dropping it. Each prefix is matched explicitly so a program named `timeout` that is not a prefix stays intact. An argument that merely contains the word (`git commit -m "use rtk"`) is data and stays untouched.
+// Rules: the scan walks the line once, tracking quote state, so a `rtk` inside a quoted argument is data and stays untouched (`git commit -m "use rtk"`, `echo "x | rtk y"`). A regex with an alternation over the separators cannot do this: it has no idea whether the separator it just matched sits inside a quote, and pinning there corrupts the argument (`echo "x | rtk y"` became `echo "x | '/opt/rtk' y"`).
+// Rules: a command position is the start of a segment (`&&`, `||`, `;`, `|`, `&`) or a new line — rtk rewrites a multi-line block and `&` backgrounding, so both arrive from the binary itself — and either a line start, a line start after a run of `VAR=value` assignments, or one after a prefix command and its own arguments. Prefix commands are matched explicitly (`env`, `nohup`, `time`, `nice`, `command`, `exec`, `builtin`, `stdbuf`, `timeout` with its own duration) because rtk peels them rather than dropping them, and a program that merely shares the name must stay intact.
 // Rules: the quote style follows the shell that will read it. POSIX shells need single quotes (with `'\''` for an embedded one); cmd.exe has no single-quote meaning at all — it would pass the quote characters through — so Windows gets a double-quoted path instead.
-const PREFIX_COMMAND = '(?:env|nohup|time|nice|command|stdbuf)(?:[ \\t]+-{0,2}[A-Za-z0-9=_,.:/-]+)*[ \\t]+|timeout(?:[ \\t]+-{0,2}[A-Za-z0-9=_,.:/-]+)*[ \\t]+[0-9.]+[A-Za-z]*[ \\t]+';
+const PREFIX_COMMANDS = new Set(['env', 'nohup', 'time', 'nice', 'command', 'exec', 'builtin', 'stdbuf', 'timeout']);
+// Rules: a prefix flag that carries a separate value (`nice -n 5`, `env -u X`, `timeout -k 1`) must consume that value too, or the value is left as the payload and the real command is never reached. A flag written `-o0` or `--unset=X` already carries its value and consumes none.
+const VALUE_FLAGS = new Set(['-n', '-k', '-u', '-i', '-o', '-e', '-f', '-S', '-s', '-a', '-c', '--unset', '--set', '--format', '--adjustment', '--kill-after']);
+
+// Rules: `rtk` must be a whole word, so `rtk-wrapper` and `myrtk` are not pinned.
+function isCommandWordAt(line: string, start: number): boolean {
+	const next = line[start + 3];
+	return line.startsWith('rtk', start) && (next === undefined || /[\s&|;<>]/.test(next));
+}
+
+function skipSpaces(text: string, start: number): number {
+	let index = start;
+	while (index < text.length && (text[index] === ' ' || text[index] === '\t')) index += 1;
+	return index;
+}
+
+// Rules: skip past the prefix commands and assignments in front of a command, returning the index the payload starts at. Stops at the first word that is neither, so the caller compares that word against `rtk`. Only a flag that starts with `-` is a flag: without that guard `time rtk git status` had `rtk` eaten as `time`'s option and the rewrite was never pinned.
+function skipPrefixes(line: string, start: number): number {
+	let index = start;
+	for (;;) {
+		index = skipSpaces(line, index);
+		const rest = line.slice(index);
+		// Rules: `FOO=1` is tested before the bare word, because the word pattern would otherwise match its `FOO` and stop the scan at an assignment.
+		const assignment = /^[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+/.exec(rest);
+		if (assignment) {
+			index += assignment[0].length;
+			continue;
+		}
+		const word = /^[A-Za-z_][A-Za-z0-9_]*/.exec(rest)?.[0];
+		if (!word || !PREFIX_COMMANDS.has(word)) return index;
+		index += word.length;
+		for (;;) {
+			index = skipSpaces(line, index);
+			const flag = /^-{1,2}[^\s]+/.exec(line.slice(index))?.[0];
+			if (!flag) break;
+			index += flag.length;
+			if (VALUE_FLAGS.has(flag) && !flag.includes('=')) {
+				index = skipSpaces(line, index);
+				const value = /^\S+/.exec(line.slice(index))?.[0];
+				if (value) index += value.length;
+			}
+		}
+		// Rules: `timeout` takes a bare duration after its flags, which is neither a flag nor the payload.
+		if (word === 'timeout') {
+			index = skipSpaces(line, index);
+			const duration = /^[0-9.]+[A-Za-z]*/.exec(line.slice(index))?.[0];
+			if (duration) index += duration.length;
+		}
+	}
+}
 
 export function pinBinary(command: string, bin: string, platform: string = process.platform): string {
 	const quoted = platform === 'win32'
 		? `"${bin.replace(/"/g, '""')}"`
 		: `'${bin.replace(/'/g, `'\\''`)}'`;
-	const assignments = '(?:[ \\t]*[A-Za-z_][A-Za-z0-9_]*=\\S+[ \\t]+)*';
-	return command.replace(
-		new RegExp(`(^|&&|\\|\\||[;|])([ \\t]*(?:${PREFIX_COMMAND})?${assignments})rtk(?=[ \\t]|$)`, 'g'),
-		(_match, lead: string, before: string) => `${lead}${before}${quoted}`,
-	);
+	let out = '';
+	let index = 0;
+	// Rules: the command position is true at the start of the string and again after a separator, so the scan carries one flag instead of re-deriving it from a lookbehind.
+	let atCommand = true;
+	while (index < command.length) {
+		const char = command[index] ?? '';
+		if (char === "'" || char === '"') {
+			// Rules: copy the quoted span verbatim — no pinning, no separator state inside it.
+			const end = command.indexOf(char, index + 1);
+			const stop = end === -1 ? command.length : end + 1;
+			out += command.slice(index, stop);
+			index = stop;
+			continue;
+		}
+		if (atCommand && isCommandWordAt(command, index)) {
+			out += quoted;
+			index += 3;
+			atCommand = false;
+			continue;
+		}
+		if (atCommand) {
+			const payload = skipPrefixes(command, index);
+			if (payload !== index) {
+				out += command.slice(index, payload);
+				index = payload;
+				continue;
+			}
+			if (isCommandWordAt(command, index)) {
+				out += quoted;
+				index += 3;
+				atCommand = false;
+				continue;
+			}
+			atCommand = false;
+		}
+		if (char === '\\' && command[index + 1] === '\n') {
+			out += '\\\n';
+			index += 2;
+			continue;
+		}
+		if (char === '\n' || char === '&' || char === '|' || char === ';') {
+			out += char;
+			index += 1;
+			// Rules: `||` and `&&` both end a segment; one flag is enough, so a second separator is consumed by the copy above.
+			atCommand = true;
+			continue;
+		}
+		out += char;
+		index += 1;
+	}
+	return out;
 }
 
 // Rules: grouping is applied by hand because toLocaleString varies with the host locale, so the message would differ per machine.
@@ -228,6 +404,19 @@ export default function (cmd: ModApi): void {
 		return binCache.value;
 	}
 
+	// Rules: an explicit `--mod-option rtk-bin=…` is never probed, so a typo used to be reported as the binary and the guidance block promised rewrites that could never run. The probe result already gets an existence and executable check; this gives the explicit path the same one. Resolution itself stays unverified so a path that appears later still works, and this answer is only used to report status and to decide whether guidance is injected.
+	function binUsable(): boolean {
+		const bin = binPath();
+		if (!bin) return false;
+		if (bin === resolveBin('rtk')) return true;
+		try {
+			accessSync(bin, constants.X_OK);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	// Rules: the rewrite is judged against the session's rules, so it runs in the session cwd; a deny file above it is found the same way rtk finds it for any other host.
 	const cwd = typeof cmd.cwd === 'string' && cmd.cwd ? cmd.cwd : undefined;
 
@@ -237,9 +426,8 @@ export default function (cmd: ModApi): void {
 	let guidanceDecided: boolean | undefined;
 	const supported = () => isSupportedVersion(version);
 	const versionNote = () => {
-		const bin = binPath();
-		if (!bin) return 'binary: NOT FOUND';
-		if (!version) return `binary: ${bin}`;
+		if (!binUsable()) return 'binary: NOT FOUND';
+		if (!version) return `binary: ${binPath()}`;
 		const label = `${version.major}.${version.minor}.${version.patch}`;
 		return supported() ? `binary: ${label}` : `binary: ${label} (too old — need >= 0.${MIN_SUPPORTED_RTK_MINOR}.0)`;
 	};
@@ -264,6 +452,8 @@ export default function (cmd: ModApi): void {
 		return true;
 	});
 	cmd.expose('getMode', () => mode);
+	// Rules: the stored mode says what the user asked for, not what the session can do. `compress` prints one line for three mods, so it needs to know that `rtk=on` condenses nothing without a usable, new-enough binary — otherwise that line claims a capability the session does not have. The reason is returned rather than a bare boolean, because "no binary" and "too old" call for different fixes.
+	cmd.expose('inactiveReason', () => (!binUsable() ? 'no binary' : !supported() ? `rtk too old, needs >= 0.${MIN_SUPPORTED_RTK_MINOR}.0` : null));
 
 	// Rules: `cmd.exec` accepts no timeout (it ignores the option), so abort through a signal or a hung rtk blocks the tool call forever.
 	async function exec(options: {command: string; args: string[]}, timeoutMs: number) {
@@ -329,14 +519,26 @@ export default function (cmd: ModApi): void {
 	}
 
 	// Rules: only the body is condensed; the host's own header and trailer are re-attached verbatim, so an exit status or a truncation notice cannot be folded away.
+	// Rules: colour is removed from the body whether or not the rtk pass below succeeds. rtk keeps escapes, so a result it declines would otherwise arrive at full size and still carry 33% of bytes that mean nothing — the strip alone is the win on those, and it is why the byte floor is checked after it, not before.
+	// Rules: the spill pointer rides in the MIDDLE of the result, so it is lifted out before filtering and put back after. The host writes it where the elision happened; a result that lost it leaves the model with no way to reach the rest of the output, which was measured: a 2,951-byte pytest result came back at 296 bytes with both pointer lines gone.
 	async function condense(toolName: string, filter: string | null, text: string): Promise<string | null> {
 		// Rules: the shape is read from the original result, because the split below removes the very header it looks for.
 		const shapeFilter = filterForShape(toolName, filter, text);
 		const {head, body, tail} = splitSegments(toolName, text);
-		if (body.trim().length < MIN_FILTER_BYTES) return null;
-		const filtered = await filterThroughRtk(shapeFilter, body);
-		if (!filtered) return null;
-		return `${head}${filtered}${tail}`;
+		const plainBody = stripAnsi(body);
+		// Rules: the no-filter paths keep the body as it was, so a pointer that rode in the middle stays exactly where the host put it. Only the filtered path has to move it, because the bytes it referred to are gone.
+		const plainResult = () => {
+			const plain = `${head}${plainBody}${tail}`;
+			return plain.length < text.length ? plain : null;
+		};
+		if (plainBody.trim().length < MIN_FILTER_BYTES) return plainResult();
+		const {body: filterable, notices} = extractSpillNotices(plainBody);
+		const filtered = await filterThroughRtk(shapeFilter, filterable);
+		if (!filtered) return plainResult();
+		// Rules: a shorter result is not automatically a safe one. The filter is rejected when it grouped content that was neither a match list nor a path list (a wrong format guess), or when it dropped a negation, so the model keeps the original rather than a summary that lies.
+		const fidelity = checkFidelity(filterable, filtered, shapeFilter === null);
+		if (!fidelity.ok) return plainResult();
+		return `${head}${notices ? `${filtered}\n${notices}` : filtered}${tail}`;
 	}
 
 	function textOf(result: unknown): string | null {
@@ -384,7 +586,7 @@ export default function (cmd: ModApi): void {
 			}
 			if (arg !== 'on' && arg !== 'off') return {message: 'Usage: /rtk [on|off|gain|status]'};
 			setMode(arg);
-			if (arg === 'on' && !binPath()) return {message: 'RTK on, but the rtk binary was not found. Install it, then /reload.'};
+			if (arg === 'on' && !binUsable()) return {message: 'RTK on, but the rtk binary was not found. Install it, then /reload.'};
 			if (arg === 'on' && !supported()) return {message: `RTK on, but ${versionNote()}. Upgrade rtk — rewrites fall back to raw until then.`};
 			return {message: `RTK ${arg}.`};
 		},
@@ -402,10 +604,14 @@ export default function (cmd: ModApi): void {
 			void versionSettled();
 		},
 
-		// Rules: the block must be byte-stable across rounds or the provider's prompt-prefix cache misses every turn, and `onSessionStart` is fire-and-forget, so the version probe is not guaranteed to have answered before round one. The decision is therefore taken once, on the first round, and reused for the session: the probe cannot move the bytes mid-session. A mode change is the one legitimate reason for the block to change, and it is a durable input the caller actually changed.
-		appendSystemPrompt: () => {
+		// Rules: the block must be byte-stable across rounds or the provider's prompt-prefix cache misses every turn, so the decision is taken once and reused for the session. A mode change is the one legitimate reason for the block to change, and it is a durable input the caller actually changed.
+		// Rules: the version probe is awaited before the decision. `onSessionStart` starts it fire-and-forget, so the first round used to decide on `null`, and `isSupportedVersion(null)` grants the benefit of the doubt — measured: an rtk 0.0.1 session was told to use rtk for rewrites that can never run, and the wrong answer was then cached for the whole session. Awaiting keeps the bytes stable and makes them correct: the promise is memoised, so only the first call waits at all.
+		appendSystemPrompt: async () => {
 			if (mode === OFF || !binPath()) return undefined;
-			guidanceDecided ??= supported();
+			await versionSettled();
+			// Rules: the mode can change while the probe runs, in which case there is nothing left to inject.
+			if (mode === OFF) return undefined;
+			guidanceDecided ??= binUsable() && supported();
 			return guidanceDecided ? wrapBlock('rtk', GUIDANCE) : undefined;
 		},
 
@@ -438,21 +644,31 @@ export default function (cmd: ModApi): void {
 			const alreadyRewritten = wasRewritten(toolCallId);
 			if (mode === OFF || isError || !supported()) return undefined;
 			const text = textOf(result);
-			if (text === null || text.length < MIN_FILTER_BYTES) return undefined;
+			if (text === null) return undefined;
+
+			// Rules: the byte floor gates the rtk spawn, not the colour strip. A 900-byte coloured result was rejected here before, so the escapes — the only thing this pass can remove for free — reached the model; the strip costs nothing without a process.
+			// Rules: the flag that turns filtering off is checked per tool below, because a caller can disable grep/glob filtering and keep the shell pass.
+			const plain = stripAnsi(text);
 
 			// An explicit filter for a tool result that is not shell output.
 			const filter = filterNameFor(toolName);
 			if (filter) {
-				if (cmd.getFlag('rtk-filter') === false) return undefined;
+				if (cmd.getFlag('rtk-filter') === false) return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
+				if (text.length < MIN_FILTER_BYTES) return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
 				const filtered = await condense(toolName, filter, text);
 				return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 			}
 
 			// Shell output rtk did not rewrite still gets auto-detected: `npm test` has no rewrite but cargo-style output does.
 			if (toolName !== 'shell_command') return undefined;
-			if (cmd.getFlag('rtk-shell') === false) return undefined;
+			if (cmd.getFlag('rtk-shell') === false) return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
 			// Rules: a rewritten call is skipped because rtk already filtered it — except when rtk declined and left its faithful baseline, which `canRefilterCompressed` recognises. Anything carrying a recovery hint stays skipped, so a recall hash is never dropped.
-			if (alreadyRewritten && !canRefilterCompressed(text)) return undefined;
+			// Rules: the shape test reads the plain text. `path:line:text` rows with an escape before the column still match the row pattern, but a styled `+3 more files` marker would not — testing the raw bytes could let a marked result through the second pass and drop its recall hash.
+			if (alreadyRewritten && !canRefilterCompressed(plain)) {
+				// Rules: rtk filtered the body but keeps every colour escape, so the strip still applies here. It deletes only escapes, which carry no information, so the envelope and every fact survive.
+				return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
+			}
+			if (text.length < MIN_FILTER_BYTES) return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
 			const filtered = await condense(toolName, null, text);
 			return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 		},

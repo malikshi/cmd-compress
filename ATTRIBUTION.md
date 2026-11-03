@@ -80,6 +80,37 @@ binary the user installs separately. The Rust source is not copied. See the
 upstream repository for RTK's own license terms, which include a BUSL-1.1
 component covering the RTK binary.
 
+## Ideas adapted from two more projects
+
+Two sibling projects were read for what they do better than the four ports above.
+No source is copied from either; the mechanisms below were reimplemented against
+this package's own shapes.
+
+### Azertyuiop442/deepshrink — AGPL-3.0
+
+<https://github.com/Azertyuiop442/deepshrink>
+
+DeepShrink's thesis is that a compression must never change meaning, and its
+`core/commitments.ts` enforces that structurally. `mods/rtk.ts` adopts the thesis
+in a narrower form, because rtk gives no commitment report to check against: the
+filtered result is compared with the original and refused when it grouped content
+that was not a match list or a path list, or dropped a negation. The check is
+format-shaped rather than atom-by-atom (deepshrink's negation, error, URL,
+version, hash and path guard), because a readable filter summarises on purpose and
+an atom-for-atom rule rejected legitimate `find` grouping in measurement. No
+deepshrink code is used; AGPL-3.0 is noted only because these ideas came from it.
+
+### ahmadbilaldev/cmd-mod-output-trimmer — MIT
+
+<https://github.com/ahmadbilaldev/cmd-mod-output-trimmer>
+
+The trimmer strips ANSI escapes as the first step of its pipeline, and keeps the
+host's `[full output saved to: …]` pointer out of the compaction steps. Both are
+now in `mods/rtk.ts`: the strip runs on every path before rtk, measured at 33.2%
+of a coloured test result and 34.2% of a `tsc` failure, and the mid-result
+truncation pointer is lifted out before filtering and re-attached after it,
+because rtk deletes it when it compresses.
+
 ## Command Code
 
 <https://commandcode.ai/docs/mods>

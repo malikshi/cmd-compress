@@ -129,6 +129,14 @@ export function makeDeclinedBaseline(files = 6, perFile = 25): string {
 	).join('\n');
 }
 
+// Rules: a test runner or build tool writes colour by default on a TTY. Measured: rtk's filters return every one of these escapes, so the mod's strip is the only thing that removes them. The shape is tsc's, which is what an agent sees most often on a failing build.
+export function makeColoredBuildOutput(lines = 40): string {
+	const rows = Array.from({length: lines}, (_, index) =>
+		`\u001B[96msrc/module${index}.ts\u001B[0m:\u001B[93m${index + 1}\u001B[0m:\u001B[93m5\u001B[0m - \u001B[91merror\u001B[0m\u001B[90m TS2322: \u001B[0mType 'string' is not assignable to type 'number'.`,
+	);
+	return `Exit code: 2\n${rows.join('\n')}\n`;
+}
+
 export function makeShellAbortOutput(): string {
 	const body = [
 		'running 3 tests',
