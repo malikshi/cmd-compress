@@ -12,6 +12,8 @@ import {normalizePonytailLevel, PONYTAIL_STOP_PHRASES} from '../mods/ponytail.ts
 import {COMPRESS_PRESETS, presetFor} from '../mods/compress.ts';
 import {defaultBinDirs, isShellTool} from '../mods/shared.ts';
 import {shouldRewrite, filterNameFor, filterForShape, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText, pinBinary, joinForRewrite, splitRewrite} from '../mods/rtk.ts';
+import {createFakeCmd} from './harness.ts';
+import {existsSync} from 'node:fs';
 
 test('normalizeCavemanLevel: on and empty mean the default, off and stop mean off', () => {
 	assert.equal(normalizeCavemanLevel(''), 'full');
@@ -362,4 +364,11 @@ test('joinForRewrite: args are joined raw, because rtk refuses quoted ones', () 
 	assert.deepEqual(joinForRewrite('cargo', ['build']), {line: 'cargo build', suffix: ' build'});
 	assert.deepEqual(joinForRewrite('grep', ['-n', 'hello world', 'src']), {line: 'grep -n hello world src', suffix: ' -n hello world src'});
 	assert.deepEqual(joinForRewrite('git', []), {line: 'git', suffix: ''});
+});
+
+// Rules: the fake's `cwd` is the directory every spawn runs in, so it must exist. It was pinned to `/repo`, which does not, and every real exec failed ENOENT — two tests had to override cwd to work, and a rewrite looked dropped whenever a test used the fake unmodified. A later tidy-up must not reintroduce a fictional path.
+test('fake harness: cwd is a directory that exists', () => {
+	const {cmd: fake} = createFakeCmd();
+	assert.equal(typeof fake.cwd, 'string');
+	assert.ok(existsSync(fake.cwd), `harness cwd must exist, got ${fake.cwd}`);
 });

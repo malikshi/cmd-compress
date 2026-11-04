@@ -79,7 +79,8 @@ export function createFakeCmd(options: {flags?: Record<string, unknown>; exec?: 
 
 	const cmd = {
 		name: 'fake',
-		cwd: '/repo',
+		// Rules: the mod reads `cmd.cwd` for every spawn, so it must be a directory that EXISTS — a hardcoded `/repo` made every real `exec` fail ENOENT and every rewrite look dropped, and two tests had to work around it. The suite's own cwd is the only answer that stays true on every machine.
+		cwd: process.cwd(),
 		addFlag: (name: string, spec: {default?: unknown}) => {
 			if (!(name in flags)) flags[name] = spec.default;
 		},

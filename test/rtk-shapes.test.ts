@@ -15,13 +15,12 @@ import {createFakeCmd, firstHook, resultText, runHandler} from './harness.ts';
 type ExecRequest = {command: string; args?: string[]; cwd?: string; signal?: AbortSignal};
 
 // Rules: the fake drives the mod's real exec path, so this exercises the same `/bin/sh -c ... < file` redirect production uses.
-// Rules: the mod reads `cmd.cwd` for every call, and the fake harness pins it to `/repo`, which does not exist here — a spawn fails ENOENT before rtk ever runs.
 function realExec(request: ExecRequest): Promise<{stdout: string; stderr: string; code: number}> {
 	return new Promise(resolve => {
 		execFile(
 			request.command,
 			request.args ?? [],
-			{cwd: process.cwd(), signal: request.signal, timeout: 10_000, maxBuffer: 32 * 1024 * 1024},
+			{cwd: request.cwd, signal: request.signal, timeout: 10_000, maxBuffer: 32 * 1024 * 1024},
 			(error, stdout, stderr) => {
 				const code = error && typeof (error as {code?: unknown}).code === 'number' ? Number((error as {code: number}).code) : error ? 1 : 0;
 				resolve({stdout: stdout.toString(), stderr: stderr.toString(), code});
