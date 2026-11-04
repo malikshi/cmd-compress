@@ -1,9 +1,10 @@
 // caveman — reply-voice rule text, one block per level.
 // exports: CAVEMAN_LEVELS, CAVEMAN_DEFAULT, CAVEMAN_RULES, cavemanRule
-// used_by: mods/caveman.ts, mods/compress.ts, test/caveman.test.ts
+// used_by: mods/caveman.ts, mods/compress.ts, test/rules.test.ts, test/mods.behaviour.test.ts
 // related: rules/ponytail.ts
 // rules: every level's text must stand alone — the mod injects exactly one block.
-// agent: 2026-11-02 ported from JuliusBrussee/caveman (Apache-2.0) + KurutoDenzeru/tersio rule files
+// agent: unknown | unknown | 2026-11-02 | unknown | ported from JuliusBrussee/caveman (Apache-2.0) + KurutoDenzeru/tersio rule files
+// agent: unknown | xai | 2026-11-04 | 01a1a3cc | corrected the used_by test targets
 
 export const CAVEMAN_LEVELS = [
 	'lite',

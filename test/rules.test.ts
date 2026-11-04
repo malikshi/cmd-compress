@@ -3,7 +3,7 @@
 // used_by: npm test
 // related: rules/caveman.ts, rules/ponytail.ts
 // rules: a mis-ported rule that drops a negation costs more than every token it saves, so negation presence is asserted.
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';

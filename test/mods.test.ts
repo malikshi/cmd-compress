@@ -3,7 +3,7 @@
 // used_by: npm test
 // related: mods/caveman.ts, mods/ponytail.ts, mods/compress.ts, mods/rtk.ts
 // rules: these must not import the mods' factory (it reads cmd.store at load); only the pure helpers are imported.
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -299,4 +299,12 @@ test('pinBinary: a wrapper with no rtk, and rtk as data, are untouched', () => {
 	assert.equal(pinBinary('bash -c "echo hi"', bin, posix), 'bash -c "echo hi"');
 	assert.equal(pinBinary('git commit -m "use rtk"', bin, posix), 'git commit -m "use rtk"');
 	assert.equal(pinBinary('echo "x | rtk y"', bin, posix), 'echo "x | rtk y"');
+});
+
+// Rules: rtk's find/grep filters group a list and print `+N` for elided repeats, and without a recall hash those names are gone — measured: a 100-path glob came back with 50 paths and five `+10` counts. The injected guidance said "Every signal survives … Treat a condensed result as complete", which tells the model to trust an incomplete list.
+test('the guidance does not promise lossless output, because grouped lists elide names', () => {
+	const guidance = guidanceText();
+	assert.doesNotMatch(guidance, /Every signal survives/, 'the old absolute claim is gone');
+	assert.match(guidance, /elid/i, 'the elision is disclosed');
+	assert.match(guidance, /rtk recall/, 'and the recovery hint is still taught');
 });

@@ -3,8 +3,8 @@
 // used_by: npm test
 // related: mods/shared.ts
 // rules: the fake store mirrors the harness store's synchronous get / async set so the serialised writer is exercised.
-// agent: 2026-11-02 initial; per-mod key after learning each mod gets its own store file
-// agent: 2026-11-03 drop the stripBlock/shortPaths tests with the functions: the host rebuilds the append list every round, so neither had a production caller
+// agent: unknown | unknown | 2026-11-02 | unknown | initial; per-mod key after learning each mod gets its own store file
+// agent: unknown | unknown | 2026-11-03 | unknown | drop the stripBlock/shortPaths tests with the functions: the host rebuilds the append list every round, so neither had a production caller
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';

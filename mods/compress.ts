@@ -1,10 +1,13 @@
 // compress — one preset for all three modes, plus the live status line.
-// exports: default (ModFactory), COMPRESS_PRESETS, presetFor
-// used_by: package.json (commandcode.mods), test/compress.test.ts
+// exports: default, COMPRESS_PRESETS, presetFor
+// used_by: package.json (commandcode.mods), test/mods.behaviour.test.ts
 // related: mods/caveman.ts, mods/ponytail.ts, mods/rtk.ts
 // rules: a preset is applied through each mode's exposed setMode, so the three mods stay the only writers of their own state.
 // rules: status reads each sibling's getMode live; reading cmd.store would see only this mod's own file.
-// agent: 2026-11-02 ported from tersio /combo
+// rules: the footer and `/compress status` both report what is in effect, including the rtk binary annotation; the two surfaces must never disagree.
+// rules: `cmd.events.on` returns a bare unsubscribe function (not a Disposable); dispose it on session end, because the host reuses one bus across a reload.
+// agent: unknown | unknown | 2026-11-02 | unknown | ported from tersio /combo
+// agent: unknown | xai | 2026-11-04 | 01a1a3cc | footer uses the availability-annotated snapshot, and the bus subscription is released on session end
 
 import type {ModApi} from '@commandcode/harness';
 import {MODE_EVENT, MODES, type ModeName} from './shared.ts';
@@ -94,19 +97,34 @@ export default function (cmd: ModApi): void {
 	// Rules: one footer segment for all three — three segments would crowd the row the prompt already owns.
 	// Rules: repaint on the shared mode event as well as on the turn boundary. A `/caveman ultra` or a preset set from the prompt changes a sibling's mode between turns, and `onRunEnd` would leave the footer claiming the old state until the turn finished.
 	cmd.hooks({
-		onSessionStart: () => paint(),
+		onSessionStart: () => {
+			subscribe();
+			paint();
+		},
+		// Rules: the host returns a bare unsubscribe function from `cmd.events.on` (measured on 1.88.2) and reuses one bus across a reload, so a dropped return value keeps this module's paint closure alive for the rest of the session.
+		onSessionEnd: () => {
+			unsubscribe?.();
+			unsubscribe = undefined;
+		},
 		onRunEnd: () => paint(),
 	});
 
-	try {
-		cmd.events?.on(MODE_EVENT, () => paint());
-	} catch {
-		// a host without the bus keeps the turn-boundary repaint
+	let unsubscribe: (() => void) | undefined;
+	function subscribe(): void {
+		unsubscribe?.();
+		unsubscribe = undefined;
+		try {
+			unsubscribe = cmd.events?.on?.(MODE_EVENT, () => paint()) ?? undefined;
+		} catch {
+			// a host without the bus keeps the turn-boundary repaint
+		}
 	}
+	subscribe();
 
 	function paint(): void {
 		if (!cmd.ui.capabilities.status) return;
-		const state = snapshot();
+		// Rules: the footer says what is in effect, exactly as `/compress status` does. `rtk=on` alone overstates a session with no usable rtk, and the annotation names the reason because the two fixes differ.
+		const state = snapshotWithAvailability();
 		const off = state.caveman === 'off' && state.ponytail === 'off' && state.rtk === 'off';
 		cmd.ui.setStatus(off ? 'compress off' : `caveman=${state.caveman} pony=${state.ponytail} rtk=${state.rtk}`);
 	}

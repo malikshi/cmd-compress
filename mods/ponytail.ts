@@ -1,9 +1,10 @@
 // ponytail — lean-code mode: `/ponytail <level|off|status>` injects one rule block into the prompt.
-// exports: default (ModFactory), PONYTAIL_STOP_PHRASES, normalizePonytailLevel
-// used_by: package.json (commandcode.mods), mods/compress.ts, test/ponytail.test.ts
+// exports: default, PONYTAIL_STOP_PHRASES, normalizePonytailLevel
+// used_by: package.json (commandcode.mods), mods/compress.ts, test/mods.behaviour.test.ts
 // related: rules/ponytail.ts, mods/shared.ts
 // rules: exactly one level block is live at a time; the injected text is byte-stable per level so the prompt cache survives.
-// agent: 2026-11-02 ported from DietrichGebert/ponytail SKILL.md (MIT)
+// agent: unknown | unknown | 2026-11-02 | unknown | ported from DietrichGebert/ponytail SKILL.md (MIT)
+// agent: unknown | xai | 2026-11-04 | 01a1a3cc | corrected the used_by test target
 
 import type {ModApi} from '@commandcode/harness';
 import {PONYTAIL_DEFAULT, PONYTAIL_LEVELS, ponytailRule, type PonytailLevel} from '../rules/ponytail.ts';

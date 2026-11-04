@@ -3,7 +3,7 @@
 // used_by: npm test
 // related: bench/lib/stats.ts, bench/lib/fixtures.ts, bench/lib/prompts.ts, bench/prompt.ts, bench/output.ts
 // rules: the bench must not report a number it cannot reproduce, so each measurement helper is pinned by a test.
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';

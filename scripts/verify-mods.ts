@@ -5,7 +5,7 @@
 // rules: `cmd mods inspect` only reads the source text — it never imports the file or runs the factory, so a mod that throws in its factory passed every check here and in the real host. This script imports each mod and runs its factory against a stub API instead.
 // rules: the stub is local on purpose. `test/` is not in package.json's `files`, so importing the test harness here would break `npm run verify` in an installed package.
 // rules: a native dynamic import is enough — Node strips TypeScript types without a flag from 22.18.0, which is the floor package.json declares.
-// agent: 2026-11-03 replaced the inspect-only check after proving it passes a factory that throws
+// agent: unknown | unknown | 2026-11-03 | unknown | replaced the inspect-only check after proving it passes a factory that throws
 
 import {execFileSync} from 'node:child_process';
 import {readFileSync} from 'node:fs';

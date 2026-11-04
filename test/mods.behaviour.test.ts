@@ -3,7 +3,7 @@
 // used_by: npm test
 // related: test/harness.ts, mods/caveman.ts, mods/ponytail.ts, mods/rtk.ts, mods/compress.ts
 // rules: setups run each mod through its exported default factory, so the wiring and the hooks are covered, not only the pure helpers.
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,6 +14,7 @@ import caveman, {normalizeCavemanLevel} from '../mods/caveman.ts';
 import ponytail from '../mods/ponytail.ts';
 import rtk from '../mods/rtk.ts';
 import compress from '../mods/compress.ts';
+import {MODE_EVENT} from '../mods/shared.ts';
 import {createFakeCmd, firstHook, runHandler, messageOf, resultText} from './harness.ts';
 
 type Fake = ReturnType<typeof createFakeCmd>;
@@ -772,7 +773,7 @@ test('compress: a missing sibling is reported as unchanged, never as applied', (
 test('rtk: an explicit --rtk-bin is used instead of probing PATH', async () => {
 	const seen: string[] = [];
 	const fake = load(rtk, {
-		flags: {'rtk-bin': '/custom/place/rtk'},
+		flags: {'rtk-bin': process.execPath},
 		exec: async request => {
 			seen.push(request.command);
 			return {stdout: 'rtk git status', stderr: '', code: 0};
@@ -780,7 +781,7 @@ test('rtk: an explicit --rtk-bin is used instead of probing PATH', async () => {
 	});
 	runHandler(fake.commands, 'rtk', 'on');
 	await firstHook(fake).beforeToolCall?.({toolCallId: 'b1', toolName: 'shell_command', input: {command: 'git status'}});
-	assert.equal(seen[0], '/custom/place/rtk', 'the flag wins over the probe');
+	assert.equal(seen[0], process.execPath, 'the flag wins over the probe');
 });
 
 // Rules: the real host registers every mod, then applies --mod-option (measured: a probe mod read its own default in the factory and the user value only in onSessionStart). A factory-time getFlag therefore ignores --rtk-bin, which is exactly what this mod used to do. The fix defers the read, so the FIRST hook call must already see the user's path.
@@ -793,10 +794,10 @@ test('rtk: --rtk-bin set after load is honoured on the first hook call', async (
 		},
 	});
 	// the host applies the option after the factory has run: mutate the fake's flags now
-	fake.cmd.getFlag = (name: string) => (name === 'rtk-bin' ? '/late/applied/rtk' : undefined);
+	fake.cmd.getFlag = (name: string) => (name === 'rtk-bin' ? process.execPath : undefined);
 	runHandler(fake.commands, 'rtk', 'on');
 	await firstHook(fake).beforeToolCall?.({toolCallId: 'b2', toolName: 'shell_command', input: {command: 'git status'}});
-	assert.equal(seen.at(-1), '/late/applied/rtk', 'the value present at first use wins, not the one at factory time');
+	assert.equal(seen.at(-1), process.execPath, 'the value present at first use wins, not the one at factory time');
 });
 
 // Rules: measured before this fix — a typo'd --mod-option rtk-bin= pointed at nothing, and /rtk status still printed that path as the binary while the guidance block promised rewrites. A path that is not an executable file must report NOT FOUND and inject nothing, or the model is told about a capability the session does not have.
@@ -844,4 +845,59 @@ test('rtk: the powershell shell tool is rewritten and condensed like shell_comma
 	})) as {content: Array<{text: string}>} | undefined;
 	assert.ok(filtered, 'and its output is condensed too');
 	assert.ok(resultText(filtered).startsWith('Exit code: 1\n'), 'the exit status survives');
+});
+
+
+// Rules: an explicit --rtk-bin that does not exist was reported NOT FOUND by /rtk status, yet the hooks still spawned it on every qualifying call: `binPath()` returns the flag verbatim and `supported()` is true while the version probe is null. A typo must cost nothing, not one failed process per shell call.
+test('rtk: an unusable --rtk-bin spawns nothing and still strips colour', async () => {
+	let calls = 0;
+	const fake = load(rtk, {
+		flags: {'rtk-bin': '/nonexistent/rtk'},
+		exec: async () => {
+			calls += 1;
+			return {stdout: '', stderr: '', code: 1};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'u1', toolName: 'shell_command', input: {command: 'git status'}});
+	const text = `Exit code: 1\n\u001B[31mFAILED\u001B[0m\n${'x'.repeat(3000)}`;
+	const result = await firstHook(fake).afterToolCall?.({toolCallId: 'u2', toolName: 'shell_command', result: [{type: 'text', text}], isError: false});
+	assert.equal(calls, 0, 'no rewrite and no filter process may run for a path that cannot execute');
+	assert.ok(!resultText(result).includes('\u001B['), 'and the free colour strip still applies');
+});
+
+// Rules: a binary below 0.25.0 cannot rewrite, but the colour strip needs no process and was skipped too: `afterToolCall` returned early on `!supported()` before `stripAnsi`. A short coloured failure reached the model with every escape intact.
+test('rtk: a too-old binary still strips colour, since the strip needs no process', async () => {
+	const fake = load(rtk, {
+		exec: async request =>
+			request.args?.[0] === '--version' ? {stdout: 'rtk 0.20.0', stderr: '', code: 0} : {stdout: '', stderr: '', code: 1},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	firstHook(fake).onSessionStart?.();
+	await new Promise(resolve => setTimeout(resolve, 50));
+	const input = 'Exit code: 1\n\u001B[31mFAILED\u001B[0m tests::x\n';
+	const result = await firstHook(fake).afterToolCall?.({toolName: 'shell_command', result: [{type: 'text', text: input}], isError: false});
+	assert.equal(resultText(result), 'Exit code: 1\nFAILED tests::x\n');
+});
+
+// Rules: `/compress status` annotates `rtk=on` with the reason it condenses nothing, but the footer used the bare snapshot. The two surfaces must not disagree about whether rtk is actually working.
+test('compress: the footer annotates rtk=on when the binary cannot condense', () => {
+	const rtkFake = load(rtk, {flags: {'rtk-bin': '/nonexistent/rtk'}});
+	const compressFake = load(compress);
+	compressFake.cmd.use = (mod: string, name: string) => (mod === 'rtk' ? rtkFake.exposed.get('probe')?.get(name) : undefined);
+	runHandler(rtkFake.commands, 'rtk', 'on');
+	firstHook(compressFake).onRunEnd?.();
+	assert.equal(compressFake.statuses.at(-1), 'caveman=? pony=? rtk=on (no binary)');
+});
+
+// Rules: `cmd.events.on` returns a bare unsubscribe function on 1.88.2, and the host reuses one bus across a mod reload. A dropped return value retains the old module's paint closure for the whole session and repaints twice per mode change.
+test('compress: a reloaded mod releases its bus subscription', () => {
+	const fake = createFakeCmd({flags: {'rtk-bin': TEST_BIN}});
+	fake.cmd.name = 'compress';
+	compress(fake.cmd as never);
+	firstHook(fake).onSessionEnd?.();
+	compress(fake.cmd as never);
+	fake.statuses.length = 0;
+	fake.cmd.events.emit(MODE_EVENT);
+	assert.equal(fake.statuses.length, 1, 'only the live factory repaints after the old one ended');
 });

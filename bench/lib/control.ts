@@ -3,7 +3,7 @@
 // used_by: bench/prompt.ts (as --mod for the control case)
 // related: bench/lib/prompts.ts
 // rules: the control injects an instruction, not a mode — it exists to separate "shorter" from "caveman".
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 import type {ModApi} from '@commandcode/harness';
 

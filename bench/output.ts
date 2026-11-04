@@ -4,7 +4,7 @@
 // related: bench/lib/fixtures.ts, mods/rtk.ts, rules/caveman.ts, rules/ponytail.ts
 // rules: prompt overhead is counted per turn, so a mode that shrinks replies can still cost more overall.
 // rules: a 0% row is reported, never hidden — rtk declines a regrouping larger than its input, and that is a finding.
-// agent: 2026-11-02 initial; split grep into clustered and scattered after learning rtk's never_worse guard
+// agent: unknown | unknown | 2026-11-02 | unknown | initial; split grep into clustered and scattered after learning rtk's never_worse guard
 
 import {execFileSync} from 'node:child_process';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';

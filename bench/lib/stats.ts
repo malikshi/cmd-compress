@@ -3,7 +3,7 @@
 // used_by: bench/output.ts, bench/prompt.ts
 // related: docs/BENCHMARK.md
 // rules: an estimate is always labelled as one — only live session usage is reported as tokens.
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 export function median(values: readonly number[]): number {
 	if (values.length === 0) return 0;

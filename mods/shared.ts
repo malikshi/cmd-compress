@@ -4,9 +4,9 @@
 // related: rules/caveman.ts, rules/ponytail.ts
 // rules: cmd.store is namespaced per mod, so a mod persists ONLY its own key; a sibling's mode is read through cmd.use.
 // rules: prompt text must be byte-stable per mode so the provider prefix cache survives across rounds.
-// agent: 2026-11-02 initial — per-mod store key after learning each mod gets its own file
-// agent: 2026-11-03 turnOffSiblings — "normal mode" must end every mode, and transformInput short-circuits on handled
-// agent: 2026-11-03 announceMode + MODE_EVENT so the compress status repaints on any mode change; drop promptHas, which no caller or test ever referenced
+// agent: unknown | unknown | 2026-11-02 | unknown | initial — per-mod store key after learning each mod gets its own file
+// agent: unknown | unknown | 2026-11-03 | unknown | turnOffSiblings — "normal mode" must end every mode, and transformInput short-circuits on handled
+// agent: unknown | unknown | 2026-11-03 | unknown | announceMode + MODE_EVENT so the compress status repaints on any mode change; drop promptHas, which no caller or test ever referenced
 
 import {accessSync, constants, existsSync} from 'node:fs';
 import {delimiter, join} from 'node:path';

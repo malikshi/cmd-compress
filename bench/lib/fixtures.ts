@@ -5,7 +5,7 @@
 // rules: output is generated from a fixed seed and sorted, so two machines measure identical bytes.
 // rules: grep is measured in two shapes — clustered (few files, many hits) and scattered (many files, one hit).
 // rules: the scattered shape exists because rtk declines a regrouping that is larger than its input; one shape alone would hide that.
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 // Rules: a tiny LCG keeps the fixture stable across Node versions; Math.random would not.
 function seedRandom(seed: number): () => number {

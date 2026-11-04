@@ -1,9 +1,10 @@
 // ponytail — lean-code rule text, one block per level.
 // exports: PONYTAIL_LEVELS, PONYTAIL_DEFAULT, PONYTAIL_RULES, PONYTAIL_MARKER, ponytailRule
-// used_by: mods/ponytail.ts, mods/compress.ts, test/ponytail.test.ts
+// used_by: mods/ponytail.ts, mods/compress.ts, test/rules.test.ts, test/mods.behaviour.test.ts
 // related: rules/caveman.ts
 // rules: PONYTAIL_MARKER must appear verbatim in every block — the mod uses it to detect a stale block.
-// agent: 2026-11-02 ported from DietrichGebert/ponytail SKILL.md (MIT) and tersio ponytail-instructions.ts
+// agent: unknown | unknown | 2026-11-02 | unknown | ported from DietrichGebert/ponytail SKILL.md (MIT) and tersio ponytail-instructions.ts
+// agent: unknown | xai | 2026-11-04 | 01a1a3cc | corrected the used_by test targets
 
 export const PONYTAIL_LEVELS = ['lite', 'full', 'ultra'] as const;
 

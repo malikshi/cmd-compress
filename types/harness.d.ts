@@ -1,11 +1,12 @@
 // harness.d.ts — the slice of the Command Code mod API these mods compile against.
 //
-// exports: (module '@commandcode/harness') ModApi, ModHooks, ModCommand, ModFlag, ModUi, ModStoreApi, ModSessionControls
+// exports: (module '@commandcode/harness') ModApi, ModHooks, ModCommand, ModFlag, ModUi, ModStoreApi
 // used_by: mods/*.ts, bench/lib/control.ts, test/harness.ts [cascade]
 // related: tsconfig.json, https://commandcode.ai/docs/mods
 // rules: mirrors only the surface a mod may call; the field list and semantics are taken verbatim from the bundled mod-builder reference (reference/api.md, reference/hooks-and-events.md), because Command Code ships no type declarations of its own.
 // rules: a hook's return type is the contract the host enforces — an unknown field is a silently ignored no-op at runtime, so it must be a type error here instead.
-// agent: 2026-11-03 initial — typed the surface the four mods actually use, so `tsc --noEmit` can catch a runtime-silent mistake.
+// agent: unknown | unknown | 2026-11-03 | unknown | initial — typed the surface the four mods actually use, so `tsc --noEmit` can catch a runtime-silent mistake.
+// agent: unknown | xai | 2026-11-04 | 01a1a3cc | ModEventBus.on returns the bare unsubscribe function the host really returns
 
 declare module '@commandcode/harness' {
 	export type ModFactory = (cmd: ModApi) => void | Promise<void>;
@@ -110,9 +111,10 @@ declare module '@commandcode/harness' {
 	/* ------------------------------------------------------------ events */
 
 	// Rules: the host's cross-mod bus. `emit(channel, data?)` / `on(channel, handler)`; a handler throw is swallowed by the host, so it can never break a sibling.
+	// Rules: `on` returns a bare unsubscribe function, not a Disposable — measured on Command Code 1.88.2. Calling `.dispose()` on it would throw.
 	export interface ModEventBus {
 		emit(channel: string, data?: unknown): void;
-		on(channel: string, handler: (data?: unknown) => void): Disposable;
+		on(channel: string, handler: (data?: unknown) => void): () => void;
 	}
 
 	/* ------------------------------------------------------------ api */

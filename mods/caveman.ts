@@ -1,9 +1,10 @@
 // caveman — terse-reply mode: `/caveman <level|off|status>` injects one rule block into the prompt.
-// exports: default (ModFactory), CAVEMAN_STOP_PHRASES, normalizeCavemanLevel
-// used_by: package.json (commandcode.mods), mods/compress.ts, test/caveman.test.ts
+// exports: default, CAVEMAN_STOP_PHRASES, normalizeCavemanLevel
+// used_by: package.json (commandcode.mods), mods/compress.ts, test/mods.behaviour.test.ts
 // related: rules/caveman.ts, mods/shared.ts
 // rules: exactly one level block is live at a time; the injected text is byte-stable per level so the prompt cache survives.
-// agent: 2026-11-02 ported from JuliusBrussee/caveman + tersio caveman extension
+// agent: unknown | unknown | 2026-11-02 | unknown | ported from JuliusBrussee/caveman + tersio caveman extension
+// agent: unknown | xai | 2026-11-04 | 01a1a3cc | corrected the used_by test target
 
 import type {ModApi} from '@commandcode/harness';
 import {CAVEMAN_DEFAULT, CAVEMAN_LEVELS, cavemanRule, type CavemanLevel} from '../rules/caveman.ts';

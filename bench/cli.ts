@@ -1,16 +1,18 @@
 // bench/cli.ts — the two entry points: the exact output bench and the live prompt bench.
-// exports: none (run directly)
+// exports: none
 // used_by: npm run bench, npm run bench:prompt
 // related: bench/output.ts, bench/prompt.ts
 // rules: the output bench always runs; the live bench costs real tokens, so it only runs when asked.
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
+// agent: unknown | xai | 2026-11-04 | 01a1a3cc | ROOT uses fileURLToPath, so a checkout path with a space is not percent-encoded
 
 import {writeFileSync} from 'node:fs';
 import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {runOutputBench, writeOutputResult} from './output.ts';
 import {runPromptBench, writePromptResult} from './prompt.ts';
 
-const ROOT = new URL('..', import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 function write(name: string, body: string): void {
 	const target = join(ROOT, 'bench', 'results', name);

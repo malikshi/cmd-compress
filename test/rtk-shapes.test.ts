@@ -3,11 +3,13 @@
 // used_by: npm test
 // related: mods/rtk.ts
 // rules: Command Code's own tool output is not rtk's fixture — grep and glob wrap their body in a header or a trailer, and shell_command prefixes an exit status. A filter that folds those away deletes information the model needs, so each shape is pinned here against the installed rtk.
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile, execFileSync} from 'node:child_process';
-import rtk, {canRefilterCompressed, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
+import {readFileSync} from 'node:fs';
+import rtk, {canRefilterCompressed, checkFidelity, hasGrepContext, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
 import {createFakeCmd, firstHook, resultText, runHandler} from './harness.ts';
 
 type ExecRequest = {command: string; args?: string[]; cwd?: string; signal?: AbortSignal};
@@ -679,4 +681,70 @@ test('a path containing -N- is not mistaken for grep context', async () => {
 
 	const mixed = `${rows}\nsrc/v2-feat-12-bar1.ts\nnotes-for-2024-summary.ts`;
 	assert.equal(hasGrepContext(mixed), false, 'unrelated path-shaped lines are not context for a known match path');
+});
+
+/* ------------------------------------ consecutive notices, windows rows, never-worse */
+
+// Rules: `formatResult2` appends the cwd note and THEN the PowerShell edition banner, so a shell result can end with two consecutive notice lines. Only the last one was split off, and rtk folded the earlier one away with the body — measured: in=2209 out=2059, cwd note kept=false, edition kept=true. Losing the cwd note can leave the model thinking the next command runs in the project root.
+test('splitSegments: every consecutive host notice is split off, not only the last', () => {
+	const cwd = '[cwd change to /tmp scanned: next call starts from the project directory]';
+	const banner = '[PowerShell edition: Windows PowerShell 5.1]';
+	const split = splitSegments('shell_command', `Exit code: 1\nbody line\n${cwd}\n${banner}`);
+	assert.equal(split.head, 'Exit code: 1\n');
+	assert.equal(split.body, 'body line', 'neither notice reaches the filtered body');
+	assert.equal(split.tail, `\n${cwd}\n${banner}`, 'both notices are re-attached in order');
+});
+
+// Rules: ripgrep on Windows prints `C:\src\a.ts:12:text`; the old row pattern stopped at the drive colon, so the context-loss guard never fired and rtk's grep filter could drop every `path-line-text` context line. The drive prefix is optional so POSIX rows are unchanged.
+test('grep rows: Windows drive-letter paths are recognised, so context loss is refused', () => {
+	const rows = [
+		'C:\\src\\a.ts:12: hit',
+		'C:\\src\\a.ts:13: hit',
+		'C:\\src\\a.ts-14- ctx',
+	].join('\n');
+	assert.equal(isGrepRows(rows), true, 'a drive-letter match row is a grep row');
+	assert.equal(hasGrepContext(rows), true, 'its -N- context line is recognised');
+	const grouped = '3 matches in 1F:\n\n[file] C:\\src\\a.ts (3):\n 12: hit';
+	const report = checkFidelity(rows, grouped, false);
+	assert.equal(report.ok, false, 'the explicit grep filter is refused when context would be lost');
+	assert.match(report.lost.join(' '), /context/);
+});
+
+// Rules: the fidelity guard's path-list test required a forward slash, so a Windows path list grouped by the find filter was refused as a wrong format guess and the 73% glob win never applied there.
+test('fidelity: a Windows path list grouped by the find filter is accepted', () => {
+	const paths = ['C:\\src\\a.ts', 'C:\\src\\b.ts'].join('\n');
+	assert.equal(checkFidelity(paths, '2 files in 1 dirs:\n\nC:\\src\\ (2)', true).ok, true);
+});
+
+// Rules: rtk only promises the filtered body is smaller, not the reassembled result. With two mid-result spill notices moved to the end, the re-attached newline can make the result one byte larger than the original. The mod promises never-worse, so the original must win.
+test('condense: a filtered result that would be larger than the original is rejected', async () => {
+	const exec = async (request: ExecRequest) => {
+		if (request.args?.[0] === '--version') return {stdout: 'rtk 1.1.0', stderr: '', code: 0};
+		const tail = request.args?.at(-1) ?? '';
+		const script = process.platform === 'win32' ? readFileSync(tail, 'utf8') : tail;
+		const file = /< "([^"]+)"/.exec(script)?.[1];
+		const body = file ? readFileSync(file, 'utf8') : '';
+		return {stdout: body.slice(0, -1), stderr: '', code: 0};
+	};
+	const fake = createFakeCmd({exec, flags: {'rtk-bin': process.execPath}});
+	fake.cmd.name = 'probe';
+	rtk(fake.cmd as never);
+	firstHook(fake).onSessionStart?.();
+	await new Promise(resolve => setTimeout(resolve, 50));
+	runHandler(fake.commands, 'rtk', 'on');
+
+	const truncation = '[... output truncated: 900000 chars total, showing first 12000 and last part ...]';
+	const pointer = '[full output saved to: /tmp/x.log — read it with read_file (offset/limit) or grep]';
+	const body = [
+		'test result: FAILED. 1 failed',
+		truncation,
+		pointer,
+		...Array.from({length: 60}, (_, index) => `note line ${index} that a filter folds away`),
+	].join('\n');
+	const input = `Exit code: 1\n${body}`;
+	const result = await firstHook(fake).afterToolCall?.({toolName: 'shell_command', result: [{type: 'text', text: input}], isError: false});
+	if (result !== undefined) {
+		assert.ok(resultText(result).length <= input.length, 'a filter may never return a larger result');
+	}
+	assert.equal(result, undefined, 'the original is smaller, so it is the only valid answer');
 });

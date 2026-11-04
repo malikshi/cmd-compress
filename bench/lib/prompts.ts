@@ -4,7 +4,7 @@
 // related: docs/BENCHMARK.md
 // rules: prompts are fixed and versioned here so two people measure the same thing.
 // rules: the keyword gate is lexical substring matching, stated as such — it is a floor, not a judge.
-// agent: 2026-11-02 initial, prompts taken from tersio docs/BENCHMARK_GUIDE.md §7
+// agent: unknown | unknown | 2026-11-02 | unknown | initial, prompts taken from tersio docs/BENCHMARK_GUIDE.md §7
 
 export interface ProsePrompt {
 	readonly id: string;

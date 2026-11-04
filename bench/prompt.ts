@@ -5,7 +5,7 @@
 // rules: every case is measured in a fresh process with the same prompts, so the only variable is the mode.
 // rules: a case with fewer than MIN_RUNS samples is reported as partial, never as a clean median.
 // rules: output tokens are the model's generated text; input tokens are reported separately and include the mode's block.
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 import {execFileSync} from 'node:child_process';
 import {CODE_PROMPTS, PROMPT_BUDGET, PROSE_OPEN, PROSE_PROMPTS, checkCode, checkProse} from './lib/prompts.ts';

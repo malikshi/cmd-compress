@@ -3,7 +3,7 @@
 // used_by: test/mods.behaviour.test.ts
 // related: mods/caveman.ts, mods/ponytail.ts, mods/rtk.ts, mods/compress.ts
 // rules: the fake mirrors only the surface these mods touch (store/expose/use/hooks/commands/flags/exec/ui), so a mod reaching further fails loudly.
-// agent: 2026-11-02 initial
+// agent: unknown | unknown | 2026-11-02 | unknown | initial
 
 import type {ModEventBus as _ModEventBus} from '@commandcode/harness';
 
@@ -27,11 +27,14 @@ export function createEventBus(): _ModEventBus {
 				}
 			}
 		},
+		// Rules: the real host returns a bare unsubscribe function here, not a Disposable (measured on 1.88.2). The fake must match, or a mod that calls the return value crashes only in production.
 		on: (channel: string, handler: (data?: unknown) => void) => {
 			const set = channels.get(channel) ?? new Set();
 			set.add(handler);
 			channels.set(channel, set);
-			return {dispose: () => set.delete(handler)};
+			return () => {
+				set.delete(handler);
+			};
 		},
 	};
 }
@@ -43,6 +46,7 @@ export interface FakeHooks {
 	beforeToolCall?: (arg: {toolCallId?: string; toolName: string; input: Record<string, unknown>}) => Promise<unknown>;
 	afterToolCall?: (arg: {toolCallId?: string; toolName: string; result: unknown; isError: boolean}) => Promise<unknown>;
 	onSessionStart?: () => void;
+	onSessionEnd?: () => void;
 	onRunEnd?: () => void;
 }
 

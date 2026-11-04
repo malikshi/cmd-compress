@@ -14,7 +14,7 @@ Every mode is **off by default**. Nothing changes until you turn it on, and the 
 ## Install
 
 ```bash
-cmd mods add owner/cmd-compress          # GitHub
+cmd mods add malikshi/cmd-compress        # GitHub
 cmd mods add ./cmd-compress              # a local checkout
 cmd mods add cmd-compress                # npm, once published
 ```
@@ -143,7 +143,7 @@ Each mod is one file, default-exporting a factory that registers a slash command
 |---|---|
 | `caveman` | `appendSystemPrompt`, `transformInput` (the stop phrase), `onSessionStart` (the flag) |
 | `ponytail` | `appendSystemPrompt`, `transformInput`, `onSessionStart` |
-| `rtk` | `appendSystemPrompt`, `beforeToolCall` (the rewrite and the deny), `afterToolCall` (grep/glob and the shell auto-detect), `onSessionStart` (flag + version probe) |
+| `rtk` | `appendSystemPrompt`, `transformInput` (the `normal mode` fallback), `beforeToolCall` (the rewrite and the deny), `afterToolCall` (grep/glob and the shell auto-detect), `onSessionStart` (flag + version probe) |
 | `compress` | `onSessionStart`, `onRunEnd` (the footer status), plus an `events.on` subscription so the footer also repaints the moment a sibling mode changes |
 
 Three details worth knowing if you fork this:
@@ -189,7 +189,8 @@ The exact, quotable numbers are the filter bytes and the prompt overhead. The li
 - **Caveman does not shorten tool output.** It changes the reply voice. Shell output is rtk's job.
 - **Caveman may not shorten replies at all on your model.** Measured here, only `ultra` saved (~12%) and `full` cost tokens in both runs. Treat the mode names as voice settings, not as a savings guarantee.
 - **The live benchmark cannot rank modes tightly.** Two runs of the same configuration disagreed on 5 of 9 cases. Quote the filter bytes and the prompt overhead; treat reply-token deltas as directional.
-- **The rtk filter is heuristic and declines rather than mangles.** `rtk pipe` refuses anything larger than its input (`never_worse`), so a scattered grep result comes back byte-identical instead of worse — measured at 0.0% on 240 matches across 240 files. A very unusual layout can still read worse; `rtk` mode is off by default and `/rtk off` stops it immediately. The host envelope — header, pagination notice, exit status — is split off before filtering and re-attached verbatim, so those lines are never at risk.
+- **The rtk filter is heuristic and declines rather than mangles.** `rtk pipe` refuses anything larger than its input (`never_worse`), so a scattered grep result comes back byte-identical instead of worse — measured at 0.0% on 240 matches across 240 files. A very unusual layout can still read worse; `rtk` mode is off by default and `/rtk off` stops it immediately. The host envelope — header, pagination notice, exit status, cwd note, PowerShell banner — is split off before filtering and re-attached verbatim, so those lines are never at risk.
+- **A grouped list can elide repeated names.** rtk's find and grep filters print `+N` for repeated paths or matches; when the full output was not stored, those names cannot be recovered from a `rtk recall` hash, and the count is all that remains. The injected guidance says so. When you need every name, re-run unfiltered or narrow the pattern, or set `--mod-option rtk-filter=false` for the session.
 - **The extra shell pass costs a process.** Measured here, 11–17 ms per qualifying result on a warm page cache. Below 1200 bytes the filter never runs, and `/rtk-shell=false` turns the pass off while keeping rewrites. The colour strip is separate and free: it needs no process, so it runs on every result at any size.
 - **A rewrite costs rtk's own startup.** `rtk rewrite` is a process spawn; measured here at a median of 72 ms per command that has an equivalent, and 13–37 ms for one that defers. That is rtk's cost, not this mod's — tersio pays it too. `/rtk off` removes it entirely.
 - **A compressed reply can read as curt.** That is the mode working. `/caveman off` restores normal prose mid-session.
@@ -226,8 +227,8 @@ types/
   harness.d.ts     the mod API slice the package compiles against
 bench/            exact (bytes) + live (reply tokens) benchmarks
 docs/             BENCHMARK.md, BENCHMARK-RESULTS.md
-test/              168 tests; 20 drive the real rtk binary and skip when it is absent,
-                   the rest use a fake ModApi so they run without one
+test/              the suite drives each mod through its exported factory; the rtk-shape
+                   tests use the real binary when installed and skip when it is absent
 ```
 
 ## Attribution

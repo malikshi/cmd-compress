@@ -1,20 +1,22 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default (ModFactory), REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, hasGrepContext, canRefilterCompressed, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, joinForRewrite, splitRewrite, guidanceText
+// exports: default, REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, hasGrepContext, canRefilterCompressed, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, joinForRewrite, splitRewrite, guidanceText
 // used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
 // rules: exit 2 is a deny from rtk's own contract: a message on stdout names the rule that blocked it, so it becomes a block; empty means a Claude-only deny rule the host does not own, so it passes.
 // rules: the host's own envelope — a `Found N files` header, a pagination notice, an `Exit code:` line — is split off before filtering and re-attached after. The head is re-attached byte-for-byte; the tail keeps its notice text exactly, with the blank run before it capped at one line. rtk folds those as noise; they carry the count, the truncation, and the failure.
+// rules: a shell result can end with two consecutive notices (the cwd note, then the PowerShell edition banner); every consecutive notice is split off, never just the last, or rtk deletes the earlier one with the body.
+// rules: never return a reassembled result larger than the original. rtk's never-worse guard covers only the body it saw; the envelope and re-attached notices can add bytes.
 // rules: the emitted `rtk` is pinned to the resolved absolute path. rtk ships to ~/.local/bin (its installer default), ~/.bun/bin or ~/.cargo/bin, and a GUI host often has none of them on PATH, so a bare name would turn a working command into `rtk: not found`. The pin is a quote-aware single pass, because rtk emits `&`, newlines, and prefix commands, and a quoted argument may contain both `rtk` and a separator. The one quoted form it does reach into is a shell wrapper's script (`bash -c "rtk …"`), which rtk rewrites and which is a command line in its own right.
 // rules: `shell_command` and `powershell` are both shell tools with the same result envelope, so every path keys off `isShellTool`, not the one name — a Windows session would otherwise get no rewrite and no condensing at all.
 // rules: a rewritten shell call is skipped unless rtk left its faithful baseline — no recovery marker and a majority of `path:line:text` rows — because rtk's own never-worse guard declines to compress multi-file grep output by default.
 // rules: `shell_command`'s `args` array is part of the command line the host runs, so the rewrite sees it; a `-A/-B/-C` grep result is never handed to rtk's grep filter, which keeps only match rows and would silently drop the context the caller asked for.
 // rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
-// agent: 2026-11-03 envelope-preserving filter (splitSegments + condense), pinBinary against off-PATH rtk, drop the dead `rg` mapping, consume the rewritten-call marker before every early return
-// agent: 2026-11-03 re-filter a rewritten call only when rtk declined to compress it (recovery-marker + grep-row gate, measured +33% on multi-file grep, 12 ms, 0 bytes on 12 real commands)
-// agent: 2026-11-03 pinBinary rewritten as a quote-aware scan after measuring two live bugs: `&` and newline separators it emits were left bare (a rewrite then failed as `rtk: not found` off PATH), and a `rtk` inside a quoted argument was rewritten, corrupting the argument
-// agent: 2026-11-03 inspect rtk 1.1.0 against the mod: cover the `powershell` shell tool, accept rtk's abbreviated `NF:` grouping header in both the recovery and fidelity markers, and probe every documented install dir (rtk's own installer writes ~/.local/bin, not ~/.bun/bin)
-// agent: 2026-11-03 two measured defects: `shell_command`'s `args` were never part of the rewrite lookup (every compound call missed), and a `-A/-B/-C` grep result had its context rows silently dropped by rtk's grep filter; forcing a filter on misdetected text measured destructive, so auto-detect stays
+// agent: unknown | unknown | 2026-11-03 | unknown | re-filter a rewritten call only when rtk declined to compress it (recovery-marker + grep-row gate, measured +33% on multi-file grep, 12 ms, 0 bytes on 12 real commands)
+// agent: unknown | unknown | 2026-11-03 | unknown | pinBinary rewritten as a quote-aware scan after measuring two live bugs: `&` and newline separators it emits were left bare (a rewrite then failed as `rtk: not found` off PATH), and a `rtk` inside a quoted argument was rewritten, corrupting the argument
+// agent: unknown | unknown | 2026-11-03 | unknown | inspect rtk 1.1.0 against the mod: cover the `powershell` shell tool, accept rtk's abbreviated `NF:` grouping header in both the recovery and fidelity markers, and probe every documented install dir (rtk's own installer writes ~/.local/bin, not ~/.bun/bin)
+// agent: unknown | unknown | 2026-11-03 | unknown | two measured defects: `shell_command`'s `args` were never part of the rewrite lookup (every compound call missed), and a `-A/-B/-C` grep result had its context rows silently dropped by rtk's grep filter; forcing a filter on misdetected text measured destructive, so auto-detect stays
+// agent: unknown | xai | 2026-11-04 | 01a1a3cc | review fixes: split every consecutive host notice, recognise Windows drive-letter grep rows, refuse an inflated reassembly, and gate spawns on an executable binary without suppressing the colour strip
 
 import type {ModApi} from '@commandcode/harness';
 import {accessSync, constants, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -49,19 +51,18 @@ export interface Segments {
 
 // Rules: the last lines of a Command Code result often carry the truth the body hides. Each form is taken from the host's own formatter, not guessed: grep's content mode closes with `[Showing results with pagination = …]`, its count mode with `Found N total occurrences across M files[ with pagination = …].`, and the grep tool times out with `[Search timed out — …]`; glob closes with `(Results are truncated: …)` or `(Search timed out …)`; a `shell_command` that ends early appends `Command aborted` or `Command timed out after Nms (exit code 124). …`, and `formatResult2` puts the cwd note and the PowerShell edition banner after the output. rtk folds all of them away as noise, so they are cut off before the filter and re-attached after it.
 // Rules: anchored to the end of the whole result, not to any line end — a notice that merely appears mid-output is body text and must be filtered with it.
-// Rules: every notice is a SINGLE line, and it is the last non-blank line of the result, so the pattern is matched sticky at that line's start instead of scanning for it. A leading `\n*` plus a trailing `[\s]*$` made the engine retry every offset and re-scan the tail each time, which is quadratic in a long blank run: measured 825 ms at 20k newlines and 9.8 s at 60k, on a result the session is blocked on. Stripping the blank padding first makes it one pass.
-const TRAILER = new RegExp(
-	'(?:' +
-		'\\[(?:Showing results with pagination|Search timed out)[^\\]\\n]*\\]' +
-		'|\\(Results are truncated: [^)\\n]*\\)' +
-		'|\\(Search timed out[^)\\n]*\\)' +
-		'|\\[cwd change to [^\\]\\n]*\\]' +
-		'|\\[PowerShell edition: [^\\]\\n]*\\]' +
-		'|Found \\d+ total occurrences? across \\d+ files?(?: with pagination = [^\\n]*)?\\.' +
-		'|Command (?:aborted|timed out after [^\\n]*)' +
-		')$',
-	'y',
-);
+// Rules: every notice is a SINGLE line at the end of the result. A leading `\n*` plus a trailing `[\s]*$` made the engine retry every offset and re-scan the tail each time, which is quadratic in a long blank run: measured 825 ms at 20k newlines and 9.8 s at 60k, on a result the session is blocked on. Stripping the blank padding first makes it one pass.
+const NOTICE_SOURCE =
+	'\\[(?:Showing results with pagination|Search timed out)[^\\]\\n]*\\]' +
+	'|\\(Results are truncated: [^)\\n]*\\)' +
+	'|\\(Search timed out[^)\\n]*\\)' +
+	'|\\[cwd change to [^\\]\\n]*\\]' +
+	'|\\[PowerShell edition: [^\\]\\n]*\\]' +
+	'|Found \\d+ total occurrences? across \\d+ files?(?: with pagination = [^\\n]*)?\\.' +
+	'|Command (?:aborted|timed out after [^\\n]*)';
+
+// Rules: the host appends more than one notice to some results (`formatResult2` writes the cwd note, then the PowerShell edition banner), so a single match would leave the earlier notice in the body for rtk to fold away. The shared source feeds the whole-line test.
+const NOTICE_LINE = new RegExp(`^(?:${NOTICE_SOURCE})$`);
 
 // Rules: `formatResult2` puts the exit status and the signal on the first lines, before any output, and follows the exit status with a parenthesised interpretation (`(No matches found)`, `(test failure)`). Both are host words, not output, and rtk drops them, so they are split with the head. The interpretation is only recognised directly after an `Exit code:` line, so a body that happens to start with a parenthesis is not eaten.
 const SHELL_HEAD = /^(?:(?:(?:Exit code|Signal):[^\n]*\n)(?:\([^)\n]*\)\n)?)+/;
@@ -73,14 +74,19 @@ export function findTrailer(text: string): {index: number; match: string; blank:
 	if (end === 0) return null;
 	// Rules: trailing whitespace after the notice must be trimmed before matching, or the notice is missed and rtk folds it away with the body. The old pattern consumed it with `[\s]*$`; doing it here keeps the match to one pass.
 	const trimmed = text.slice(0, end);
-	const lineStart = trimmed.lastIndexOf('\n') + 1;
-	TRAILER.lastIndex = lineStart;
-	const match = TRAILER.exec(trimmed);
-	if (!match) return null;
-	let runStart = lineStart;
+	let first = trimmed.lastIndexOf('\n') + 1;
+	if (!NOTICE_LINE.test(trimmed.slice(first))) return null;
+	// Rules: consume every consecutive notice line, not just the last. A shell result can carry a cwd note followed by the PowerShell banner; splitting only the banner feeds the note to rtk, which deletes it.
+	while (first > 0) {
+		const prevEnd = first - 1;
+		const prevStart = trimmed.lastIndexOf('\n', prevEnd - 1) + 1;
+		if (!NOTICE_LINE.test(trimmed.slice(prevStart, prevEnd))) break;
+		first = prevStart;
+	}
+	let runStart = first;
 	while (runStart > 0 && trimmed[runStart - 1] === '\n') runStart -= 1;
-	const blank = lineStart - runStart >= 2 ? '\n\n' : '\n';
-	return {index: runStart, match: match[0], blank};
+	const blank = first - runStart >= 2 ? '\n\n' : '\n';
+	return {index: runStart, match: trimmed.slice(first), blank};
 }
 
 // Rules: `glob` prints `Found N files` and then one indented path per line. The find filter reads that header line as a path, so it is split off rather than fed in.
@@ -91,7 +97,8 @@ const RECOVERY_MARKER = /\bmatches in \d+(?: files?|F):|\+\d+ more|\+ \.\.\. mor
 
 // Rules: rtk's search filter prints its faithful baseline whenever capping would not shrink the output, which is the normal case for a multi-file grep (measured 4,026 -> 4,026 bytes). That baseline is exempt from the filter by construction, so a shell call rtk rewrote can still arrive uncompressed.
 // Rules: the rows are recognised by shape — `path:line:text` — and a majority is required, so a diff, a log, or a build log that happens to contain one such line is not mistaken for a match list.
-const GREP_ROW = /^[^\s:][^:\n]*:\d+:[^\n]*$/;
+// Rules: a Windows match row is `C:\src\a.ts:12:text`; the drive colon is consumed explicitly so the rest of the path may not hide one. A bare `.*` would also read `http://host:8080:x` as a row. Own match on the same pattern so the path can be read back for the context test.
+const GREP_ROW = /^((?:[A-Za-z]:[\\/])?[^\s:][^:\n]*):\d+:[^\n]*$/;
 export function isGrepRows(text: string): boolean {
 	const lines = text.split('\n').filter(line => line.trim());
 	if (lines.length < 2) return false;
@@ -108,7 +115,8 @@ export function hasGrepContext(text: string): boolean {
 	const lines = text.split('\n').filter(line => line.trim());
 	const knownPaths = new Set<string>();
 	for (const line of lines) {
-		if (GREP_ROW.test(line)) knownPaths.add(line.slice(0, line.indexOf(':')));
+		const path = GREP_ROW.exec(line)?.[1];
+		if (path !== undefined) knownPaths.add(path);
 	}
 	if (knownPaths.size === 0) return false;
 	for (const line of lines) {
@@ -219,7 +227,7 @@ export function checkFidelity(original: string, filtered: string, autoDetected: 
 function pathLineRatio(text: string): number {
 	const lines = text.split('\n').filter(line => line.trim());
 	if (lines.length < 2) return 0;
-	const paths = lines.filter(line => /^\s*(?:\.{0,2}\/|[\w.-]+\/)[^\s:]*$/.test(line)).length;
+	const paths = lines.filter(line => /^\s*(?:\.{0,2}[\\/]|[A-Za-z]:[\\/]|[\w.-]+[\\/])[^\s:]*$/.test(line)).length;
 	return paths / lines.length;
 }
 
@@ -485,11 +493,11 @@ function grouped(value: number): string {
 	return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
-const GUIDANCE = `RTK is active: command output is condensed before it reaches you. Every signal survives — the failing test name, the assertion, the file and line. Treat a condensed result as complete. Re-run a command unfiltered only when its result is empty when output was clearly expected, contradicts its exit code, or is garbled; do that with \`rtk bypass <cmd>\` or \`RTK_DISABLED=1 <cmd>\`, not by dropping the prefix yourself.
+const GUIDANCE = `RTK is active: command output is condensed before it reaches you. The facts that matter are kept — the failing test name, the assertion, the file and line. A grouped file or match list may print \`+N\` for repeated names it elided: that many entries were dropped, and when no \`rtk recall\` hint follows they were not stored. Re-run a command unfiltered (or narrow its pattern) when you need every name, when its result is empty although output was clearly expected, when it contradicts its exit code, or when it is garbled; do that with \`rtk bypass <cmd>\` or \`RTK_DISABLED=1 <cmd>\`, not by dropping the prefix yourself.
 
 Call rtk directly for what the automatic rewrite cannot express: \`rtk read <file> --level aggressive\` for an overview, \`rtk smart <file>\` for two lines, \`rtk err <cmd>\` for errors only, \`rtk log <file>\` to dedupe, \`rtk json <file> --keys-only\` for shape, \`rtk deps\`, \`rtk diff\`, \`rtk env\`, \`rtk test <cmd>\`, and \`rtk find . -name '*.ts'\`. Do not type \`rtk\` in front of a command that is already rewritten for you.
 
-Condensed output states its own recovery path. An elided span prints a count such as \`+50\`, and when the full text was kept it also prints a hint naming \`rtk recall <hash>\`; use that hint rather than re-running the command, which can be slow or have side effects. When there is a count but no hash the elided lines were not stored — re-read the specific file or range instead of re-running the whole command. \`rtk gain\` reports what rtk has saved; \`rtk discover\` finds past commands it could have condensed.`;
+Condensed output states its own recovery path. An elided span prints a count such as \`+50\`, and when the full text was kept it also prints a hint naming \`rtk recall <hash>\`; use that hint rather than re-running the command, which can be slow or have side effects. When there is a count but no hash the elided entries were not stored — narrow the pattern or re-read the specific file or range instead of re-running the whole command. \`rtk gain\` reports what rtk has saved; \`rtk discover\` finds past commands it could have condensed.`;
 
 // Rules: exported so a test can check every named subcommand against the installed binary instead of trusting the prose.
 export function guidanceText(): string {
@@ -512,11 +520,10 @@ export default function (cmd: ModApi): void {
 		return binCache.value;
 	}
 
-	// Rules: an explicit `--mod-option rtk-bin=…` is never probed, so a typo used to be reported as the binary and the guidance block promised rewrites that could never run. The probe result already gets an existence and executable check; this gives the explicit path the same one. Resolution itself stays unverified so a path that appears later still works, and this answer is only used to report status and to decide whether guidance is injected.
+	// Rules: an explicit `--mod-option rtk-bin=…` is never probed, so a typo used to be reported as the binary and the guidance block promised rewrites that could never run. Both sources get one existence and executable check here; resolution itself stays unverified so a path that appears later still works. This answer gates status, guidance, and every process spawn.
 	function binUsable(): boolean {
 		const bin = binPath();
 		if (!bin) return false;
-		if (bin === resolveBin('rtk')) return true;
 		try {
 			accessSync(bin, constants.X_OK);
 			return true;
@@ -530,7 +537,7 @@ export default function (cmd: ModApi): void {
 
 	let version: RtkVersion | null = null;
 	let versionProbe: Promise<void> | null = null;
-	// undefined = not yet decided for this session; a later mode change clears it so a re-enable decides again.
+	// undefined means undecided; a mode change clears it so a re-enable decides again.
 	let guidanceDecided: boolean | undefined;
 	const supported = () => isSupportedVersion(version);
 	const versionNote = () => {
@@ -646,7 +653,9 @@ export default function (cmd: ModApi): void {
 		// Rules: a shorter result is not automatically a safe one. The filter is rejected when it grouped content that was neither a match list nor a path list (a wrong format guess), or when it dropped a negation, so the model keeps the original rather than a summary that lies.
 		const fidelity = checkFidelity(filterable, filtered, shapeFilter === null);
 		if (!fidelity.ok) return plainResult();
-		return `${head}${notices ? `${filtered}\n${notices}` : filtered}${tail}`;
+		// Rules: rtk's never-worse guard covers the body it saw, not the envelope and notices re-attached here; with two notices the joins can add a byte. The mod promises never-worse, so an inflated result falls back to the stripped original.
+		const next = `${head}${notices ? `${filtered}\n${notices}` : filtered}${tail}`;
+		return next.length < text.length ? next : plainResult();
 	}
 
 	function textOf(result: unknown): string | null {
@@ -733,7 +742,7 @@ export default function (cmd: ModApi): void {
 
 		beforeToolCall: async ({toolCallId, toolName, input}) => {
 			const bin = binPath();
-			if (mode === OFF || !isShellTool(toolName) || !bin || !supported()) return undefined;
+			if (mode === OFF || !isShellTool(toolName) || !bin || !binUsable() || !supported()) return undefined;
 			const command = typeof input.command === 'string' ? input.command : '';
 			if (!shouldRewrite(command)) return undefined;
 			// Rules: the host appends `args` after shell-quoting them, so the rewrite is asked about the whole line and split back only when the answer still ends with the caller's own suffix. `powershell` has no args field, so this is empty there.
@@ -755,33 +764,34 @@ export default function (cmd: ModApi): void {
 			// Rules: the marker is consumed on entry, before any guard that returns early, so a rewritten call whose output was too small or errored leaves no id behind. The value is captured once and read by the shell pass below, so consuming early cannot lose the answer this call needs.
 			if (rewrittenCalls.size > 256) rewrittenCalls.clear();
 			const alreadyRewritten = wasRewritten(toolCallId);
-			if (mode === OFF || isError || !supported()) return undefined;
+			if (mode === OFF || isError) return undefined;
 			const text = textOf(result);
 			if (text === null) return undefined;
 
-			// Rules: the byte floor gates the rtk spawn, not the colour strip. A 900-byte coloured result was rejected here before, so the escapes — the only thing this pass can remove for free — reached the model; the strip costs nothing without a process.
+			// Rules: the byte floor and the binary gate the rtk spawn, not the colour strip. A 900-byte coloured result was rejected here before, so the escapes — the only thing this pass can remove for free — reached the model; the strip costs nothing without a process. A binary that is missing or too old must not spawn, and must not suppress the strip either.
 			// Rules: the flag that turns filtering off is checked per tool below, because a caller can disable grep/glob filtering and keep the shell pass.
 			const plain = stripAnsi(text);
+			const stripped = plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
 
 			// An explicit filter for a tool result that is not shell output.
 			const filter = filterNameFor(toolName);
 			if (filter) {
-				if (cmd.getFlag('rtk-filter') === false) return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
-				if (text.length < MIN_FILTER_BYTES) return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
+				if (cmd.getFlag('rtk-filter') === false || !supported() || !binUsable()) return stripped;
+				if (text.length < MIN_FILTER_BYTES) return stripped;
 				const filtered = await condense(toolName, filter, text);
 				return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 			}
 
-			// Shell output rtk did not rewrite still gets auto-detected: `npm test` has no rewrite but cargo-style output does.
+			// Shell output with no rewrite is still auto-detected: `npm test` output can be cargo-shaped.
 			if (!isShellTool(toolName)) return undefined;
-			if (cmd.getFlag('rtk-shell') === false) return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
+			if (cmd.getFlag('rtk-shell') === false || !supported() || !binUsable()) return stripped;
 			// Rules: a rewritten call is skipped because rtk already filtered it — except when rtk declined and left its faithful baseline, which `canRefilterCompressed` recognises. Anything carrying a recovery hint stays skipped, so a recall hash is never dropped.
 			// Rules: the shape test reads the plain text. `path:line:text` rows with an escape before the column still match the row pattern, but a styled `+3 more files` marker would not — testing the raw bytes could let a marked result through the second pass and drop its recall hash.
 			if (alreadyRewritten && !canRefilterCompressed(plain)) {
 				// Rules: rtk filtered the body but keeps every colour escape, so the strip still applies here. It deletes only escapes, which carry no information, so the envelope and every fact survive.
-				return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
+				return stripped;
 			}
-			if (text.length < MIN_FILTER_BYTES) return plain.length < text.length ? {content: [{type: 'text', text: plain}]} : undefined;
+			if (text.length < MIN_FILTER_BYTES) return stripped;
 			const filtered = await condense(toolName, null, text);
 			return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 		},
