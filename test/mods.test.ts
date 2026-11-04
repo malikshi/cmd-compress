@@ -14,6 +14,7 @@ import {defaultBinDirs, isShellTool} from '../mods/shared.ts';
 import {shouldRewrite, filterNameFor, filterForShape, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText, pinBinary, joinForRewrite, splitRewrite} from '../mods/rtk.ts';
 import {createFakeCmd} from './harness.ts';
 import {existsSync} from 'node:fs';
+import {join} from 'node:path';
 
 test('normalizeCavemanLevel: on and empty mean the default, off and stop mean off', () => {
 	assert.equal(normalizeCavemanLevel(''), 'full');
@@ -266,11 +267,16 @@ test('pinBinary: a valueless prefix flag does not swallow the command', () => {
 });
 
 // Rules: rtk's own installer writes to `$RTK_INSTALL_DIR`, defaulting to ~/.local/bin (install.sh:18) — not ~/.bun/bin, which the probe assumed. A machine that installed rtk the documented way had the binary, yet the mod reported `binary: NOT FOUND` and injected no guidance. Every documented install dir is probed, and the user's explicit RTK_INSTALL_DIR comes first.
+// Rules: the expected paths are built with `join`, because the implementation joins too. Hardcoded `/home/u/...` literals failed on the Windows runners, where `defaultBinDirs` correctly answers `\home\u\...` — the separators are the platform's, not a defect.
 test('defaultBinDirs: every documented install dir is probed, the explicit one first', () => {
-	assert.deepEqual(defaultBinDirs('/home/u'), ['/home/u/.local/bin', '/home/u/.bun/bin', '/home/u/.cargo/bin']);
+	const home = '/home/u';
+	const local = join(home, '.local', 'bin');
+	const bun = join(home, '.bun', 'bin');
+	const cargo = join(home, '.cargo', 'bin');
+	assert.deepEqual(defaultBinDirs(home), [local, bun, cargo]);
 	assert.deepEqual(
-		defaultBinDirs('/home/u', '/opt/rtk/bin'),
-		['/opt/rtk/bin', '/home/u/.local/bin', '/home/u/.bun/bin', '/home/u/.cargo/bin'],
+		defaultBinDirs(home, '/opt/rtk/bin'),
+		['/opt/rtk/bin', local, bun, cargo],
 		'RTK_INSTALL_DIR wins, because it is the one the user chose',
 	);
 });
