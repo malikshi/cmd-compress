@@ -9,8 +9,8 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile, execFileSync} from 'node:child_process';
 import {readFileSync} from 'node:fs';
-import rtk, {canRefilterCompressed, checkFidelity, hasGrepContext, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
-import {createFakeCmd, firstHook, resultText, runHandler} from './harness.ts';
+import rtk, {canRefilterCompressed, checkFidelity, condenseGrepRows, condensePaths, hasGrepContext, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
+import {createFakeCmd, firstHook, resultText, runHandler, type FakeExecRequest} from './harness.ts';
 
 type ExecRequest = {command: string; args?: string[]; cwd?: string; signal?: AbortSignal};
 
@@ -45,6 +45,15 @@ async function loaded() {
 	rtk(fake.cmd as never);
 	firstHook(fake).onSessionStart?.();
 	await new Promise(resolve => setTimeout(resolve, 150));
+	runHandler(fake.commands, 'rtk', 'on');
+	return fake;
+}
+
+// Rules: the local condenser needs no binary, so its tests must not inherit `realExec` or skip with the rest of this file. A stub that fails every spawn proves the pass never shells out.
+function localOnly(exec: (request: FakeExecRequest) => Promise<{stdout: string; stderr: string; code: number}>) {
+	const fake = createFakeCmd({exec});
+	fake.cmd.name = 'probe';
+	rtk(fake.cmd as never);
 	runHandler(fake.commands, 'rtk', 'on');
 	return fake;
 }
@@ -152,7 +161,8 @@ test('grep: the truncation notice survives, and the match lines still shrink', a
 	const input = grepOutput(240, 'limit: 240');
 	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: input}], isError: false}));
 	assert.ok(out.trimEnd().endsWith('[Showing results with pagination = limit: 240]'), 'the notice is the last thing the model reads');
-	assert.ok(out.includes('src/handlers.ts'), 'the file is still named');
+	// Rules: the directory layout names the path as a `src/` header plus `handlers.ts`, so the literal `src/handlers.ts` need not appear; the file layout prints it whole. Either is a named file.
+	assert.ok(out.includes('handlers.ts'), 'the file is still named');
 	assert.ok(out.length < input.length);
 });
 
@@ -333,6 +343,160 @@ test('a short command whose body is already minimal is not inflated by the filte
 	assert.ok(out.length < input.length, 'the filter still ran');
 	assert.ok(out.startsWith('Exit code: 1 (test failure)\n'), 'and the exit status is still first');
 	assert.ok(out.includes('tests::bad'), 'and the failing test is still named');
+});
+
+/* ------------------------------------------- the local content-mode condenser */
+
+// Rules: rtk's own grep filter repeats the path and the full match text on every row, so it saves almost nothing on the shapes a coding agent actually greps: 20 files x 5 hits 6,850 -> 6,591 (3%), 30 files x 1 hit 0%. These tests pin the local replacement, which runs with no binary and must never lose a file.
+const grepBody = (files: number, perFile: number, make = (file: number, hit: number) => `\tconst value${file}_${hit} = compute(input);`): string =>
+	Array.from({length: files}, (_, file) =>
+		Array.from({length: perFile}, (_, hit) => `src/mod${file}.ts:${hit + 1}:${make(file, hit)}`).join('\n'),
+	).join('\n');
+
+test('condenseGrepRows: identical lines collapse to one row with their numbers joined', () => {
+	const input = grepBody(3, 4, () => '\tconst value = compute(input);');
+	const out = condenseGrepRows(input);
+	assert.ok(out, 'the body is condensed');
+	assert.match(out, /^12 matches in 3F:/);
+	// Rules: either layout is valid; both join a repeated line's numbers into one row. The directory layout carries the path as a `src/` header plus `mod0.ts:…`, the file layout as `[file] src/mod0.ts`.
+	const joined = /mod0\.ts:1,2,3,4:\tconst value = compute\(input\);|1,2,3,4:\tconst value = compute\(input\);/;
+	assert.match(out, joined, 'the four line numbers are joined on one row');
+	assert.ok(out.includes('mod0.ts'), 'the file is named');
+	assert.ok(out.length < input.length);
+});
+
+test('condenseGrepRows: every file is still named, even past the per-file cap', () => {
+	const rows = Array.from({length: 40}, (_, file) =>
+		Array.from({length: 6}, (_, hit) => `src/m${file}.ts:${hit + 1}:\tconst distinct${hit} = compute();`).join('\n'),
+	).join('\n');
+	const out = condenseGrepRows(rows, 3);
+	assert.ok(out, 'condensed');
+	for (let file = 0; file < 40; file += 1) assert.ok(out.includes(`m${file}.ts`), `file m${file} is named`);
+	assert.match(out, /\+3 more lines/, 'the elided rows are counted');
+});
+
+test('condenseGrepRows: a body with any non-row line is refused, so a log is never regrouped', () => {
+	assert.equal(condenseGrepRows('error: boom\nsrc/a.ts:1:\tconst x = 1;\n'.repeat(30)), null);
+	assert.equal(condenseGrepRows('src/a.ts:1:x\nsrc/a.ts-2-context line\n'.repeat(30)), null, 'a -A/-B/-C context row opts out');
+	assert.equal(condenseGrepRows('src/a.ts:1:only one row'), null);
+});
+
+// Rules: the directory layout prints a `dir/  (N)` header and lists `name:numbers:text`, so the full path is the header plus the name — that is how the model reopens a file. The file layout prints the path verbatim. Both are checked by reconstructing the original path from the output.
+test('condenseGrepRows: nested, spaced, Windows and root-relative paths all survive', () => {
+	for (const path of ['src/a/b/c/f.ts', 'src/my dir/f.ts', 'C:\\src\\f.ts', 'f.ts', 'pkg/mod/src/f.ts']) {
+		const rows = Array.from({length: 20}, (_, index) => `${path}:${index + 1}:\tconst x = 1;`).join('\n');
+		const out = condenseGrepRows(rows);
+		assert.ok(out, `${path} is condensed`);
+		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+		const dir = slash >= 0 ? path.slice(0, slash + 1) : './';
+		const name = slash >= 0 ? path.slice(slash + 1) : path;
+		const reconstructable = out.includes(path) || (out.includes(dir) && out.includes(name));
+		assert.ok(reconstructable, `${path} is reconstructable from the output:\n${out}`);
+	}
+});
+
+test('condenseGrepRows: a body that would not shrink is refused', () => {
+	assert.equal(condenseGrepRows(Array.from({length: 40}, (_, index) => `f${index}.ts:1:x`).join('\n')), null);
+});
+
+// Rules: rtk's find filter names only some directories on a wide tree (measured 19 of 60), so the local path pass exists to keep every one. It must refuse a match row, or it would read the line number into the file name.
+test('condensePaths: every directory is named and each file list is capped', () => {
+	const paths = Array.from({length: 240}, (_, index) => `./src/a${index % 24}/module-name${index}.ts`).join('\n');
+	const out = condensePaths(paths);
+	assert.ok(out, 'a path list is condensed');
+	assert.match(out, /^240 files in 24 dirs:/);
+	for (let dir = 0; dir < 24; dir += 1) assert.ok(out.includes(`./src/a${dir}/`), `dir a${dir} is named`);
+	assert.match(out, /\+4\n/, 'the elided files are counted');
+});
+
+test('condensePaths: a match row is refused, so a grep body is left to the row condenser', () => {
+	const rows = Array.from({length: 40}, (_, index) => `src/f${index}.ts:${index + 1}:hit`).join('\n');
+	assert.equal(condensePaths(rows), null);
+});
+
+test('condensePaths: a prose line is refused', () => {
+	const mixed = [...Array.from({length: 40}, (_, index) => `src/f${index}.ts`), 'error: gone wrong'].join('\n');
+	assert.equal(condensePaths(mixed), null);
+});
+
+// Rules: the local passes now run on EVERY shell result before rtk, so each must refuse a shape that is not its own. A build log, a git status, a diff, an ls listing and a JSON blob all have `:` or path-like fragments; regrouping one would corrupt output that rtk used to leave alone.
+test('the local condensers refuse every non-grep shell shape', () => {
+	const shapes: Record<string, string> = {
+		'git status': Array.from({length: 60}, (_, index) => `\tmodified:   src/file${index}.ts`).join('\n'),
+		'cargo errors': Array.from({length: 60}, (_, index) => `error[E0${index}]: cannot find value \`x${index}\` in this scope\n  --> src/lib.rs:${index + 1}:5`).join('\n'),
+		'ls -l': Array.from({length: 60}, (_, index) => `-rw-r--r-- 1 u u 1234 ${index} file${index}.ts`).join('\n'),
+		'npm warnings': Array.from({length: 60}, (_, index) => `npm WARN deprecated pkg@1.${index}.0: use something else`).join('\n'),
+		diff: Array.from({length: 60}, (_, index) => `+  const x = ${index};`).join('\n'),
+		pytest: Array.from({length: 60}, (_, index) => `tests/test_${index}.py::test_${index} PASSED [ ${index}%]`).join('\n'),
+		json: `{\n${Array.from({length: 60}, (_, index) => `  "key${index}": "value${index}",`).join('\n')}\n}`,
+	};
+	for (const [name, body] of Object.entries(shapes)) {
+		assert.equal(condenseGrepRows(body), null, `${name} is not regrouped as match rows`);
+		assert.equal(condensePaths(body), null, `${name} is not regrouped as paths`);
+	}
+});
+
+// Rules: a repeat command is a cache hit that costs no process; a deny is never cached, because the user can edit their rtk rules mid-session and a stale deny would block a command that is now allowed.
+test('rewrite: a repeated command spawns rtk once, and a deny is always re-asked', async () => {
+	let calls = 0;
+	const fake = localOnly(async (request: FakeExecRequest) => {
+		calls += 1;
+		if (request.args?.[0] === '--version') return {stdout: 'rtk 1.1.0', stderr: '', code: 0};
+		if (request.args?.[1] === 'rm -rf /') return {stdout: 'blocked by rule', stderr: '', code: 2};
+		return {stdout: 'rtk git status', stderr: '', code: 0};
+	});
+	firstHook(fake).onSessionStart?.();
+	await new Promise(resolve => setTimeout(resolve, 50));
+	const call = () => firstHook(fake).beforeToolCall?.({toolCallId: `c${calls}`, toolName: 'shell_command', input: {command: 'git status'}});
+
+	calls = 0;
+	await call();
+	const afterFirst = calls;
+	await call();
+	assert.equal(calls, afterFirst, 'the second identical command spawned nothing');
+
+	calls = 0;
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'd1', toolName: 'shell_command', input: {command: 'rm -rf /'}});
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'd2', toolName: 'shell_command', input: {command: 'rm -rf /'}});
+	assert.equal(calls, 2, 'a denied command is asked again every time');
+});
+
+// Rules: the local condensers cost no process, so they must not be gated on the binary or on the 1,200-byte spawn floor. This is the whole point on a machine with no rtk: the grep result still shrinks. A stub whose every spawn fails is a session with no binary.
+test('grep: a body below the spawn floor still shrinks, with no process', async () => {
+	const spawned: string[] = [];
+	const fake = localOnly(async (request: FakeExecRequest) => {
+		spawned.push(request.args?.join(' ') ?? '');
+		return {stdout: '', stderr: 'ENOENT', code: 1};
+	});
+	const rows = Array.from({length: 16}, (_, file) =>
+		Array.from({length: 2}, (_, hit) => `src/m${file}.ts:${hit + 1}:x`).join('\n'),
+	).join('\n');
+	assert.ok(rows.length < MIN_FILTER_BYTES, `the fixture is under the floor (${rows.length})`);
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: rows}], isError: false}));
+	assert.ok(out.length < rows.length * 0.7, `expected a cut with no binary, got ${rows.length} -> ${out.length}`);
+	assert.match(out, /^32 matches in 16F:/, 'the rows were grouped, with each file named once');
+	assert.deepEqual(spawned, [], 'no process was spawned');
+});
+
+test('glob: a path list still shrinks with no binary', async () => {
+	const fake = localOnly(async () => ({stdout: '', stderr: 'ENOENT', code: 1}));
+	const input = `Found 40 files\n${Array.from({length: 40}, (_, index) => `./src/d${index % 4}/file-name-${index}.ts`).join('\n')}`;
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'glob', result: [{type: 'text', text: input}], isError: false}));
+	assert.ok(out.length < input.length, `expected a cut, got ${input.length} -> ${out.length}`);
+	for (let dir = 0; dir < 4; dir += 1) assert.ok(out.includes(`./src/d${dir}/`), `dir d${dir} is named`);
+});
+
+test('grep: a content-mode body is condensed locally, without spawning rtk', async () => {
+	const spawned: string[] = [];
+	const fake = localOnly(async (request: FakeExecRequest) => {
+		spawned.push(request.args?.join(' ') ?? '');
+		return {stdout: '', stderr: '', code: 1};
+	});
+	const input = grepBody(20, 5, () => '\t  const result = compute(input, options);');
+	const out = resultText(await firstHook(fake).afterToolCall?.({toolName: 'grep', result: [{type: 'text', text: input}], isError: false}));
+	assert.match(out, /^100 matches in 20F:/);
+	assert.ok(out.length < input.length / 2, `expected a >50% cut, got ${input.length} -> ${out.length}`);
+	assert.deepEqual(spawned, [], 'no filter process was spawned for a grep body');
 });
 
 // Rules: splitSegments feeds the filter from the body only, so it must be lossless in content — the envelope is re-attached, never dropped. Whitespace may collapse (the host's blank-line run before a notice is capped at one), but no non-whitespace character may disappear.

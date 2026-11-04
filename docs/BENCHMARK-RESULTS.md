@@ -1,6 +1,8 @@
 # Measured results
 
-Measured 2026-11-02. Model `nexrouter/deepseek-v4.1-flash`, Command Code `1.88.2`, rtk `1.0.1`, Linux.
+Measured 2026-11-04. Model `nexrouter/deepseek-v4.1-flash`, Command Code `1.88.2`, rtk `1.1.0`, Linux.
+
+The shell-output rows were re-measured after the local condenser was added: the mod no longer sends a grep body or a path list to `rtk pipe` first. Both are grouped in-process, which raised every grep and glob row and removed the process spawn (0–1 ms instead of 12–15 ms). rtk is still the filter for everything the local pass declines.
 
 Two full live runs, same day, same model, same prompts: [`prompt-run-a.md`](../bench/results/prompt-run-a.md) and [`prompt-run-b.md`](../bench/results/prompt-run-b.md). Both are published because they disagree, and the disagreement is the most important result here.
 
@@ -32,9 +34,9 @@ From `npm run bench`. No model involved; these bytes are the same on any machine
 
 | Case | Shape | Bytes in | Bytes out | Saved | Fidelity |
 |---|---|---:|---:|---:|---|
-| grep, clustered | 240 matches in 6 files | 16,130 | 3,148 | **80.5%** | 6/6 files named, 60 of 240 match lines kept |
-| grep, scattered | 240 matches in 240 files | 14,874 | 14,874 | **0.0%** | passed through unchanged |
-| find | 260 paths in 10 dirs | 6,092 | 1,748 | **71.3%** | 10/10 dirs named, header correct |
+| grep, clustered | 240 matches in 6 files | 16,130 | 1,377 | **91.5%** | 6/6 files named, 240 of 240 match lines kept |
+| grep, scattered | 240 matches in 240 files | 14,874 | 13,421 | **9.8%** | 240/240 files named |
+| find | 260 paths in 10 dirs | 6,092 | 1,149 | **81.1%** | 10/10 dirs named, header correct |
 
 ### Command Code's own tool shapes
 
@@ -42,14 +44,14 @@ The raw rows above are rtk's fixture, not what this host produces. A `glob` resu
 
 | Case | Envelope | Bytes in | Bytes out | Saved | Fidelity |
 |---|---|---:|---:|---:|---|
-| glob tool | `Found 260 files` header | 4,326 | 1,149 | **73.4%** | header kept |
-| glob tool, truncated | header + truncation notice | 5,021 | 1,345 | **73.2%** | header kept, trailer kept |
-| grep tool, truncated | pagination notice | 15,540 | 3,183 | **79.5%** | trailer kept |
-| grep tool, files mode | `Found 300 files …` header (find filter) | 4,448 | 620 | **86.1%** | header kept |
-| grep tool, count mode | total-occurrences notice | 17,228 | 14,420 | **16.3%** | trailer kept |
+| glob tool | `Found 260 files` header | 4,326 | 788 | **81.8%** | header kept, local path condenser |
+| glob tool, truncated | header + truncation notice | 5,021 | 964 | **80.8%** | header kept, trailer kept |
+| grep tool, truncated | pagination notice | 15,540 | 1,333 | **91.4%** | trailer kept, local row condenser |
+| grep tool, files mode | `Found 300 files …` header | 4,448 | 439 | **90.1%** | header kept, local path condenser |
+| grep tool, count mode | total-occurrences notice | 17,228 | 2,509 | **85.4%** | trailer kept, local row condenser |
 | shell tool | `Exit code: 1` head | 2,769 | 324 | **88.3%** | header kept |
-| shell tool, timed out | header + timeout notice | 5,889 | 340 | **94.2%** | header kept, trailer kept |
-| shell tool, declined grep baseline | none — rtk refused to group | 8,081 | 514 | **93.6%** | no envelope |
+| shell tool, timed out | header + timeout notice | 5,889 | 339 | **94.2%** | header kept, trailer kept |
+| shell tool, declined grep baseline | none — rtk refused to group | 8,081 | 430 | **94.7%** | local row condenser |
 | shell tool, coloured build | `Exit code: 2` head + 40 SGR-coloured `tsc` errors | 5,274 | 3,474 | **34.1%** | header kept |
 
 ### The declined baseline
@@ -65,7 +67,7 @@ rtk's search filter prints its **faithful baseline** whenever capping would not 
 
 The gate has to exist because the opposite is destructive: one blind second pass over rtk-grouped output **deleted all 9 `rtk recall` hints** from it, and a recall hash is unrecoverable once its hint is gone. So anything carrying `matches in N files:`, `+N more`, `+ … more files`, `[+N hidden: rtk recall …]` or `[full output: rtk recall …]` is left byte-identical to what rtk emitted.
 
-Cost is bounded: the second pass measured **12 ms** median (`rtk pipe` on a 5 KB result), and it is skipped entirely below the 1,200-byte threshold and for every non-match-list shape. Twelve real rewritten commands (`git status`, `git log`, `git diff`, `npm test`, `npx tsc`, `ls`, `find`, `git branch`, `du`) measured **0 bytes changed** — the gate does not fire on them at all.
+Cost is bounded: the local pass costs no process at all (0–1 ms), and it is skipped below the 1,200-byte threshold and for every non-match-list shape. The old second `rtk pipe` pass, which this replaces on the row path, measured **12 ms** median. Twelve real rewritten commands (`git status`, `git log`, `git diff`, `npm test`, `npx tsc`, `ls`, `find`, `git branch`, `du`) measured **0 bytes changed** — the gate does not fire on them at all.
 
 A live headless run against a fixture repo confirms it outside the bench: a `glob` of 380 files came back as `Found 100 files` plus rtk's grouped body and the host's own truncation notice intact — **1,771 → 471 bytes**, every directory named.
 
@@ -82,9 +84,11 @@ Those rows exist because an earlier build lost or skipped every one of them. Eac
 
 Rewrite: 12 of 12 commands rewritten, ~78 ms mean, ~84 ms p95.
 
-**The scattered row is the important one.** It saves nothing, and that is not a bug: rtk's `never_worse` guard refuses a regrouping larger than its input. Reporting only the clustered case would have claimed 80% as if it were universal. The honest claim is *"a shell result that groups by file gets much smaller; a result with one hit per file is unchanged."*
+**The scattered row is the honest floor.** 240 matches across 240 files saves 9.8%, because a per-file row cannot be dropped without dropping the file. Reporting only the clustered case would have claimed 91% as if it were universal. The claim is *"a shell result that groups by file gets much smaller; a result with one hit per file still moves, but only a little."* Before the local condenser this row was **0.0%** — rtk's `never_worse` guard refused the regrouping outright.
 
-**Fidelity has a cost.** Clustered grep keeps 60 of 240 match lines — it folds each file's tail behind `+N`. Fewer bytes, fewer lines, every named file still present. A grep result where those folded lines mattered will read worse, not better.
+**Why the local pass exists.** rtk's own grep filter groups by file but repeats the full path and match text on every row, so on a hit-dense file it barely moves: a body of 20 files × 5 hits came back 6,850 → 6,591 (**3%**), 30 files × 1 hit came back 1,671 → 1,671 (**0%**), and a 400-row count-mode body 17,140 → 14,331 (**16%**). The mod's in-process condenser groups *and* dedupes — identical lines collapse to one row with their line numbers joined — and lands at **76%, 58% and 86%** on the same three bodies, with every file named. Two layouts are built and the smaller wins: `[file] path (N):` blocks for a file with several hits, and a `dir/  (N)` tree of `name:numbers:text` rows for a body that is mostly one hit per file — the layout that takes the 240-files-one-hit case from 0% to 9.8%. It runs in 0 ms: no process, no temp file, and it works with no rtk installed at all. rtk's `find` filter loses whole directories on a wide tree (19 of 60 named on one measured glob), which the local path pass does not.
+
+**Fidelity has a cost.** Clustered grep keeps every file name but caps the distinct lines shown per file at six, folding each file's tail behind `+N more lines in this file`. Fewer bytes, every named file still present, but a grep result where those folded lines mattered will read worse, not better.
 
 ## 2. Prompt overhead — the one solid live result
 
@@ -156,7 +160,7 @@ Worth it only if the reader wants that register. On a code task it is a cost wit
 
 | Claim | Supported? |
 |---|---|
-| Shell output gets smaller | **Conditionally, exactly measured.** 80.5% on file-clustered grep, 71.3% on `find`, **0%** when hits are one-per-file. |
+| Shell output gets smaller | **Conditionally, exactly measured.** 91.5% on file-clustered grep, 81.1% on `find`, **9.8%** when hits are one-per-file. |
 | A mode adds prompt overhead | **Yes, reproducible.** Within 10% of the static estimate for a single mode; presets read ~20% above it. |
 | Caveman shortens replies | **Only `ultra`, by ~12–13%**, and only on open prompts. `full` costs more in both runs. |
 | The mode pays for itself in one turn | **No.** `ultra` saves ~50–70 reply tokens against a 232-token block. |

@@ -13,7 +13,7 @@ import {join} from 'node:path';
 import {CAVEMAN_LEVELS, cavemanRule} from '../rules/caveman.ts';
 import {PONYTAIL_LEVELS, ponytailRule} from '../rules/ponytail.ts';
 import {resolveBin} from '../mods/shared.ts';
-import {canRefilterCompressed, filterForShape, splitSegments, stripAnsi} from '../mods/rtk.ts';
+import {canRefilterCompressed, condenseGrepRows, condensePaths, filterForShape, splitSegments, stripAnsi} from '../mods/rtk.ts';
 import {
 	makeFindOutput,
 	makeGlobToolOutput,
@@ -105,7 +105,8 @@ export const ENVELOPE_CASES = [
 ] as const;
 
 // Rules: rtk pipe takes stdin only, so the fixture is redirected from a temp file rather than interpolated into a command line.
-function pipeThrough(bin: string, filter: string | null, input: string): string | null {
+function pipeThrough(bin: string | null, filter: string | null, input: string): string | null {
+	if (!bin) return null;
 	let dir: string | undefined;
 	try {
 		dir = mkdtempSync(join(tmpdir(), 'cmd-compress-bench-'));
@@ -122,7 +123,7 @@ function pipeThrough(bin: string, filter: string | null, input: string): string 
 
 // Rules: this mirrors the mod's own condense() step exactly — pick the filter from the shape, split the host envelope off, strip colour, filter only the body, put the envelope back. Measuring a path production does not run is what let the envelope bug through.
 // Rules: a rewritten shell call is skipped unless rtk left its faithful baseline, so the cases say which they model. An unrewritten call (`npm test`) is filtered unconditionally; a rewritten one goes through the same gate production uses.
-function condenseTool(bin: string, filter: string | null, tool: string, input: string, rewritten = false): {stdout: string; fidelity: string} | null {
+function condenseTool(bin: string | null, filter: string | null, tool: string, input: string, rewritten = false): {stdout: string; fidelity: string} | null {
 	const plain = stripAnsi(input);
 	const strippedAsEnvelope = splitSegments(tool, plain);
 	if (rewritten && !canRefilterCompressed(plain)) {
@@ -130,7 +131,17 @@ function condenseTool(bin: string, filter: string | null, tool: string, input: s
 	}
 	const shapeFilter = filterForShape(tool, filter, input);
 	const {head, body, tail} = splitSegments(tool, input);
-	const filtered = pipeThrough(bin, shapeFilter, stripAnsi(body));
+	const plainBody = stripAnsi(body);
+	// Rules: the mod tries its own condensers before spawning rtk, so the bench must too or the published rows describe a path production no longer takes. The local passes need no binary, so they are measured even when rtk is absent.
+	const localRows = condenseGrepRows(plainBody);
+	if (localRows !== null && localRows.length < body.length) {
+		return {stdout: `${head}${localRows}${tail}`, fidelity: fidelityOf(head, tail, 'local row condenser')};
+	}
+	const localPaths = condensePaths(plainBody);
+	if (localPaths !== null) {
+		return {stdout: `${head}${localPaths}${tail}`, fidelity: fidelityOf(head, tail, 'local path condenser')};
+	}
+	const filtered = pipeThrough(bin, shapeFilter, plainBody);
 	if (filtered === null) {
 		if (plain.length >= input.length) return null;
 		return {stdout: `${strippedAsEnvelope.head}${strippedAsEnvelope.body}${strippedAsEnvelope.tail}`, fidelity: 'colour stripped, filter declined'};
@@ -142,12 +153,29 @@ function condenseTool(bin: string, filter: string | null, tool: string, input: s
 	return {stdout: composed, fidelity: notes.length ? notes.join(', ') : 'no envelope'};
 }
 
-// Rules: fidelity is asserted, not assumed — a filter that drops a whole file is a failed run and says so.
+function fidelityOf(head: string, tail: string, note: string): string {
+	const notes = [head.trim() ? 'header kept' : '', tail.trim() ? 'trailer kept' : ''].filter(Boolean);
+	return [note, ...notes].join(', ');
+}
+
+// Rules: fidelity is asserted, not assumed — a filter that drops a whole file is a failed run and says so. Both row shapes count: rtk's `  12: text` and the local condenser's `  1,2,3: text`, where the number list is one line carrying several matches. A file is named when its path is literal or reconstructable from a `dir/  (N)` header plus its `name:…` row, which is the directory layout's form.
 function grepFidelity(input: string, output: string): string {
 	const lines = input.split('\n').filter(Boolean);
 	const files = new Set(lines.map(line => line.split(':')[0] ?? ''));
-	const named = [...files].filter(file => output.includes(file)).length;
-	const kept = output.split('\n').filter(line => /^\s*\d+:/.test(line)).length;
+	const named = [...files].filter(file => {
+		if (output.includes(file)) return true;
+		const slash = Math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'));
+		const dir = slash >= 0 ? file.slice(0, slash + 1) : './';
+		const name = slash >= 0 ? file.slice(slash + 1) : file;
+		return output.includes(dir) && new RegExp(`(?:^|\\n)\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:`).test(output);
+	}).length;
+	let kept = 0;
+	for (const line of output.split('\n')) {
+		if (/^\s*\d+:/.test(line)) kept += 1;
+		else if (/^\s*\d+(?:,\d+)+:/.test(line)) kept += line.split(':')[0]?.split(',').length ?? 0;
+		// Rules: the directory layout puts the file name before the numbers, so its row is `name:12:text` or `name:1,2,3:text`.
+		else if (/^[^\n:]+:\d+(?:,\d+)*:/.test(line) && !/^\s*\+/.test(line)) kept += line.split(':')[1]?.split(',').length ?? 0;
+	}
 	if (output === input) return `passed through unchanged (${lines.length} matches, ${files.size} files)`;
 	return `${named}/${files.size} files named, ${kept} of ${lines.length} match lines kept`;
 }
@@ -215,7 +243,9 @@ export function runOutputBench(): OutputBenchResult {
 	const bin = resolveBin('rtk');
 	const filters: FilterResult[] = [];
 
-	if (bin) {
+	// Rules: the local condensers run with no binary, so the envelope rows are measured either way — a missing rtk must not hide a 91% row the session still gets. Only the rtk-only rows (the FILTER_CASES raw shapes and the rewrite lookup) need the binary.
+	{
+		// Rules: every row runs the mod's own path, so a local condenser that wins is reflected in the published number rather than hidden behind a raw `rtk pipe` that production no longer calls first.
 		for (const testCase of FILTER_CASES) {
 			const input = testCase.build();
 			const inputBytes = Buffer.byteLength(input, 'utf8');
@@ -223,8 +253,10 @@ export function runOutputBench(): OutputBenchResult {
 			let output = '';
 			for (let index = 0; index < FILTER_SAMPLES; index += 1) {
 				const started = process.hrtime.bigint();
-				output = pipeThrough(bin, testCase.filter, input) ?? '';
+				const result = condenseTool(bin, testCase.filter, testCase.filter === 'find' ? 'glob' : 'grep', input);
 				samples.push(Number(process.hrtime.bigint() - started) / 1_000_000);
+				if (!result) break;
+				output = result.stdout;
 			}
 			if (!output) continue;
 			const outputBytes = Buffer.byteLength(output, 'utf8');

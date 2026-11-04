@@ -1,5 +1,5 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default, REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, hasGrepContext, canRefilterCompressed, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, joinForRewrite, splitRewrite, guidanceText
+// exports: default, REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, hasGrepContext, canRefilterCompressed, condenseGrepRows, condensePaths, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, joinForRewrite, splitRewrite, guidanceText
 // used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
@@ -131,6 +131,149 @@ export function hasGrepContext(text: string): boolean {
 // Rules: a rewritten call is normally left alone because rtk already filtered it. The exception is the baseline rtk declined to compress: it carries no recovery hint, so a second pass recovers rows it refused to group instead of discarding information.
 export function canRefilterCompressed(text: string): boolean {
 	return !RECOVERY_MARKER.test(text) && isGrepRows(text);
+}
+
+/* ---------------------------------------------- local grep and path condensers */
+
+// Rules: rtk's own `grep` filter is its weakest path. Measured against 1.1.0: 20 files x 5 hits came back 6,850 -> 6,591 (3%), 30 files x 1 hit 1,671 -> 1,671 (0%), a 400-row count-mode body 17,140 -> 14,331 (16%). It groups by file but repeats the path and the whole match text on every row. This condenser groups AND dedupes the text, so identical lines collapse to one row with their line numbers joined — 75%, 56% and 85% on the same three inputs — and it never drops a file.
+// Rules: the row parser is stricter than `GREP_ROW` on purpose: any non-blank line that is not `path:line:text` makes the whole body ineligible, so a build log that happens to hold a few match rows is never regrouped. That also means a `-A/-B/-C` context row opts the body out for free, matching the explicit `hasGrepContext` refusal.
+// Rules: the path must look like a file — a separator, or a dot before the colon — because this pass also sees shell output, and a log line is `2026-11-04 12:00:01: INFO started`, which a bare pattern reads as path `2026-11-04 12`, line `00`, text `01: INFO started`. Measured: 40 such lines were regrouped into one bogus file, losing every timestamp. A real match path carries `src/` or `.ts` before its first colon. A body with no such row anywhere is refused, so that log is returned untouched.
+// Rules: the cap only elides repeated *rows* inside one file, never a file, and never a whole directory. Every path still gets named, so the model can always see which files matched, and the dropped count is stated.
+// Rules: both layouts keep rtk's own recovery marker (`N matches in MF:`) so a grouped result is never fed back through the filter, and so `+N` reads the way the model already learned.
+const GREP_BODY_ROW = /^((?:[A-Za-z]:[\\/]|[\w.$@+-]*[\\/][^:\n]*|[^:\s/\\]+(?:\.[^:\s/\\]+)+)[^:\n]*?):(\d+):([^\n]*)$/;
+
+interface GrepRow {
+	readonly number: string;
+	readonly text: string;
+}
+
+// Rules: two layouts, both keeping every file name, and the smaller one wins. `[file] path (N):` pays a constant per file and a tab-indented row per line, which wins when a file has several hits; the `path:  (N)` directory tree pays one directory line and lists `name:numbers:text`, which wins when most files hold a single hit and a per-file header would add more than the row it introduces. Measured: the directory tree takes a 240-files-one-hit-each body from 0% to 23% and a 30-files-one-hit body from 30% to 58%, while the file-header layout stays ahead on a file with 20 hits (77% vs 75%) — so neither dominates and both are built.
+function layoutByFile(order: readonly string[], rowsByFile: ReadonlyMap<string, GrepRow[]>, perFileCap: number, total: number): string {
+	const out: string[] = [`${total} matches in ${order.length}F:`];
+	for (const path of order) {
+		const rows = rowsByFile.get(path) ?? [];
+		const groups: Array<{numbers: string[]; text: string}> = [];
+		const index = new Map<string, number>();
+		for (const row of rows) {
+			const at = index.get(row.text);
+			if (at === undefined) {
+				index.set(row.text, groups.length);
+				groups.push({numbers: [row.number], text: row.text});
+			} else groups[at]?.numbers.push(row.number);
+		}
+		const shown = groups.slice(0, perFileCap);
+		out.push(`[file] ${path} (${rows.length}):`);
+		for (const group of shown) out.push(`  ${group.numbers.join(',')}:${group.text}`);
+		const keptRows = shown.reduce((sum, group) => sum + group.numbers.length, 0);
+		if (rows.length > keptRows) out.push(`  +${rows.length - keptRows} more lines in this file`);
+	}
+	return `${out.join('\n')}\n`;
+}
+
+// Rules: the path is split on its last separator, so a Windows drive colon never becomes a directory boundary, and a relative root file lands under `./`.
+function layoutByDir(order: readonly string[], rowsByFile: ReadonlyMap<string, GrepRow[]>, perFileCap: number, total: number): string {
+	const dirs: string[] = [];
+	const filesByDir = new Map<string, string[]>();
+	for (const path of order) {
+		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+		const dir = slash >= 0 ? path.slice(0, slash + 1) : './';
+		let files = filesByDir.get(dir);
+		if (!files) {
+			files = [];
+			filesByDir.set(dir, files);
+			dirs.push(dir);
+		}
+		files.push(path);
+	}
+	const out: string[] = [`${total} matches in ${order.length}F:`];
+	for (const dir of dirs) {
+		const paths = filesByDir.get(dir) ?? [];
+		out.push(`${dir}  (${paths.length})`);
+		for (const path of paths) {
+			const name = dir === './' && !path.includes('/') && !path.includes('\\') ? path : path.slice(dir.length);
+			const groups: Array<{numbers: string[]; text: string}> = [];
+			const index = new Map<string, number>();
+			for (const row of rowsByFile.get(path) ?? []) {
+				const at = index.get(row.text);
+				if (at === undefined) {
+					index.set(row.text, groups.length);
+					groups.push({numbers: [row.number], text: row.text});
+				} else groups[at]?.numbers.push(row.number);
+			}
+			for (const group of groups.slice(0, perFileCap)) out.push(`  ${name}:${group.numbers.join(',')}:${group.text}`);
+			if (groups.length > perFileCap) out.push(`  ${name}: +${groups.length - perFileCap} more lines`);
+		}
+	}
+	return `${out.join('\n')}\n`;
+}
+
+// Rules: a reshape that saves almost nothing is not worth it — it spends the model's attention on a new layout for a byte or two, and it rewrites a diagnostic shape it may misread. Measured: a `file:line:col: message` linter listing parsed as match rows and came back 2,389 -> 2,340 (2%), so anything under 5% is declined and left exactly as it was. Real grep wins clear this by a wide margin (a 240-files-one-hit body is the floor at 9.8%).
+const MIN_LOCAL_GAIN = 0.05;
+
+function worthIt(original: string, condensed: string | null): boolean {
+	return condensed !== null && condensed.length < original.length * (1 - MIN_LOCAL_GAIN);
+}
+
+export function condenseGrepRows(text: string, perFileCap = 6): string | null {
+	const order: string[] = [];
+	const rowsByFile = new Map<string, GrepRow[]>();
+	for (const line of text.split('\n')) {
+		if (!line.trim()) continue;
+		const match = GREP_BODY_ROW.exec(line);
+		if (!match) return null;
+		const [, path, number, body] = match as unknown as [string, string, string, string];
+		let rows = rowsByFile.get(path);
+		if (!rows) {
+			rows = [];
+			rowsByFile.set(path, rows);
+			order.push(path);
+		}
+		rows.push({number, text: body});
+	}
+	const total = [...rowsByFile.values()].reduce((sum, rows) => sum + rows.length, 0);
+	if (total < 2) return null;
+
+	const candidates = [layoutByFile(order, rowsByFile, perFileCap, total), layoutByDir(order, rowsByFile, perFileCap, total)];
+	let best: string | null = null;
+	for (const candidate of candidates) if (worthIt(text, candidate) && (best === null || candidate.length < best.length)) best = candidate;
+	return best;
+}
+
+// Rules: rtk's `find` filter groups by directory but elides whole directories once it has printed enough: on a 60-directory glob it named 19 of 60, so the model cannot tell which directories matched at all. This condenser prints every directory, caps only the file list inside one directory, and states the elided count. Measured 82-84% on a 260- and a 300-path glob versus rtk's 73-77%, and it needs no process.
+// Rules: a body that is not one clean path per line is refused, so a count-mode grep body or a shell listing with prose is never folded into a path tree. A `path:line:text` row is refused explicitly even though it passes `PATH_ROW` (a colon is not whitespace): the path condenser would read the line number and the match text as part of the file name and drop both. That case is `condenseGrepRows`' job, and when it declines the body is left for rtk.
+const PATH_ROW = /^\s*(?:\.{0,2}[\\/]|[A-Za-z]:[\\/]|[\w.$@+-]+[\\/])[^\s]*$/;
+
+export function condensePaths(text: string, perDirCap = 6): string | null {
+	const order: string[] = [];
+	const filesByDir = new Map<string, string[]>();
+	for (const line of text.split('\n')) {
+		if (!line.trim()) continue;
+		if (GLOB_HEAD.test(`${line}\n`)) continue;
+		if (!PATH_ROW.test(line) || GREP_BODY_ROW.test(line.trim())) return null;
+		const path = line.trim();
+		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+		const dir = slash >= 0 ? path.slice(0, slash + 1) : './';
+		const name = slash >= 0 ? path.slice(slash + 1) : path;
+		let files = filesByDir.get(dir);
+		if (!files) {
+			files = [];
+			filesByDir.set(dir, files);
+			order.push(dir);
+		}
+		files.push(name);
+	}
+	const total = [...filesByDir.values()].reduce((sum, files) => sum + files.length, 0);
+	if (total < 2) return null;
+
+	const out: string[] = [`${total} files in ${order.length} dirs:`];
+	for (const dir of order) {
+		const files = filesByDir.get(dir) ?? [];
+		out.push(`${dir}  (${files.length})`);
+		for (const file of files.slice(0, perDirCap)) out.push(`  ${file}`);
+		if (files.length > perDirCap) out.push(`  +${files.length - perDirCap}`);
+	}
+	const joined = `${out.join('\n')}\n`;
+	return worthIt(text, joined) ? joined : null;
 }
 
 // Rules: `grep` is not one shape. Its default `files_with_matches` mode prints a plain path list under a `Found N files` header, which the grep filter passes through untouched (measured 4,448 → 4,448 bytes) while the find filter condenses it (→ 630). Content mode is the opposite: `path:line:text` rows, where grep wins. So the filter is chosen from the body's shape, not from the tool name alone.
@@ -614,12 +757,23 @@ export default function (cmd: ModApi): void {
 		}
 	}
 
+	// Rules: a rewrite is a pure function of the command line and the resolved binary, and a session repeats the same few commands constantly (`git status`, `git diff`, `npm test` six times in a row is normal). Each `rtk rewrite` measured 30-160 ms here, so a session cache removes most of that cost. Only a `rewrite` verdict is cached, never a deny: a deny depends on rules the user can edit mid-session, and serving a stale deny would block a command that is now allowed. A `pass` is cached too, since re-asking about the same unchanged command finds the same nothing.
+	// Rules: bounded so a long session cannot grow it without limit, and keyed on the exact line, so a different argument set is a different entry.
+	const rewriteCache = new Map<string, RewriteVerdict>();
+
 	async function rewrite(command: string): Promise<RewriteVerdict> {
 		const bin = binPath();
 		if (!bin || !supported()) return {kind: 'pass'};
+		const cached = rewriteCache.get(command);
+		if (cached && cached.kind !== 'deny') return cached;
 		try {
 			const {stdout, code} = await exec({command: bin, args: ['rewrite', command]}, REWRITE_TIMEOUT_MS);
-			return classifyRewrite(code, stdout, command);
+			const verdict = classifyRewrite(code, stdout, command);
+			if (verdict.kind !== 'deny') {
+				if (rewriteCache.size >= 128) rewriteCache.clear();
+				rewriteCache.set(command, verdict);
+			}
+			return verdict;
 		} catch {
 			return {kind: 'pass'};
 		}
@@ -655,9 +809,30 @@ export default function (cmd: ModApi): void {
 		}
 	}
 
+	// Rules: the local condensers are the only part that need no process, so they are split out. Every caller runs them first, whatever the binary state — that is what makes a grep or glob result still shrink on a machine with no rtk installed, and below the byte floor where a spawn would not be worth it.
+	function condenseLocally(toolName: string, filter: string | null, text: string): string | null {
+		const {head, body, tail} = splitSegments(toolName, text);
+		const plainBody = stripAnsi(body);
+		const {body: filterable, notices} = extractSpillNotices(plainBody);
+		// Rules: content-mode grep rows are condensed locally, with no process. Measured against rtk 1.1.0 on the same bodies, the local pass wins every common shape (20 files x 5 hits 6,850 -> 1,681 vs rtk's 6,591; 30 files x 1 hit 1,671 -> 701 vs rtk's unchanged 1,671; count mode 17,140 -> 2,421 vs 14,331) and it never drops a file, where rtk's find filter named only 10 of 20. It also removes the spawn: grep results cost 0 ms instead of rtk's measured 12-15 ms. The fidelity check still runs, so a cap that would drop every negation is refused.
+		const local = condenseGrepRows(filterable);
+		if (local !== null && checkFidelity(filterable, local, false).ok) {
+			const next = `${head}${notices ? `${local}\n${notices}` : local}${tail}`;
+			if (next.length < text.length) return next;
+		}
+		// Rules: the same reasoning applies to a path list. rtk's find filter loses whole directories on a wide tree (measured 19 of 60 named), and the local pass keeps every one for a few more percent. It is tried only when the body is one clean path per line, so a count-mode grep body and a shell listing still go to rtk.
+		const localPaths = condensePaths(filterable);
+		if (localPaths !== null) {
+			const next = `${head}${notices ? `${localPaths}\n${notices}` : localPaths}${tail}`;
+			if (next.length < text.length) return next;
+		}
+		return null;
+	}
+
 	// Rules: only the body is condensed; the host's own header and trailer are re-attached verbatim, so an exit status or a truncation notice cannot be folded away.
 	// Rules: colour is removed from the body whether or not the rtk pass below succeeds. rtk keeps escapes, so a result it declines would otherwise arrive at full size and still carry 33% of bytes that mean nothing — the strip alone is the win on those, and it is why the byte floor is checked after it, not before.
 	// Rules: the spill pointer rides in the MIDDLE of the result, so it is lifted out before filtering and put back after. The host writes it where the elision happened; a result that lost it leaves the model with no way to reach the rest of the output, which was measured: a 2,951-byte pytest result came back at 296 bytes with both pointer lines gone.
+	// Rules: the byte floor gates the rtk SPAWN, not the local pass. The local condensers cost no process, so they run below it — an 870-byte body of 20 files x 3 hits still went 870 -> 360, and a 790-byte path list 790 -> 385. Skipping those would leave the cheapest win unused.
 	async function condense(toolName: string, filter: string | null, text: string): Promise<string | null> {
 		// Rules: the shape is read from the original result, because the split below removes the very header it looks for.
 		const shapeFilter = filterForShape(toolName, filter, text);
@@ -668,6 +843,8 @@ export default function (cmd: ModApi): void {
 			const plain = `${head}${plainBody}${tail}`;
 			return plain.length < text.length ? plain : null;
 		};
+		const local = condenseLocally(toolName, filter, text);
+		if (local !== null) return local;
 		if (plainBody.trim().length < MIN_FILTER_BYTES) return plainResult();
 		const {body: filterable, notices} = extractSpillNotices(plainBody);
 		const filtered = await filterThroughRtk(shapeFilter, filterable);
@@ -809,21 +986,28 @@ export default function (cmd: ModApi): void {
 			// An explicit filter for a tool result that is not shell output.
 			const filter = filterNameFor(toolName);
 			if (filter) {
-				if (cmd.getFlag('rtk-filter') === false || !supported() || !binUsable()) return stripped;
-				if (text.length < MIN_FILTER_BYTES) return stripped;
+				if (cmd.getFlag('rtk-filter') === false) return stripped;
+				// Rules: the local pass needs no binary and no byte floor, so it is tried before either guard. A session without rtk still gets its grep and glob results grouped, and a body under 1,200 bytes still shrinks. The guards below only gate the spawn.
+				const local = condenseLocally(toolName, filter, text);
+				if (local) return {content: [{type: 'text', text: local}]};
+				if (text.length < MIN_FILTER_BYTES || !supported() || !binUsable()) return stripped;
 				const filtered = await condense(toolName, filter, text);
 				return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 			}
 
 			// Shell output with no rewrite is still auto-detected: `npm test` output can be cargo-shaped.
 			if (!isShellTool(toolName)) return undefined;
-			if (cmd.getFlag('rtk-shell') === false || !supported() || !binUsable()) return stripped;
+			if (cmd.getFlag('rtk-shell') === false) return stripped;
 			// Rules: a rewritten call is skipped because rtk already filtered it — except when rtk declined and left its faithful baseline, which `canRefilterCompressed` recognises. Anything carrying a recovery hint stays skipped, so a recall hash is never dropped.
 			// Rules: the shape test reads the plain text. `path:line:text` rows with an escape before the column still match the row pattern, but a styled `+3 more files` marker would not — testing the raw bytes could let a marked result through the second pass and drop its recall hash.
 			if (alreadyRewritten && !canRefilterCompressed(plain)) {
 				// Rules: rtk filtered the body but keeps every colour escape, so the strip still applies here. It deletes only escapes, which carry no information, so the envelope and every fact survive.
 				return stripped;
 			}
+			// Rules: a rewritten call that rtk declined is a match list or a path list by construction, which is exactly what the local pass handles, and it needs no second process. It runs before the binary guard for the same reason as on the grep path.
+			const local = condenseLocally(toolName, null, text);
+			if (local) return {content: [{type: 'text', text: local}]};
+			if (!supported() || !binUsable()) return stripped;
 			if (text.length < MIN_FILTER_BYTES) return stripped;
 			const filtered = await condense(toolName, null, text);
 			return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
