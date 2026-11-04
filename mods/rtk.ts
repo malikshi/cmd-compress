@@ -10,6 +10,7 @@
 // rules: the emitted `rtk` is pinned to the resolved absolute path. rtk ships to ~/.local/bin (its installer default), ~/.bun/bin or ~/.cargo/bin, and a GUI host often has none of them on PATH, so a bare name would turn a working command into `rtk: not found`. The pin is a quote-aware single pass, because rtk emits `&`, newlines, and prefix commands, and a quoted argument may contain both `rtk` and a separator. The one quoted form it does reach into is a shell wrapper's script (`bash -c "rtk …"`), which rtk rewrites and which is a command line in its own right.
 // rules: `shell_command` and `powershell` are both shell tools with the same result envelope, so every path keys off `isShellTool`, not the one name — a Windows session would otherwise get no rewrite and no condensing at all.
 // rules: a rewritten shell call is skipped unless rtk left its faithful baseline — no recovery marker and a majority of `path:line:text` rows — because rtk's own never-worse guard declines to compress multi-file grep output by default.
+// rules: a sub-agent run gets no mod hooks at all, so the child's own shell calls are never rewritten from here. The `agent` call's prompt is the only channel: it carries a block telling the child to prefix commands with the resolved absolute binary, and it is added only when that binary is usable and new enough.
 // rules: `shell_command`'s `args` array is part of the command line the host runs, so the rewrite sees it; a `-A/-B/-C` grep result is never handed to rtk's grep filter, which keeps only match rows and would silently drop the context the caller asked for.
 // rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
 // agent: unknown | unknown | 2026-11-03 | unknown | pinBinary rewritten as a quote-aware scan after measuring two live bugs: `&` and newline separators it emits were left bare (a rewrite then failed as `rtk: not found` off PATH), and a `rtk` inside a quoted argument was rewritten, corrupting the argument
@@ -22,7 +23,7 @@ import type {ModApi} from '@commandcode/harness';
 import {accessSync, constants, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {announceMode, filterShell, isShellTool, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, wrapBlock, writeOwnMode, OFF} from './shared.ts';
+import {AGENT_TOOL, announceMode, filterShell, isShellTool, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, withAgentBlock, wrapBlock, writeOwnMode, OFF} from './shared.ts';
 
 export const REWRITE_TIMEOUT_MS = 2000;
 
@@ -514,6 +515,17 @@ export function guidanceText(): string {
 	return GUIDANCE;
 }
 
+// Rules: a sub-agent never receives this mod, so nothing rewrites its shell calls. The parent cannot rewrite them either — its hooks only see its own tool calls, and the child's tool call ids never reach them. The one lever left is the `agent` call's prompt: tell the child to prefix commands itself, with the absolute path this mod resolved, because a bare `rtk` is exactly what `pinBinary` exists to avoid (rtk ships to ~/.local/bin, often off a GUI host's PATH).
+// Rules: the path is emitted through `pinBinary` so it arrives shell-quoted, for the same measured reason the rewrite path does. Raw, a path with a space breaks the line the child is told to type: `/opt/my tools/rtk git status` ran as `sh: /opt/my: not found`, and Windows puts rtk under `C:\Program Files\` by default.
+// Rules: the wording must not reuse GUIDANCE. That block says output is condensed *for* the reader and forbids typing `rtk` yourself — both false in a child, where nothing is rewritten unless the child does it.
+// Rules: an agent with no shell tool cannot follow the block, so it is not sent one. The names are the host's reserved ones and a custom file using them is ignored, so they always resolve to these bundled tool sets (measured on 1.88.2): `explore` is glob/grep/read_file/read_directory and `plan` is read_file alone. `general` and every custom agent may run shell, and an omitted `subagent_type` defaults to `general`, so those still get it.
+const NO_SHELL_AGENTS = new Set(['explore', 'plan']);
+
+export function subAgentGuidance(bin: string, platform: string = process.platform): string {
+	const quoted = pinBinary('rtk', bin, platform);
+	return `RTK is available here, but this sub-agent's own shell calls are NOT rewritten automatically — no hook reaches a sub-agent run. Prefix each command with ${quoted} so its output is condensed before you read it: \`${quoted} git status\`, \`${quoted} cargo build\`, \`${quoted} npm test\`. It keeps the failing test name, the assertion, the file and line, and may fold repeated paths into \`+N\`. Never prefix the same command twice, and re-run one unfiltered with \`RTK_DISABLED=1 <cmd>\` when you need every name or the result looks wrong.`;
+}
+
 export default function (cmd: ModApi): void {
 	cmd.addFlag('rtk', {type: 'string', default: '', description: 'Start mode: on|off (default: off)'});
 	cmd.addFlag('rtk-bin', {type: 'string', default: '', description: 'Absolute path to the rtk binary (default: probe PATH, then ~/.local/bin, ~/.bun/bin, ~/.cargo/bin)'});
@@ -752,7 +764,18 @@ export default function (cmd: ModApi): void {
 
 		beforeToolCall: async ({toolCallId, toolName, input}) => {
 			const bin = binPath();
-			if (mode === OFF || !isShellTool(toolName) || !bin || !binUsable() || !supported()) return undefined;
+			if (mode === OFF) return undefined;
+			// Rules: the child gets no rewrite hook, so the only way its calls are condensed is the child doing it itself. The block names the resolved absolute path, and is added only with a usable, new-enough binary — otherwise it would instruct a session to run something that cannot.
+			if (toolName === AGENT_TOOL) {
+				const agent = typeof input.subagent_type === 'string' ? input.subagent_type.trim().toLowerCase() : '';
+				if (NO_SHELL_AGENTS.has(agent)) return undefined;
+				if (!bin || !binUsable()) return undefined;
+				await versionSettled();
+				if (!supported()) return undefined;
+				const next = withAgentBlock(input, 'rtk', subAgentGuidance(bin));
+				return next ? {input: next} : undefined;
+			}
+			if (!isShellTool(toolName) || !bin || !binUsable() || !supported()) return undefined;
 			const command = typeof input.command === 'string' ? input.command : '';
 			if (!shouldRewrite(command)) return undefined;
 			// Rules: the host appends `args` after shell-quoting them, so the rewrite is asked about the whole line and split back only when the answer still ends with the caller's own suffix. `powershell` has no args field, so this is empty there.

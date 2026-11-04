@@ -1,5 +1,5 @@
 // shared — mode lookup, prompt-block helpers, and binary/path utilities for the four mods.
-// exports: MODES, OFF, DEFAULT_MODE, MODE_EVENT, readOwnMode, writeOwnMode, announceMode, wrapBlock, defaultBinDirs, resolveBin, SHELL_TOOLS, isShellTool, filterShell, windowsPipeScript, pipeCommand, turnOffSiblings
+// exports: MODES, OFF, DEFAULT_MODE, MODE_EVENT, readOwnMode, writeOwnMode, announceMode, wrapBlock, AGENT_TOOL, withAgentBlock, defaultBinDirs, resolveBin, SHELL_TOOLS, isShellTool, filterShell, windowsPipeScript, pipeCommand, turnOffSiblings
 // used_by: mods/*.ts, test/*.test.ts
 // related: rules/caveman.ts, rules/ponytail.ts
 // rules: cmd.store is namespaced per mod, so a mod persists ONLY its own key; a sibling's mode is read through cmd.use.
@@ -7,6 +7,7 @@
 // agent: unknown | unknown | 2026-11-02 | unknown | initial — per-mod store key after learning each mod gets its own file
 // agent: unknown | unknown | 2026-11-03 | unknown | turnOffSiblings — "normal mode" must end every mode, and transformInput short-circuits on handled
 // agent: unknown | unknown | 2026-11-03 | unknown | announceMode + MODE_EVENT so the compress status repaints on any mode change; drop promptHas, which no caller or test ever referenced
+// agent: unknown | unknown | 2026-11-04 | unknown | AGENT_TOOL + withAgentBlock — a sub-agent run gets no mod hooks, so the `agent` call's prompt is the only channel a mode block can reach it through
 
 import {accessSync, constants, existsSync} from 'node:fs';
 import {delimiter, join} from 'node:path';
@@ -94,6 +95,18 @@ export function isShellTool(toolName: string): boolean {
 // Rules: no strip step is needed. The host builds the append list fresh every round (`appendSystemPrompt` collects one string per mod and joins them), so a level change swaps the block by simply returning the new one — a previous block can never accumulate, and the `<tag>` wrapper is for readability, not deduplication.
 export function wrapBlock(tag: string, body: string): string {
 	return `<${tag}>\n${body.trim()}\n</${tag}>`;
+}
+
+/* ------------------------------------------------------------- sub-agents */
+
+// Rules: a sub-agent run is built with `definition.systemPrompt` and a mod list holding only the host's own user-hooks mod (measured on 1.88.2: `mods:[a.mod, ...e.mods?.({permissionMode})]`, where the provider answers `[createUserHooksMod(...)]`), so `appendSystemPrompt` never fires for it and none of these blocks reach it. The one lever the parent still owns is the `agent` tool call itself: the host runs `run({userInput: e.prompt})` for the child and chains `beforeToolCall`'s `input` across mods, so appending to `prompt` puts the block in the child's first user turn.
+export const AGENT_TOOL = 'agent';
+
+// Rules: the caller's own prompt is never rewritten, only extended — it is the whole task the child was given. A prompt already carrying the block is left alone, because a retried call would otherwise stack a second copy.
+export function withAgentBlock(input: Record<string, unknown>, tag: string, body: string): Record<string, unknown> | undefined {
+	const prompt = typeof input.prompt === 'string' ? input.prompt : '';
+	if (!prompt || prompt.includes(`<${tag}>`)) return undefined;
+	return {...input, prompt: `${prompt}\n\n${wrapBlock(tag, body)}`};
 }
 
 /* ---------------------------------------------------------------- binaries */

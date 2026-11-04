@@ -5,10 +5,11 @@
 // rules: exactly one level block is live at a time; the injected text is byte-stable per level so the prompt cache survives.
 // agent: unknown | unknown | 2026-11-02 | unknown | ported from JuliusBrussee/caveman + tersio caveman extension
 // agent: unknown | xai | 2026-11-04 | 01a1a3cc | corrected the used_by test target
+// agent: unknown | unknown | 2026-11-04 | unknown | beforeToolCall appends the level block to the `agent` call's prompt, because a sub-agent run receives no mod hooks
 
 import type {ModApi} from '@commandcode/harness';
 import {CAVEMAN_DEFAULT, CAVEMAN_LEVELS, cavemanRule, type CavemanLevel} from '../rules/caveman.ts';
-import {announceMode, NORMAL_MODE, OFF, readOwnMode, turnOffSiblings, wrapBlock, writeOwnMode} from './shared.ts';
+import {AGENT_TOOL, announceMode, NORMAL_MODE, OFF, readOwnMode, turnOffSiblings, withAgentBlock, wrapBlock, writeOwnMode} from './shared.ts';
 
 // Rules: `normal mode` is the upstream phrase for the same thing, so it must work too; the whole message has to be the phrase.
 export const CAVEMAN_STOP_PHRASES = new Set(['stop caveman', 'caveman off', NORMAL_MODE]);
@@ -72,6 +73,13 @@ export default function (cmd: ModApi): void {
 		},
 
 		appendSystemPrompt: () => (mode === OFF ? undefined : wrapBlock('caveman', cavemanRule(mode))),
+
+		// Rules: a sub-agent never receives this mod — its run is built with the agent definition's own system prompt and the host's user-hooks mod only — so the block rides in on the `agent` call's prompt instead, which the host uses as the child's first user turn.
+		beforeToolCall: ({toolName, input}) => {
+			if (mode === OFF || toolName !== AGENT_TOOL) return undefined;
+			const next = withAgentBlock(input, 'caveman', cavemanRule(mode));
+			return next ? {input: next} : undefined;
+		},
 
 		// Rules: the stop phrase must be the whole message, so "add a caveman off toggle" never disables it.
 		// Rules: `normal mode` ends EVERY mode, so it is answered even when caveman is already off — otherwise it would fall through the chain and leave a lone `rtk` running. The host stops the chain at the first `handled`, so the siblings are turned off here rather than by their own hooks.

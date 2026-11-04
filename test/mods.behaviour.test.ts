@@ -7,12 +7,12 @@
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import caveman, {normalizeCavemanLevel} from '../mods/caveman.ts';
 import ponytail from '../mods/ponytail.ts';
-import rtk from '../mods/rtk.ts';
+import rtk, {subAgentGuidance} from '../mods/rtk.ts';
 import compress from '../mods/compress.ts';
 import {MODE_EVENT} from '../mods/shared.ts';
 import {createFakeCmd, firstHook, runHandler, messageOf, resultText} from './harness.ts';
@@ -900,4 +900,145 @@ test('compress: a reloaded mod releases its bus subscription', () => {
 	fake.statuses.length = 0;
 	fake.cmd.events.emit(MODE_EVENT);
 	assert.equal(fake.statuses.length, 1, 'only the live factory repaints after the old one ended');
+});
+
+/* ------------------------------------------------------------- sub-agents */
+
+// Rules: measured on Command Code 1.88.2 — a sub-agent run is built with the agent definition's own system prompt and a mod list holding only the host's user-hooks mod, so `appendSystemPrompt` never fires inside it and none of these blocks reach the child. The host runs `run({userInput: e.prompt})` for the child and chains `beforeToolCall`'s `input` across mods, so the `agent` call's own prompt is the one channel a block can take.
+const AGENT_CALL = {toolName: 'agent', toolCallId: 'a1', input: {subagent_type: 'general', description: 'look', prompt: 'Find the exports.'}};
+
+test('caveman: the block rides in on the agent call, so a sub-agent sees it', async () => {
+	const fake = load(caveman);
+	runHandler(fake.commands, 'caveman', 'ultra');
+	const result = (await firstHook(fake).beforeToolCall?.(AGENT_CALL)) as {input: {prompt: string; subagent_type: string}} | undefined;
+	assert.ok(result, 'the agent call is intercepted');
+	assert.match(result.input.prompt, /^Find the exports\./, 'the caller\'s own task comes first and is not rewritten');
+	assert.match(result.input.prompt, /<caveman>\nCaveman ultra active/);
+	assert.equal(result.input.subagent_type, 'general', 'every other input field survives');
+});
+
+test('caveman: it does not touch an agent call while off, nor any other tool', async () => {
+	const fake = load(caveman);
+	assert.equal(await firstHook(fake).beforeToolCall?.(AGENT_CALL), undefined, 'off means nothing changes');
+
+	runHandler(fake.commands, 'caveman', 'full');
+	assert.equal(
+		await firstHook(fake).beforeToolCall?.({toolName: 'shell_command', input: {command: 'git status'}}),
+		undefined,
+		'only the agent tool carries the block',
+	);
+});
+
+// Rules: the host re-runs a call when it retries, and a prompt that already carries the block must not collect a second copy — the child would read the rules twice and pay for both.
+test('caveman: a prompt that already carries the block is left alone', async () => {
+	const fake = load(caveman);
+	runHandler(fake.commands, 'caveman', 'full');
+	const first = (await firstHook(fake).beforeToolCall?.(AGENT_CALL)) as {input: Record<string, unknown>};
+	assert.equal(await firstHook(fake).beforeToolCall?.({toolName: 'agent', input: first.input}), undefined, 'no second copy');
+});
+
+test('ponytail: the block rides in on the agent call, so a sub-agent sees it', async () => {
+	const fake = load(ponytail);
+	runHandler(fake.commands, 'ponytail', 'ultra');
+	const result = (await firstHook(fake).beforeToolCall?.(AGENT_CALL)) as {input: {prompt: string}};
+	assert.match(result.input.prompt, /^Find the exports\./);
+	assert.match(result.input.prompt, /<ponytail>\nPONYTAIL MODE ACTIVE — level: ultra/);
+});
+
+// Rules: a child run has no rewrite hook, so the only way its shell calls are condensed is the child typing the prefix itself — and that prefix must be the resolved absolute path, because rtk ships to ~/.local/bin, which a GUI host often leaves off PATH. A bare `rtk` there fails as `rtk: not found`.
+test('rtk: the agent call tells the child to prefix commands with the resolved binary', async () => {
+	const fake = load(rtk, {
+		exec: async request =>
+			request.args?.[0] === '--version' ? {stdout: 'rtk 1.0.1', stderr: '', code: 0} : {stdout: '', stderr: '', code: 1},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	const result = (await firstHook(fake).beforeToolCall?.(AGENT_CALL)) as {input: {prompt: string}} | undefined;
+	assert.ok(result, 'the agent call is intercepted');
+	assert.match(result.input.prompt, /^Find the exports\./);
+	assert.match(result.input.prompt, /NOT rewritten automatically/, 'the child is told it must do the rewriting itself');
+	assert.ok(result.input.prompt.includes(TEST_BIN), 'and it is handed the absolute path, not a bare `rtk`');
+	assert.doesNotMatch(result.input.prompt, /are condensed before it reaches you/, 'the parent block would contradict itself here');
+});
+
+test('rtk: no block when the binary cannot run, since the child could not follow it', async () => {
+	for (const flags of [{'rtk-bin': '/nonexistent/rtk'}]) {
+		const fake = load(rtk, {flags});
+		runHandler(fake.commands, 'rtk', 'on');
+		assert.equal(await firstHook(fake).beforeToolCall?.(AGENT_CALL), undefined, 'a path that cannot execute injects nothing');
+	}
+
+	const old = load(rtk, {
+		exec: async request =>
+			request.args?.[0] === '--version' ? {stdout: 'rtk 0.20.0', stderr: '', code: 0} : {stdout: '', stderr: '', code: 1},
+	});
+	runHandler(old.commands, 'rtk', 'on');
+	assert.equal(await firstHook(old).beforeToolCall?.(AGENT_CALL), undefined, 'a too-old binary injects nothing');
+});
+
+// Rules: the host chains `input` from mod to mod (`if (r?.input) g = r.input`), execution using the last rewrite. Two modes both want the child, so each must append to what the previous mod left, not to the original prompt.
+test('sub-agent: caveman and ponytail both reach the child through the chained rewrite', async () => {
+	const fake = createFakeCmd({flags: {'rtk-bin': TEST_BIN}});
+	for (const [name, factory] of [['caveman', caveman], ['ponytail', ponytail]] as const) {
+		fake.bindStore(name);
+		fake.cmd.name = name;
+		factory(fake.cmd as never);
+	}
+	runHandler(fake.commands, 'caveman', 'full');
+	runHandler(fake.commands, 'ponytail', 'lite');
+
+	let input: Record<string, unknown> = AGENT_CALL.input;
+	for (const hook of fake.hooks) {
+		const result = (await hook.beforeToolCall?.({toolCallId: 'a2', toolName: 'agent', input})) as {input?: Record<string, unknown>} | undefined;
+		if (result?.input) input = result.input;
+	}
+	const prompt = String(input.prompt);
+	assert.match(prompt, /^Find the exports\./);
+	assert.match(prompt, /Caveman full active/);
+	assert.match(prompt, /PONYTAIL MODE ACTIVE — level: lite/);
+});
+
+// Rules: measured — the child is told to type the prefix itself, and the host runs `command` raw while quoting only `args` (`buildCommand2`), so a path with a space arrives split: `/tmp/sp ace/rtk --version` exited 127 with `sh: /tmp/sp: not found`, and the same command quoted exited 0. Windows puts rtk under `C:\Program Files\`, so this is the default there, not an edge case.
+test('rtk: the child is handed a shell-quoted path, so a space in it cannot split the command', async () => {
+	const spaced = join(mkdtempSync(join(tmpdir(), 'rtk sp-')), 'rtk');
+	copyFileSync(TEST_BIN, spaced);
+	const fake = load(rtk, {
+		flags: {'rtk-bin': spaced},
+		exec: async request =>
+			request.args?.[0] === '--version' ? {stdout: 'rtk 1.0.1', stderr: '', code: 0} : {stdout: '', stderr: '', code: 1},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	const result = (await firstHook(fake).beforeToolCall?.(AGENT_CALL)) as {input: {prompt: string}};
+	assert.ok(result.input.prompt.includes(`'${spaced}'`), 'the path is quoted, not bare');
+	assert.ok(result.input.prompt.includes(`\`'${spaced}' git status\``), 'and every example shows the quoted form');
+});
+
+test('rtk: subAgentGuidance quotes for the platform that will read it', () => {
+	const posix = subAgentGuidance('/opt/my tools/rtk', 'linux');
+	assert.ok(posix.includes(`'/opt/my tools/rtk'`));
+	assert.ok(!posix.includes('"'), 'POSIX gets single quotes, which the shell honours');
+
+	const win = subAgentGuidance('C:\\Program Files\\rtk\\rtk.exe', 'win32');
+	assert.ok(win.includes('"C:\\Program Files\\rtk\\rtk.exe"'), 'cmd.exe has no single-quote meaning, so Windows gets double quotes');
+});
+
+// Rules: a block a child cannot act on is paid for by every delegation and changes nothing. `explore` has glob/grep/read_file/read_directory and `plan` has read_file alone (measured in the bundled host on 1.88.2), so neither can run the prefix the block asks for.
+test('rtk: an agent with no shell tool is not sent the prefix block', async () => {
+	const fake = load(rtk, {
+		exec: async request =>
+			request.args?.[0] === '--version' ? {stdout: 'rtk 1.0.1', stderr: '', code: 0} : {stdout: '', stderr: '', code: 1},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	for (const agent of ['explore', 'plan', 'EXPLORE']) {
+		assert.equal(
+			await firstHook(fake).beforeToolCall?.({toolName: 'agent', input: {...AGENT_CALL.input, subagent_type: agent}}),
+			undefined,
+			`${agent} cannot run a shell command, so the block would be dead weight`,
+		);
+	}
+	const general = (await firstHook(fake).beforeToolCall?.({toolName: 'agent', input: {...AGENT_CALL.input, subagent_type: 'general'}})) as
+		| {input: {prompt: string}}
+		| undefined;
+	assert.ok(general, 'general may run shell, so it still gets the block');
+	// an omitted subagent_type defaults to general in the host, so it must keep the block too
+	assert.ok(await firstHook(fake).beforeToolCall?.({toolName: 'agent', input: {description: 'x', prompt: 'task'}}));
 });
