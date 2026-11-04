@@ -12,11 +12,11 @@
 // rules: a rewritten shell call is skipped unless rtk left its faithful baseline — no recovery marker and a majority of `path:line:text` rows — because rtk's own never-worse guard declines to compress multi-file grep output by default.
 // rules: `shell_command`'s `args` array is part of the command line the host runs, so the rewrite sees it; a `-A/-B/-C` grep result is never handed to rtk's grep filter, which keeps only match rows and would silently drop the context the caller asked for.
 // rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
-// agent: unknown | unknown | 2026-11-03 | unknown | re-filter a rewritten call only when rtk declined to compress it (recovery-marker + grep-row gate, measured +33% on multi-file grep, 12 ms, 0 bytes on 12 real commands)
 // agent: unknown | unknown | 2026-11-03 | unknown | pinBinary rewritten as a quote-aware scan after measuring two live bugs: `&` and newline separators it emits were left bare (a rewrite then failed as `rtk: not found` off PATH), and a `rtk` inside a quoted argument was rewritten, corrupting the argument
 // agent: unknown | unknown | 2026-11-03 | unknown | inspect rtk 1.1.0 against the mod: cover the `powershell` shell tool, accept rtk's abbreviated `NF:` grouping header in both the recovery and fidelity markers, and probe every documented install dir (rtk's own installer writes ~/.local/bin, not ~/.bun/bin)
 // agent: unknown | unknown | 2026-11-03 | unknown | two measured defects: `shell_command`'s `args` were never part of the rewrite lookup (every compound call missed), and a `-A/-B/-C` grep result had its context rows silently dropped by rtk's grep filter; forcing a filter on misdetected text measured destructive, so auto-detect stays
 // agent: unknown | xai | 2026-11-04 | 01a1a3cc | review fixes: split every consecutive host notice, recognise Windows drive-letter grep rows, refuse an inflated reassembly, and gate spawns on an executable binary without suppressing the colour strip
+// agent: unknown | unknown | 2026-11-04 | unknown | measured review: splitRewrite dropped every prefixed/chained/expanded rewrite (7 of 10 commands), the negation count refused rtk's row-eliding grouping (41,739 -> 11,252 bytes declined), and valueless prefix flags (`env -i`, `exec -c`) ate the payload; raw args join kept and documented because quoting makes rtk defer
 
 import type {ModApi} from '@commandcode/harness';
 import {accessSync, constants, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -204,9 +204,13 @@ export interface FidelityReport {
 export function checkFidelity(original: string, filtered: string, autoDetected: boolean): FidelityReport {
 	const lost: string[] = [];
 
+	// Rules: the count test only holds when the filter kept every row. rtk's grep and find grouping ELIDES repeated rows by design (`+N`), so a 300-row file whose lines say `not` legitimately comes back with 10 — measured against rtk 1.1.0, a real grouped grep of `returns not ready_N` rows went 41,739 -> 11,252 bytes and was refused as `negation: 200 -> 80`, which suppressed the compression for every search that touches code containing a negation. So the counting test is skipped when the output is grouped; the `format:` and `context:` guards below still cover the harmful grouping cases.
+	// Rules: total loss is still refused even when grouped, because a group that drops every negation inverts the meaning no matter how many rows it elided.
+	const grouped = GROUPING_MARKER.test(filtered);
 	const negationsIn = countOf(original, NEGATION);
 	const negationsOut = countOf(filtered, NEGATION);
-	if (negationsOut < negationsIn) lost.push(`negation: ${negationsIn} -> ${negationsOut}`);
+	if (negationsIn > 0 && negationsOut === 0) lost.push(`negation: ${negationsIn} -> 0`);
+	else if (!grouped && negationsOut < negationsIn) lost.push(`negation: ${negationsIn} -> ${negationsOut}`);
 
 	// Rules: an explicit `-f grep` is rtk's grep filter, and that filter keeps only `path:line:text` rows. A result from the host's `grep` tool with `-A/-B/-C` carries `path-line-text` rows too, and every one of them is dropped (measured end-to-end: 40 context lines in, 0 out, accepted). The check runs for the explicit filter as well, because `autoDetected` is false on that path and the grouping test below would never see it.
 	// Rules: no `isGrepRows` precondition — one context line per match row is still a 50% row ratio, so the majority test would wave through exactly the case that loses the most context.
@@ -299,13 +303,18 @@ export function shouldRewrite(command: string): boolean {
 // Rules: `shell_command` carries an optional `args` array beside `command`, and the host runs `command + ' ' + args.shellQuoted` (verified in the bundled cli.mjs: `buildCommand2`). The rewrite must see that whole line, or a compound command is invisible: `command: 'cargo'` + `args: ['build']` asks rtk about the bare `cargo`, which has no rewrite, so the call ran unfiltered while `cargo build` rewrites fine. Measured on 12 real compound calls, every one was missed.
 // Rules: the answer is split back into a command plus the caller's untouched args, so the host's own quoting still applies to them — round-tripping them through a string would have to re-quote, and rtk does not preserve the quoting it is handed (`grep -r 'a b' src/` came back unquoted).
 // Rules: only a rewrite the line still *ends* with is trusted. rtk normalises some commands (`npx jest` -> `rtk jest`), and then the args suffix no longer lines up, so that rewrite is left alone rather than guessed at — a wrong split would move a caller's argument into the command.
+// Rules: the args are joined RAW, not shell-quoted the way the host runs them. That is deliberate and measured against rtk 1.1.0: quoting each arg makes rtk refuse the rewrite outright (`git 'status' '--porcelain'` and `cargo 'build'` both exit 1 with no output), while the raw form rewrites cleanly. A mismatch here can only cause rtk to judge a differently-quoted line, and any rewrite that comes back is re-emitted as the untouched `command` plus the caller's own args, which the host re-quotes — so a wrong verdict can only cost the rewrite, never change what runs.
 export function joinForRewrite(command: string, args: readonly string[]): {line: string; suffix: string} {
 	const suffix = args.length > 0 ? ` ${args.join(' ')}` : '';
 	return {line: `${command}${suffix}`, suffix};
 }
 
+// Rules: `rtk` must be a whole command word, so a `rtk-wrapper` binary or a path segment (`/tmp/rtk/git`) is not mistaken for the rewrite. The boundaries are the shell's own separators and quote characters, the same set `isCommandWordAt` uses; word boundaries alone accept both false positives.
+const CARRIES_RTK = /(?:^|[\s&|;<>"'(])rtk(?=$|[\s&|;<>"')])/;
+
+// Rules: a no-args rewrite is not `rtk ${command}` verbatim. rtk keeps a prefix (`env FOO=1 rtk …`, `nohup rtk …`, `timeout 5 rtk …`), a wrapper (`bash -c "rtk …"`), a chain (`cd src && rtk …`), or expands the subcommand (`cat README.md` -> `rtk read README.md`). Requiring exact equality dropped every one of those: measured against rtk 1.1.0, 7 of 10 representative commands were refused. The carried rewrite is accepted when it still names `rtk` at a command position, which is the same guard the args branch below uses.
 export function splitRewrite(rewritten: string, command: string, suffix: string): string | null {
-	if (!suffix) return rewritten === `rtk ${command}` ? rewritten : null;
+	if (!suffix) return CARRIES_RTK.test(rewritten) ? rewritten : null;
 	if (!rewritten.endsWith(suffix)) return null;
 	const rest = rewritten.slice(0, rewritten.length - suffix.length);
 	// Rules: the remainder must still carry the prefix, or the split ate the whole answer (a payload that happened to equal the suffix) and the caller would run an empty command.
@@ -317,8 +326,9 @@ export function splitRewrite(rewritten: string, command: string, suffix: string)
 // Rules: a command position is the start of a segment (`&&`, `||`, `;`, `|`, `&`) or a new line — rtk rewrites a multi-line block and `&` backgrounding, so both arrive from the binary itself — and either a line start, a line start after a run of `VAR=value` assignments, or one after a prefix command and its own arguments. Prefix commands are matched explicitly (`env`, `nohup`, `time`, `nice`, `command`, `exec`, `builtin`, `stdbuf`, `timeout` with its own duration) because rtk peels them rather than dropping them, and a program that merely shares the name must stay intact.
 // Rules: the quote style follows the shell that will read it. POSIX shells need single quotes (with `'\''` for an embedded one); cmd.exe has no single-quote meaning at all — it would pass the quote characters through — so Windows gets a double-quoted path instead.
 const PREFIX_COMMANDS = new Set(['env', 'nohup', 'time', 'nice', 'command', 'exec', 'builtin', 'stdbuf', 'timeout']);
-// Rules: a prefix flag that carries a separate value (`nice -n 5`, `env -u X`, `timeout -k 1`) must consume that value too, or the value is left as the payload and the real command is never reached. A flag written `-o0` or `--unset=X` already carries its value and consumes none.
-const VALUE_FLAGS = new Set(['-n', '-k', '-u', '-i', '-o', '-e', '-f', '-S', '-s', '-a', '-c', '--unset', '--set', '--format', '--adjustment', '--kill-after']);
+// Rules: a flag that carries its value in a SEPARATE word must consume it (`nice -n 5`, `env -u X`, `timeout -k 1`, `time -o FILE`), or the value is left as the payload and the real command is never reached. A flag written `-o0`, `--unset=X` or `--signal=9` already carries its value and must consume none.
+// Rules: `-i` and `-c` are NOT value-consuming: for `env`, `-i` is `--ignore-environment`, and for `exec`, `-c` is `-clear` (both verified: `bash -c 'exec -c echo hi'` printed `hi`, i.e. no argument was eaten). Listing either ate `rtk` as the flag's value and left the binary unpinned (measured). `stdbuf`'s `-i` is `--input=MODE` and normally written joined (`-i0`), which the joined branch handles.
+const VALUE_FLAGS = new Set(['-n', '-k', '-u', '-o', '-e', '-f', '-S', '-s', '-a', '--adjustment', '--unset', '--set', '--format', '--kill-after', '--signal']);
 
 // Rules: `rtk` must be a whole word, so `rtk-wrapper` and `myrtk` are not pinned.
 function isCommandWordAt(line: string, start: number): boolean {

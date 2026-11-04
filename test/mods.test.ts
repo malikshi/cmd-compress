@@ -11,7 +11,7 @@ import {normalizeCavemanLevel, CAVEMAN_STOP_PHRASES} from '../mods/caveman.ts';
 import {normalizePonytailLevel, PONYTAIL_STOP_PHRASES} from '../mods/ponytail.ts';
 import {COMPRESS_PRESETS, presetFor} from '../mods/compress.ts';
 import {defaultBinDirs, isShellTool} from '../mods/shared.ts';
-import {shouldRewrite, filterNameFor, filterForShape, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText, pinBinary} from '../mods/rtk.ts';
+import {shouldRewrite, filterNameFor, filterForShape, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText, pinBinary, joinForRewrite, splitRewrite} from '../mods/rtk.ts';
 
 test('normalizeCavemanLevel: on and empty mean the default, off and stop mean off', () => {
 	assert.equal(normalizeCavemanLevel(''), 'full');
@@ -249,6 +249,20 @@ test('pinBinary: a prefix command before rtk is pinned, and plain programs are n
 	assert.equal(pinBinary('git commit -m "use rtk"', bin, posix), 'git commit -m "use rtk"');
 });
 
+// Rules: `env -i` is `--ignore-environment` and takes no value, so it must not consume the payload. Measured before this fix: `-i` sat in VALUE_FLAGS, so `env -i rtk git status` had `rtk` eaten as the flag's value and the binary was left bare — a working command became `rtk: not found` off PATH.
+test('pinBinary: a valueless prefix flag does not swallow the command', () => {
+	const bin = '/opt/rtk';
+	const posix = 'linux';
+	assert.equal(pinBinary('env -i rtk git status', bin, posix), `env -i '${bin}' git status`);
+	assert.equal(pinBinary('env --ignore-environment rtk ls', bin, posix), `env --ignore-environment '${bin}' ls`);
+	// `exec -c` is `-clear` and takes no argument either (verified: `bash -c 'exec -c echo hi'` prints `hi`)
+	assert.equal(pinBinary('exec -c rtk ls', bin, posix), `exec -c '${bin}' ls`);
+	// the value-taking flags are unchanged
+	assert.equal(pinBinary('env -u HOME rtk ls', bin, posix), `env -u HOME '${bin}' ls`);
+	assert.equal(pinBinary('nice -n 5 rtk ls', bin, posix), `nice -n 5 '${bin}' ls`);
+	assert.equal(pinBinary('time -o out.txt rtk ls', bin, posix), `time -o out.txt '${bin}' ls`);
+});
+
 // Rules: rtk's own installer writes to `$RTK_INSTALL_DIR`, defaulting to ~/.local/bin (install.sh:18) — not ~/.bun/bin, which the probe assumed. A machine that installed rtk the documented way had the binary, yet the mod reported `binary: NOT FOUND` and injected no guidance. Every documented install dir is probed, and the user's explicit RTK_INSTALL_DIR comes first.
 test('defaultBinDirs: every documented install dir is probed, the explicit one first', () => {
 	assert.deepEqual(defaultBinDirs('/home/u'), ['/home/u/.local/bin', '/home/u/.bun/bin', '/home/u/.cargo/bin']);
@@ -307,4 +321,45 @@ test('the guidance does not promise lossless output, because grouped lists elide
 	assert.doesNotMatch(guidance, /Every signal survives/, 'the old absolute claim is gone');
 	assert.match(guidance, /elid/i, 'the elision is disclosed');
 	assert.match(guidance, /rtk recall/, 'and the recovery hint is still taught');
+});
+
+// Rules: a no-args rewrite is not `rtk ${command}` verbatim — rtk keeps a prefix, a wrapper, a chain, or expands the subcommand. Measured against rtk 1.1.0, the exact-equality check refused 7 of 10 representative commands, so the rewrite was silently dropped for the common case where `args` is empty and `command` holds everything.
+test('splitRewrite: a prefixed, chained or expanded rewrite is kept', () => {
+	const cases: Array<[string, string]> = [
+		['rtk read README.md', 'cat README.md'],
+		['rtk read README.md --head-lines 50', 'head -50 README.md'],
+		['cd src && rtk git status', 'cd src && git status'],
+		['rtk git status && rtk git diff', 'git status && git diff'],
+		['env FOO=1 rtk git status', 'env FOO=1 git status'],
+		['nohup rtk npm test', 'nohup npm test'],
+		['bash -c "rtk git status"', 'bash -c "git status"'],
+		['DOCKER_BUILDKIT=1 rtk docker build .', 'DOCKER_BUILDKIT=1 docker build .'],
+	];
+	for (const [rewritten, command] of cases) {
+		assert.equal(splitRewrite(rewritten, command, ''), rewritten, rewritten);
+	}
+});
+
+// Rules: the acceptance test must not become a hole — an answer with no `rtk` at all is not a rewrite, and neither a path segment nor a `rtk-…` program name is a command position.
+test('splitRewrite: an answer without rtk is still refused', () => {
+	assert.equal(splitRewrite('git status', 'git status', ''), null);
+	assert.equal(splitRewrite('', 'git status', ''), null);
+	assert.equal(splitRewrite('/tmp/rtk/git status', 'git status', ''), null);
+	assert.equal(splitRewrite('foo/rtk bar', 'bar', ''), null);
+	assert.equal(splitRewrite('rtk-wrapper x', 'x', ''), null);
+	assert.equal(splitRewrite('myrtk y', 'y', ''), null);
+});
+
+// Rules: the args branch is unchanged — it splits only when the answer still ends with the caller's suffix, so an arg moved into the command is caught.
+test('splitRewrite: the args branch still splits and still refuses a misaligned answer', () => {
+	assert.equal(splitRewrite('rtk cargo build', 'cargo', ' build'), 'rtk cargo');
+	assert.equal(splitRewrite('rtk jest', 'npx', ' jest --coverage'), null);
+	assert.equal(splitRewrite('rtk git status', 'git status', ''), 'rtk git status');
+});
+
+// Rules: `joinForRewrite` joins raw on purpose. Measured against rtk 1.1.0: host-style quoting makes rtk refuse the rewrite (`git 'status' '--porcelain'` exits 1 with no output) while the raw line rewrites fine, so quoting would cost every compound rewrite. Pinned so a later "fix" does not undo it.
+test('joinForRewrite: args are joined raw, because rtk refuses quoted ones', () => {
+	assert.deepEqual(joinForRewrite('cargo', ['build']), {line: 'cargo build', suffix: ' build'});
+	assert.deepEqual(joinForRewrite('grep', ['-n', 'hello world', 'src']), {line: 'grep -n hello world src', suffix: ' -n hello world src'});
+	assert.deepEqual(joinForRewrite('git', []), {line: 'git', suffix: ''});
 });

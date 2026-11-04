@@ -652,6 +652,25 @@ test('a filter that drops a negation is refused', async () => {
 	assert.match(report.lost[0] ?? '', /negation/);
 });
 
+// Rules: rtk's grep/find grouping elides repeated rows by design (`+N`), so the negation COUNT legitimately falls. Measured against rtk 1.1.0: a real grouped grep of `returns not ready_N` rows went 41,739 -> 11,252 bytes and the counting test refused it (`negation: 200 -> 80`), which turned the filter off for every search whose matches contain `not`. A grouped result keeps a reduced count, so the count test is skipped there.
+test('a grouped result is not refused for eliding repeated negations', async () => {
+	const {checkFidelity} = await import('../mods/rtk.ts');
+	const rows = Array.from({length: 300}, (_, index) => `src/a.ts:${index + 1}:  if (!ready) return; // not allowed`).join('\n');
+	const grouped = '300 matches in 1F:\n\n[file] src/a.ts (300):\n     1: if (!ready) return; // not allowed\n  +290';
+	assert.equal(checkFidelity(rows, grouped, false).ok, true, 'elided rows carry a reduced negation count, which is expected');
+	assert.equal(checkFidelity(rows, grouped, true).ok, true, 'the auto-detected path is the same');
+});
+
+// Rules: total negation loss still inverts meaning even when grouped, so the grouping exemption must not become a hole for the original failure.
+test('a grouped result that drops every negation is still refused', async () => {
+	const {checkFidelity} = await import('../mods/rtk.ts');
+	const rows = Array.from({length: 40}, (_, index) => `src/a.ts:${index + 1}:  not ready`).join('\n');
+	const grouped = '40 matches in 1F:\n\n[file] src/a.ts (40):\n     1: fine';
+	const report = checkFidelity(rows, grouped, false);
+	assert.equal(report.ok, false);
+	assert.match(report.lost.join(' '), /negation: 40 -> 0/);
+});
+
 // Rules: the host's `grep` tool supports `-A/-B/-C`, and ripgrep prints a context line as `path-line-text` where a match is `path:line:text`. rtk's grep filter keeps only the match form, so the context the caller explicitly asked for is dropped — measured end-to-end through the real mod, a 40-match result with 40 context lines went 3,178 -> 1,665 bytes with all 40 gone. The explicit-filter path skips the grouping test, so this needs its own check.
 test('a grep result carrying -A/-B/-C context is not handed to the grep filter', async () => {
 	const {checkFidelity} = await import('../mods/rtk.ts');
