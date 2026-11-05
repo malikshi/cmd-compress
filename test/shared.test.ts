@@ -5,6 +5,7 @@
 // rules: the fake store mirrors the harness store's synchronous get / async set so the serialised writer is exercised.
 // agent: unknown | unknown | 2026-11-02 | unknown | initial; per-mod key after learning each mod gets its own store file
 // agent: unknown | unknown | 2026-11-03 | unknown | drop the stripBlock/shortPaths tests with the functions: the host rebuilds the append list every round, so neither had a production caller
+// agent: unknown | xai | 2026-11-06 | unknown | POSIX pipe paths are single-quoted; added literal `$` execution and Windows `%` escaping tests
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -115,9 +116,9 @@ test('pipeCommand: POSIX passes the redirect line bare to sh -c', () => {
 	const shell = {command: '/bin/sh', args: ['-c'], wrap: false};
 	assert.deepEqual(pipeCommand('/root/.bun/bin/rtk', 'grep', '/tmp/in.txt', shell), {
 		command: '/bin/sh',
-		args: ['-c', '"/root/.bun/bin/rtk" pipe -f grep < "/tmp/in.txt"'],
+		args: ['-c', "'/root/.bun/bin/rtk' pipe -f grep < '/tmp/in.txt'"],
 	});
-	assert.deepEqual(pipeCommand('rtk', null, '/tmp/in.txt', shell).args[1], '"rtk" pipe < "/tmp/in.txt"', 'no -f when auto-detecting');
+	assert.deepEqual(pipeCommand('rtk', null, '/tmp/in.txt', shell).args[1], "'rtk' pipe < '/tmp/in.txt'", 'no -f when auto-detecting');
 });
 
 // Rules: cmd.exe re-parses its /c line and nested quotes do not survive that second pass. Measured on windows-latest: `""…rtk.cmd" pipe -f grep < "…in.txt""` was rejected with "is not recognized as an internal or external command". The builder therefore hands cmd.exe a batch file path and nothing else, and the script carries the real line.
@@ -180,5 +181,28 @@ test('pipeCommand: the Windows batch file actually redirects through cmd.exe', t
 	} finally {
 		rmSync(dir, {recursive: true, force: true});
 	}
+});
+
+// Rules: double quotes leave `$` active in the POSIX line, so a managed install under a path like `/opt/rtk$proof` expanded to a different path and the redirect failed. The single-quoted line must survive a real `sh`.
+test('pipeCommand: a POSIX path with $ is not expanded', t => {
+	if (process.platform === 'win32') return t.skip('POSIX quoting only');
+	const dir = mkdtempSync(join(tmpdir(), 'cmd-compress-$-'));
+	const file = join(dir, 'in.txt');
+	const standIn = join(dir, 'rtk');
+	writeFileSync(file, 'hello from stdin\n', 'utf8');
+	writeFileSync(standIn, '#!/bin/sh\nexec /bin/cat\n', {encoding: 'utf8', mode: 0o755});
+	try {
+		const built = pipeCommand(standIn, null, file, {command: '/bin/sh', args: ['-c'], wrap: false});
+		const out = execFileSync(built.command, built.args, {encoding: 'utf8'});
+		assert.equal(out, 'hello from stdin\n', 'the literal $ path reached the stand-in');
+	} finally {
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
+test('windowsPipeScript: a literal % in a path is doubled for cmd.exe', () => {
+	const script = windowsPipeScript('C:\\100%\\rtk.exe', null, 'C:\\a%20b\\in.txt');
+	assert.match(script, /100%%/);
+	assert.match(script, /a%%20b/);
 });
 

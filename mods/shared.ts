@@ -1,5 +1,5 @@
 // shared — mode lookup, prompt-block helpers, and binary/path utilities for the four mods.
-// exports: MODES, OFF, DEFAULT_MODE, MODE_EVENT, readOwnMode, writeOwnMode, announceMode, wrapBlock, AGENT_TOOL, withAgentBlock, defaultBinDirs, resolveBin, SHELL_TOOLS, isShellTool, filterShell, windowsPipeScript, pipeCommand, turnOffSiblings
+// exports: MODES, ModeName, OFF, DEFAULT_MODE, NORMAL_MODE, MODE_EVENT, readOwnMode, writeOwnMode, announceMode, wrapBlock, AGENT_TOOL, withAgentBlock, defaultBinDirs, resolveBin, SHELL_TOOLS, isShellTool, filterShell, windowsPipeScript, pipeCommand, turnOffSiblings
 // used_by: mods/*.ts, test/*.test.ts
 // related: rules/caveman.ts, rules/ponytail.ts
 // rules: cmd.store is namespaced per mod, so a mod persists ONLY its own key; a sibling's mode is read through cmd.use.
@@ -8,6 +8,7 @@
 // agent: unknown | unknown | 2026-11-03 | unknown | turnOffSiblings — "normal mode" must end every mode, and transformInput short-circuits on handled
 // agent: unknown | unknown | 2026-11-03 | unknown | announceMode + MODE_EVENT so the compress status repaints on any mode change; drop promptHas, which no caller or test ever referenced
 // agent: unknown | unknown | 2026-11-04 | unknown | AGENT_TOOL + withAgentBlock — a sub-agent run gets no mod hooks, so the `agent` call's prompt is the only channel a mode block can reach it through
+// agent: unknown | xai | 2026-11-06 | unknown | review fixes: CodeDNA section dividers removed; `NORMAL_MODE`/`ModeName` added to exports; POSIX pipe paths single-quoted and Windows `%` escaped
 
 import {accessSync, constants, existsSync} from 'node:fs';
 import {delimiter, join} from 'node:path';
@@ -81,7 +82,6 @@ export function announceMode(events: {emit?: (channel: string, data?: unknown) =
 	}
 }
 
-/* ---------------------------------------------------------------- shell tools */
 
 // Rules: Command Code exposes `shell_command` on every platform and `powershell` additionally on Windows (the host registers it behind `isPowerShellToolSupported`, an env override included). Both render through the same `formatResult2`, so both carry the `Exit code:` head and the same trailing notices, and a filter that covers one but not the other leaves every Windows shell result uncondensed.
 export const SHELL_TOOLS: ReadonlySet<string> = new Set(['shell_command', 'powershell']);
@@ -90,14 +90,12 @@ export function isShellTool(toolName: string): boolean {
 	return SHELL_TOOLS.has(toolName);
 }
 
-/* ---------------------------------------------------------------- prompt text */
 
 // Rules: no strip step is needed. The host builds the append list fresh every round (`appendSystemPrompt` collects one string per mod and joins them), so a level change swaps the block by simply returning the new one — a previous block can never accumulate, and the `<tag>` wrapper is for readability, not deduplication.
 export function wrapBlock(tag: string, body: string): string {
 	return `<${tag}>\n${body.trim()}\n</${tag}>`;
 }
 
-/* ------------------------------------------------------------- sub-agents */
 
 // Rules: a sub-agent run is built with `definition.systemPrompt` and a mod list holding only the host's own user-hooks mod (measured on 1.88.2: `mods:[a.mod, ...e.mods?.({permissionMode})]`, where the provider answers `[createUserHooksMod(...)]`), so `appendSystemPrompt` never fires for it and none of these blocks reach it. The one lever the parent still owns is the `agent` tool call itself: the host runs `run({userInput: e.prompt})` for the child and chains `beforeToolCall`'s `input` across mods, so appending to `prompt` puts the block in the child's first user turn.
 export const AGENT_TOOL = 'agent';
@@ -109,7 +107,6 @@ export function withAgentBlock(input: Record<string, unknown>, tag: string, body
 	return {...input, prompt: `${prompt}\n\n${wrapBlock(tag, body)}`};
 }
 
-/* ---------------------------------------------------------------- binaries */
 
 // Rules: the platform's own command shell, since `rtk pipe` reads stdin and the redirect has to be interpreted. `wrap` marks the platform whose shell re-parses its own /c line and therefore cannot be handed nested quoting.
 // Rules: the platform and ComSpec are parameters, not reads of the ambient process, so both branches are reachable from a test on either OS — otherwise the win32 path is code no run ever executes.
@@ -124,12 +121,19 @@ export function filterShell(
 }
 
 // Rules: cmd.exe re-parses its /c line, and nested quotes do not survive that second pass — measured on windows-latest CI, where `""…\rtk.cmd" pipe -f grep < "…\in.txt""` was rejected with "is not recognized as an internal or external command". A batch file removes the second parse: the script holds the real line once, and cmd.exe is asked only to run one path.
+// Rules: cmd.exe expands `%NAME%` inside quotes too, so a literal `%` in the binary or input path is doubled for the batch file.
 export function windowsPipeScript(bin: string, filter: string | null, file: string): string {
 	const flags = filter ? `-f ${filter} ` : '';
-	return `@echo off\r\n"${bin}" pipe ${flags}< "${file}"\r\n`;
+	const literal = (value: string) => value.replace(/%/g, '%%');
+	return `@echo off\r\n"${literal(bin)}" pipe ${flags}< "${literal(file)}"\r\n`;
 }
 
 // Rules: `rtk pipe` takes its input on stdin and the host exec has no stdin, so the text is redirected in from a file; this is the one place the shell line is built. When the shell wraps (cmd.exe) the caller passes the batch file it wrote, and only that path reaches the command line.
+// Rules: POSIX quotes both paths with single quotes, because double quotes leave `$`, a backtick, and `\` active: a managed install under a path like `/opt/rtk$proof` expanded to a different path and the redirect failed.
+function posixQuote(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 export function pipeCommand(
 	bin: string,
 	filter: string | null,
@@ -138,9 +142,9 @@ export function pipeCommand(
 	scriptPath?: string,
 ): {command: string; args: string[]} {
 	const flags = filter ? `-f ${filter} ` : '';
-	const line = `"${bin}" pipe ${flags}< "${file}"`;
+	const line = `${posixQuote(bin)} pipe ${flags}< ${posixQuote(file)}`;
 	if (shell.wrap) {
-		return {command: shell.command, args: [...shell.args, scriptPath ?? line]};
+		return {command: shell.command, args: [...shell.args, scriptPath ?? `"${bin}" pipe ${flags}< "${file}"`]};
 	}
 	return {command: shell.command, args: [...shell.args, line]};
 }
@@ -168,7 +172,7 @@ export function resolveBin(
 				return candidate;
 			}
 		} catch {
-			// not executable: keep probing
+			// Rules: a candidate that is not executable is skipped; keep probing.
 		}
 	}
 	return null;

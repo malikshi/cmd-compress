@@ -4,6 +4,7 @@
 // related: test/harness.ts, mods/caveman.ts, mods/ponytail.ts, mods/rtk.ts, mods/compress.ts
 // rules: setups run each mod through its exported default factory, so the wiring and the hooks are covered, not only the pure helpers.
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
+// agent: unknown | xai | 2026-11-06 | unknown | timestamp-log rewritten-call regression; wrapper and cache covered here or in the pure suites
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -222,7 +223,7 @@ test('rtk: on rewrites a shell command through rtk and injects guidance', async 
 		input: {command: 'git status'},
 	})) as {input: {command: string}};
 	assert.match(result.input.command, /rtk['"] git status$/, 'the rewrite is pinned to the resolved absolute path, quoted for this shell');
-	assert.match(seen[0] ?? '', /rewrite git status$/);
+	assert.match(seen.find(line => line.includes('rewrite')) ?? '', /rewrite git status$/);
 	assert.match(await appends(fake), /<rtk>/);
 });
 
@@ -244,7 +245,7 @@ test('rtk: a rewrite keeps the call\'s own args intact', async () => {
 	assert.match(result.input.command, /rtk['"] git status$/, 'only the command is rewritten, quoted for this shell');
 	assert.deepEqual(result.input.args, ['--porcelain'], 'the args survive');
 	assert.equal(result.input.timeout, 5000, 'and every other input field survives');
-	assert.match(seen[0] ?? '', /rewrite git status --porcelain$/, 'rtk is asked about the full line the host runs');
+	assert.match(seen.find(line => line.includes('rewrite')) ?? '', /rewrite git status --porcelain$/, 'rtk is asked about the full line the host runs');
 });
 
 // Rules: a compound command lives only in `command` + `args`: `command: 'cargo'` alone has no rewrite, while `cargo build` does. Measured against rtk 1.1.0 — every one of 12 real compound calls was missed before this.
@@ -285,8 +286,8 @@ test('rtk: a command with no rewrite is left untouched', async () => {
 test('rtk: an unrelated tool is never rewritten', async () => {
 	let calls = 0;
 	const fake = load(rtk, {
-		exec: async () => {
-			calls += 1;
+		exec: async request => {
+			if (request.args?.[0] !== '--version') calls += 1;
 			return {stdout: 'rtk read x', stderr: '', code: 0};
 		},
 	});
@@ -345,7 +346,7 @@ test('rtk: hostile grep output reaches the filter as data, not as shell source',
 	assert.ok(filterCommand, 'the filter ran');
 	assert.ok(!filterCommand.includes('/tmp/pwned'), 'payload is not in the command line');
 	assert.ok(!filterCommand.includes('rm -rf'), 'payload is not in the command line');
-	assert.match(filterCommand, / pipe -f grep < "/, 'the payload arrives through a redirected file');
+	assert.match(filterCommand, / pipe -f grep < '/, 'the payload arrives through a redirected file');
 });
 
 // Rules: rtk's exit 2 is a deny in its own contract — running the command anyway would ignore a rule the operator wrote.
@@ -406,7 +407,7 @@ test('rtk: unrewritten shell output is still condensed by auto-detect', async ()
 		isError: false,
 	})) as {content: Array<{text: string}>};
 	assert.equal(filtered.content[0]?.text, 'FAILURES (1):\n');
-	assert.match(calls.at(-1) ?? '', / pipe < "/, 'auto-detect runs with no -f');
+	assert.match(calls.at(-1) ?? '', / pipe < '/, 'auto-detect runs with no -f');
 });
 
 // Rules: a rewritten call was already filtered by rtk itself, so a second pass would cost a process and gain nothing.
@@ -570,7 +571,7 @@ test('rtk: a rewritten shell call is not filtered a second time', async () => {
 	const fake = load(rtk, {
 		exec: async request => {
 			if (request.args?.[0] === 'rewrite') return {stdout: 'rtk git status', stderr: '', code: 0};
-			filtered.push(request.args?.join(' ') ?? '');
+			if (request.args?.[0] !== '--version') filtered.push(request.args?.join(' ') ?? '');
 			return {stdout: 'condensed output\n', stderr: '', code: 0};
 		},
 	});
@@ -591,6 +592,34 @@ test('rtk: a rewritten shell call is not filtered a second time', async () => {
 	// and the marker is consumed, so replaying the same id does not suppress the pass forever
 	const replay = await firstHook(fake).afterToolCall?.({toolCallId: 'r1', toolName: 'shell_command', result: [{type: 'text', text: big}], isError: false});
 	assert.ok(replay, 'the marker was consumed, so a reused id is not suppressed');
+});
+
+// Rules: a timestamped log has the `path:line:text` shape but no file-like path. The loose row test treated it as rtk's declined grep baseline, so a rewritten call went through a second filter and came back as `N matches in 1F:` with the log lines elided. The strict row parser refuses it, so the rewritten-call guard returns the original.
+test('rtk: a timestamped log from a rewritten call is left untouched', async () => {
+	let pipes = 0;
+	const log = Array.from({length: 50}, (_, index) => `2026-11-04 12:00:${String(index % 60).padStart(2, '0')}: INFO step ${index} completed`).join('\n');
+	const grouped = '50 matches in 1F:\n\n[file] 2026-11-04 12 (50):\n  00:00: INFO step 0\n  +49';
+	const fake = load(rtk, {
+		exec: async request => {
+			if (request.args?.[0] === '--version') return {stdout: 'rtk 1.1.0', stderr: '', code: 0};
+			if (request.args?.[0] === 'rewrite') return {stdout: 'rtk grep -n INFO x', stderr: '', code: 0};
+			if (request.args?.join(' ').includes(' pipe ')) {
+				pipes += 1;
+				return {stdout: grouped, stderr: '', code: 0};
+			}
+			return {stdout: '', stderr: '', code: 1};
+		},
+	});
+	runHandler(fake.commands, 'rtk', 'on');
+	await firstHook(fake).beforeToolCall?.({toolCallId: 'log1', toolName: 'shell_command', input: {command: 'grep -n INFO x'}});
+	const result = await firstHook(fake).afterToolCall?.({
+		toolCallId: 'log1',
+		toolName: 'shell_command',
+		result: [{type: 'text', text: log}],
+		isError: false,
+	});
+	assert.equal(result, undefined, 'the original log reaches the model');
+	assert.equal(pipes, 0, 'no second filter pass for a non-match list');
 });
 
 
@@ -746,6 +775,7 @@ test('compress: an rtk that is too old is annotated with its own reason', async 
 	}
 	sessionStart(fake);
 	await new Promise(resolve => setTimeout(resolve, 20));
+	await runHandler(fake.commands, 'rtk', 'status');
 	assert.match(messageOf(runHandler(fake.commands, 'compress', 'max')), /rtk=on \(rtk too old/);
 });
 
@@ -816,6 +846,29 @@ test('rtk: a real --rtk-bin is still reported as the binary', async () => {
 	assert.doesNotMatch(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /NOT FOUND/);
 });
 
+// Rules: `accessSync(X_OK)` passes for a searchable directory. Reporting that as the binary injects guidance and promises rewrites, while every spawn fails; the check must require a regular file.
+test('rtk: a directory is reported as NOT FOUND, not as the binary', async () => {
+	const fake = load(rtk, {flags: {'rtk-bin': tmpdir()}});
+	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /binary: NOT FOUND/);
+	assert.equal(await appends(fake), '', 'no guidance for a path that cannot execute');
+});
+
+// Rules: the default is off, so an off session must not pay a version spawn it never uses. Status and `on` ask for the probe explicitly.
+test('rtk: an off session does not probe, and status probes on demand', async () => {
+	let calls = 0;
+	const fake = load(rtk, {
+		exec: async () => {
+			calls += 1;
+			return {stdout: 'rtk 1.1.0', stderr: '', code: 0};
+		},
+	});
+	firstHook(fake).onSessionStart?.();
+	await new Promise(resolve => setTimeout(resolve, 20));
+	assert.equal(calls, 0, 'off means no version probe at session start');
+	await runHandler(fake.commands, 'rtk', 'status');
+	assert.equal(calls, 1, 'status probes the binary');
+});
+
 // Rules: Command Code registers `powershell` on Windows, and it renders through the same formatter `shell_command` does. Measured before this fix: the mod did nothing at all for it — no rewrite, no condensing — so every Windows shell result reached the model at full size.
 test('rtk: the powershell shell tool is rewritten and condensed like shell_command', async () => {
 	const seen: string[] = [];
@@ -835,7 +888,7 @@ test('rtk: the powershell shell tool is rewritten and condensed like shell_comma
 	})) as {input: {command: string}} | undefined;
 	assert.ok(rewritten, 'a powershell command is rewritten');
 	assert.match(rewritten.input.command, /rtk['"] git status$/, 'and pinned to the resolved path');
-	assert.match(seen[0] ?? '', /rewrite git status$/);
+	assert.match(seen.find(line => line.includes('rewrite')) ?? '', /rewrite git status$/);
 
 	const filtered = (await firstHook(fake).afterToolCall?.({
 		toolCallId: 'ps2',

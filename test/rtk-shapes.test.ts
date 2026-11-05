@@ -5,6 +5,7 @@
 // rules: Command Code's own tool output is not rtk's fixture — grep and glob wrap their body in a header or a trailer, and shell_command prefixes an exit status. A filter that folds those away deletes information the model needs, so each shape is pinned here against the installed rtk.
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
 // agent: unknown | unknown | 2026-11-05 | unknown | added the CRLF equivalence test and the two local-layout fidelity tests, after measuring that Windows parsing dropped every path list and that the guard refused the condenser's own `NF:` header
+// agent: unknown | xai | 2026-11-06 | unknown | review fixes: timestamp-log data-loss test, pass-cache regression, median timing batches, count/path `+N files` assertions
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -56,7 +57,9 @@ function localOnly(exec: (request: FakeExecRequest) => Promise<{stdout: string; 
 	const fake = createFakeCmd({exec});
 	fake.cmd.name = 'probe';
 	rtk(fake.cmd as never);
-	runHandler(fake.commands, 'rtk', 'on');
+	// Rules: set the mode through the exposed setter, not `/rtk on`, so these tests isolate the local pass from the on-demand version probe.
+	const setMode = fake.exposed.get('probe')?.get('setMode') as ((value: unknown) => boolean) | undefined;
+	setMode?.('on');
 	return fake;
 }
 
@@ -440,7 +443,7 @@ test('condensePaths: every directory is named and each file list is capped', () 
 	assert.ok(out, 'a path list is condensed');
 	assert.match(out, /^240 files in 24 dirs:/);
 	for (let dir = 0; dir < 24; dir += 1) assert.ok(out.includes(`./src/a${dir}/`), `dir a${dir} is named`);
-	assert.match(out, /\+4\n/, 'the elided files are counted');
+	assert.match(out, /\+4 files\n/, 'the elided files are counted and labelled');
 });
 
 test('condensePaths: a match row is refused, so a grep body is left to the row condenser', () => {
@@ -456,6 +459,7 @@ test('condenseCountRows: a count body is grouped, and no number is left where a 
 	assert.match(out, /^40 files in 1 dirs:/);
 	assert.match(out, /src\/  \(40 files, \d+ hits\)/, 'the directory line states both counts');
 	assert.match(out, /file0\.ts \(1\)/, 'each count is printed with the file it belongs to');
+	assert.match(out, /\+34 files/, 'the elided file names are counted and labelled');
 	assert.doesNotMatch(out, /^\s+\S+:\d+/m, 'no bare `name:number` position can be misread as a line number');
 	assert.ok(out.length < count.length, 'and it is smaller than the input');
 });
@@ -540,6 +544,27 @@ test('rewrite: a repeated command spawns rtk once, and a deny is always re-asked
 	assert.equal(calls, 2, 'a denied command is asked again every time');
 });
 
+// Rules: a cached `pass` is the mirror of a stale deny. The user can add a rule mid-session; a command that passed before the edit must be asked again, or the new rule is bypassed for the rest of the session. Only a rewrite verdict is stable enough to cache.
+test('rewrite: a pass is re-asked, so a new deny is not bypassed', async () => {
+	let calls = 0;
+	let deny = false;
+	const fake = localOnly(async (request: FakeExecRequest) => {
+		if (request.args?.[0] === '--version') return {stdout: 'rtk 1.1.0', stderr: '', code: 0};
+		calls += 1;
+		return deny
+			? {stdout: 'pipeline rule forbids it', stderr: '', code: 2}
+			: {stdout: '', stderr: '', code: 1};
+	});
+	const call = (id: string) => firstHook(fake).beforeToolCall?.({toolCallId: id, toolName: 'shell_command', input: {command: 'git status'}});
+
+	assert.equal(await call('p1'), undefined, 'the first call has no rewrite');
+	deny = true;
+	const blocked = (await call('p2')) as {block?: boolean; additionalContext?: string} | undefined;
+	assert.equal(calls, 2, 'the second call spawned rtk instead of serving the cached pass');
+	assert.equal(blocked?.block, true, 'the newly added rule blocks the command');
+	assert.match(blocked?.additionalContext ?? '', /pipeline rule forbids it/);
+});
+
 // Rules: the local condensers cost no process, so they must not be gated on the binary or on the 1,200-byte spawn floor. This is the whole point on a machine with no rtk: the grep result still shrinks. A stub whose every spawn fails is a session with no binary.
 test('grep: a body below the spawn floor still shrinks, with no process', async () => {
 	const spawned: string[] = [];
@@ -610,25 +635,36 @@ test('splitSegments: a notice followed by trailing whitespace is still split off
 	assert.equal(split.tail, '\n\n[Showing results with pagination = limit: 40]');
 });
 
+// Rules: a single wall-clock sample is not a regression signal in this container. Measured: the same linear call took 22 ms on two runs and 747 ms on a third while an unrelated no-op loop showed the same stall. The median of several batches ignores a stalled batch and still fails loudly if the old quadratic path returns.
+function medianMs(run: () => void, batches = 5, perBatch = 3): number {
+	const samples: number[] = [];
+	for (let batch = 0; batch < batches; batch += 1) {
+		const started = performance.now();
+		for (let index = 0; index < perBatch; index += 1) run();
+		samples.push((performance.now() - started) / perBatch);
+	}
+	samples.sort((a, b) => a - b);
+	return samples[Math.floor(samples.length / 2)] ?? Number.POSITIVE_INFINITY;
+}
+
 // Rules: `splitSegments` runs on every large shell result before the filter, so it must be linear. The original trailer pattern began with `\n*` and ended with `[\s]*$`, which made the engine retry every offset and re-scan the tail each time: measured 825 ms at 20k newlines and 9.8 s at 60k, on a result the session is blocked on. A 200k-newline body must stay in the low milliseconds, and the notice must still be found.
 test('splitSegments: a long blank run is handled in linear time, not quadratic', () => {
-	const started = Date.now();
-	const split = splitSegments('shell_command', 'Exit code: 1\nbody\n' + '\n'.repeat(200_000) + '[Showing results with pagination = limit: 40]');
-	const elapsed = Date.now() - started;
+	const input = 'Exit code: 1\nbody\n' + '\n'.repeat(200_000) + '[Showing results with pagination = limit: 40]';
+	const elapsed = medianMs(() => splitSegments('shell_command', input));
+	const split = splitSegments('shell_command', input);
 	assert.equal(split.head, 'Exit code: 1\n', 'the exit status is still split as the head');
 	assert.equal(split.body, 'body', 'the body is what is left after the blank run');
 	assert.equal(split.tail, '\n\n[Showing results with pagination = limit: 40]', 'and the notice is still found at the end');
-	assert.ok(elapsed < 200, `200k newlines took ${elapsed}ms; the old pattern took seconds at 60k`);
+	assert.ok(elapsed < 200, `200k newlines took ${elapsed.toFixed(0)}ms median; the old pattern took seconds at 60k`);
 });
 
 // Rules: the same shape without a notice must also stay linear — this is the case that made the quadratic path worst, because every attempt failed.
 test('splitSegments: a long blank run with no notice stays linear too', () => {
-	const started = Date.now();
 	const input = `Exit code: 1\n${'x'.repeat(200_000)}\n${'\n'.repeat(100_000)}`;
+	const elapsed = medianMs(() => splitSegments('shell_command', input));
 	const split = splitSegments('shell_command', input);
-	const elapsed = Date.now() - started;
 	assert.equal(split.tail, '');
-	assert.ok(elapsed < 200, `took ${elapsed}ms`);
+	assert.ok(elapsed < 200, `took ${elapsed.toFixed(0)}ms median`);
 });
 
 // Rules: this file's whole value is running against a real binary. When rtk is absent every test here skips, and a skipped suite looks exactly like a passing one in a summary line — which is how this coverage went quiet before CI installed rtk. The guard turns that silence into a visible note instead of a hidden skip, and CI fails the install step rather than reaching here without the binary.
@@ -679,16 +715,28 @@ test('the abbreviated NF: grouping header is a recovery marker too', async t => 
 });
 
 // Rules: a diff, a git log, and a build log all contain colons and digits, so the row test must not fire on them — re-filtering a format rtk did not decline was measured as byte-identical (0 bytes, 12 real commands), which is a wasted process rather than a loss, but still not worth spawning.
+// Rules: a timestamped log is the dangerous form. `2026-11-04 12:00:01: INFO …` has the `path:line:text` shape unless the path is checked like a file; without that check a rewritten call's log was accepted as a grep baseline, grouped, and returned as a summary that dropped every line.
 test('output that is not a match list is never re-filtered', () => {
 	const samples: Array<[string, string]> = [
 		['diff', '+++ b/mods/rtk.ts\n--- a/mods/rtk.ts\n@@ -1,4 +1,4 @@\n-const a = 1;\n+const a = 2;'],
 		['git log', 'f7e35e0 chore: release 0.1.1\nd18dfed fix(rtk): stop deleting host envelopes'],
 		['build log', '> tsc --noEmit\n\nsrc/a.ts(12,5): error TS2322: Type string is not assignable'],
 		['json', '{\n  "name": "cmd-compress",\n  "version": "0.1.1"\n}'],
+		['timestamp log', Array.from({length: 20}, (_, index) => `2026-11-04 12:00:${String(index).padStart(2, '0')}: INFO step ${index}`).join('\n')],
 	];
 	for (const [name, text] of samples) {
 		assert.equal(canRefilterCompressed(text), false, `${name} must not be re-filtered`);
 	}
+});
+
+test('a timestamped log is not accepted as a grouped match list', () => {
+	const log = Array.from({length: 20}, (_, index) => `2026-11-04 12:00:${String(index).padStart(2, '0')}: INFO step ${index}`).join('\n');
+	const grouped = '20 matches in 1F:\n\n[file] 2026-11-04 12 (20):\n  00:00: INFO step 0\n  +19';
+	assert.equal(isGrepRows(log), false, 'the log has no file-like path');
+	assert.equal(canRefilterCompressed(log), false, 'the declined-baseline path is closed');
+	const report = checkFidelity(log, grouped, true);
+	assert.equal(report.ok, false, 'the grouping is a wrong format guess');
+	assert.match(report.lost.join(' '), /format:/);
 });
 
 // Rules: end to end through the real hooks, the whole point is that a rewritten call normally skips and this one does not.

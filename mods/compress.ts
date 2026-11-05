@@ -1,5 +1,5 @@
 // compress — one preset for all three modes, plus the live status line.
-// exports: default, COMPRESS_PRESETS, presetFor
+// exports: default, COMPRESS_PRESETS, presetFor, Preset
 // used_by: package.json (commandcode.mods), test/mods.behaviour.test.ts
 // related: mods/caveman.ts, mods/ponytail.ts, mods/rtk.ts
 // rules: a preset is applied through each mode's exposed setMode, so the three mods stay the only writers of their own state.

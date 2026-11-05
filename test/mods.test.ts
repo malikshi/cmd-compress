@@ -4,6 +4,7 @@
 // related: mods/caveman.ts, mods/ponytail.ts, mods/compress.ts, mods/rtk.ts
 // rules: these must not import the mods' factory (it reads cmd.store at load); only the pure helpers are imported.
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
+// agent: unknown | xai | 2026-11-06 | unknown | wrapper requote execution test, quoted assignment prefixes, guidance pinned-path test
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -13,7 +14,9 @@ import {COMPRESS_PRESETS, presetFor} from '../mods/compress.ts';
 import {defaultBinDirs, isShellTool} from '../mods/shared.ts';
 import {shouldRewrite, filterNameFor, filterForShape, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText, pinBinary, joinForRewrite, splitRewrite} from '../mods/rtk.ts';
 import {createFakeCmd} from './harness.ts';
-import {existsSync} from 'node:fs';
+import {chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
+import {execFileSync} from 'node:child_process';
+import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
 test('normalizeCavemanLevel: on and empty mean the default, off and stop mean off', () => {
@@ -127,6 +130,16 @@ test('pinBinary: an assignment prefix does not hide the command', () => {
 	assert.equal(pinBinary('FOO=1 rtk ls', '/opt/rtk', 'linux'), "FOO=1 '/opt/rtk' ls");
 });
 
+// Rules: rtk emits assignments with quoted values (`FOO="a b" rtk git status` and `env FOO="a b" rtk git status`). A `\S*` value regex stopped at the space inside the quotes, so the inner rtk stayed bare. The value is scanned as a shell word, including escaped spaces.
+test('pinBinary: a quoted assignment value does not hide the command', () => {
+	const bin = '/opt/rtk';
+	const posix = 'linux';
+	assert.equal(pinBinary('FOO="a b" rtk git status', bin, posix), `FOO="a b" '${bin}' git status`);
+	assert.equal(pinBinary("FOO='a b' rtk git status", bin, posix), `FOO='a b' '${bin}' git status`);
+	assert.equal(pinBinary('env FOO="a b" rtk git status', bin, posix), `env FOO="a b" '${bin}' git status`);
+	assert.equal(pinBinary('FOO=a\\ b rtk git status', bin, posix), `FOO=a\\ b '${bin}' git status`);
+});
+
 test('filterNameFor: grep and glob map to rtk filters, others do not', () => {
 	assert.equal(filterNameFor('grep'), 'grep');
 	assert.equal(filterNameFor('glob'), 'find');
@@ -197,6 +210,15 @@ test('the injected guidance only names commands this rtk build actually has', as
 	for (const name of new Set(named)) {
 		assert.match(help, new RegExp(`\\b${name}\\b`), `rtk ${name} is listed in rtk --help`);
 	}
+});
+
+// Rules: the guidance is injected when the binary is usable, including an install outside PATH — the exact case the pinning exists for. Direct commands in the block must therefore use the resolved quoted path, or the model is told to run a bare `rtk` that the shell cannot find. The path is stable for the session, so the prompt block stays byte-stable.
+test('guidanceText: direct rtk commands use the resolved binary path', () => {
+	const text = guidanceText('/opt/my tools/rtk', 'linux');
+	assert.match(text, /'\/opt\/my tools\/rtk' read/);
+	assert.match(text, /'\/opt\/my tools\/rtk' gain/);
+	assert.match(text, /'\/opt\/my tools\/rtk' recall/);
+	assert.doesNotMatch(text, /`rtk read/);
 });
 
 // Rules: a named subcommand can exist while a flag it is shown with does not — `--level aggressive` and `--keys-only` are both taught by the guidance, so each flag is checked against that subcommand's own help.
@@ -312,6 +334,24 @@ test('pinBinary: a wrapper script that expands is left alone rather than requote
 	const posix = 'linux';
 	assert.equal(pinBinary("sh -c 'echo $HOME; rtk x'", bin, posix), "sh -c 'echo $HOME; rtk x'", 'a $ inside single quotes stays put');
 	assert.equal(pinBinary('sh -c "echo $HOME; rtk x"', bin, posix), `sh -c "echo $HOME; '${bin}' x"`, 'a double-quoted script keeps its expansion and is still pinned');
+});
+
+// Rules: the wrapper requote used to wrap the pinned script in double quotes without escaping the script's own double quotes. `sh -c 'printf "[%s]\n" "a b"; rtk done'` became `sh -c "'/bin/rtk' printf "[%s]\n" "a b"; …"`, so the inner shell split `a b` into two arguments. The pinned path may also contain `$`; the single-quoted script has no expansion of its own, so escaping the entire pinned form for the outer double quotes keeps both.
+test('pinBinary: a single-quoted wrapper keeps its double quotes and special path', t => {
+	if (process.platform === 'win32') return t.skip('POSIX wrapper quoting only');
+	const dir = mkdtempSync(join(tmpdir(), 'rtk-pin-'));
+	const stub = join(dir, 'rtk$proof');
+	writeFileSync(stub, '#!/bin/sh\nprintf "RTK:%s\\n" "$*"\n', {mode: 0o755});
+	chmodSync(stub, 0o755);
+	try {
+		const pinned = pinBinary(`sh -c 'printf "<%s>" "a b"; rtk done'`, stub, 'linux');
+		const out = execFileSync('/bin/sh', ['-c', pinned], {encoding: 'utf8', env: {...process.env, PATH: `${dir}:${process.env.PATH ?? ''}`}});
+		assert.match(out, /<a b>/, 'the quoted argument stays one word');
+		assert.doesNotMatch(out, /<a><b>/, 'the argument was not split');
+		assert.match(out, /RTK:done/, 'the pinned wrapper ran the stub');
+	} finally {
+		rmSync(dir, {recursive: true, force: true});
+	}
 });
 
 // Rules: the wrapper pass must not touch ordinary quoting — a `rtk` that is data stays data, and a script with no rtk in it is returned untouched.
