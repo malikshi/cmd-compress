@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {execFile, execFileSync} from 'node:child_process';
 import {readFileSync} from 'node:fs';
 import {performance} from 'node:perf_hooks';
-import rtk, {canRefilterCompressed, checkFidelity, condenseGrepRows, condensePaths, hasGrepContext, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
+import rtk, {canRefilterCompressed, checkFidelity, condenseCountRows, condenseGrepRows, condensePaths, hasGrepContext, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
 import {createFakeCmd, firstHook, resultText, runHandler, type FakeExecRequest} from './harness.ts';
 
 type ExecRequest = {command: string; args?: string[]; cwd?: string; signal?: AbortSignal};
@@ -448,6 +448,51 @@ test('condensePaths: a match row is refused, so a grep body is left to the row c
 	assert.equal(condensePaths(rows), null);
 });
 
+// Rules: the host's count mode emits `path:count` (`finishCountMode`: `compactPath(n.path):n.count`), which `grepBodyRow` cannot recognise because it needs a third field. That row used to reach the path tree and print `file0.ts:1`, where `1` is the match COUNT sitting exactly where a line number goes — a model reading that reopens the wrong line. It now has its own layout, where every number is labelled, so no position in the output can be read as a line number.
+test('condenseCountRows: a count body is grouped, and no number is left where a line number goes', () => {
+	const count = Array.from({length: 40}, (_, index) => `src/file${index}.ts:${(index % 10) + 1}`).join('\n');
+	const out = condenseCountRows(count);
+	assert.ok(out, 'a count body is condensed');
+	assert.match(out, /^40 files in 1 dirs:/);
+	assert.match(out, /src\/  \(40 files, \d+ hits\)/, 'the directory line states both counts');
+	assert.match(out, /file0\.ts \(1\)/, 'each count is printed with the file it belongs to');
+	assert.doesNotMatch(out, /^\s+\S+:\d+/m, 'no bare `name:number` position can be misread as a line number');
+	assert.ok(out.length < count.length, 'and it is smaller than the input');
+});
+
+test('condenseCountRows: a path list, a match body and a log are all refused', () => {
+	assert.equal(condenseCountRows(Array.from({length: 40}, (_, index) => `src/f${index}.ts`).join('\n')), null, 'a bare path has no count');
+	assert.equal(condenseCountRows(Array.from({length: 40}, (_, index) => `src/f${index}.ts:${index}:hit`).join('\n')), null, 'a match row has text after the number');
+	assert.equal(condenseCountRows('2026-11-04 12:00:01: INFO started\n2026-11-04 12:00:02: INFO done'), null, 'a timestamp log is not a count body');
+	assert.equal(condenseCountRows('src/a.ts:1'), null, 'a single row is not worth a layout');
+});
+
+// Rules: a path that appears on more than one row must become ONE entry whose count is the sum, never two entries under the same name. Measured: six `src/m0/f0.ts` rows printed `f0.ts` six times and the directory header claimed more files than existed, so the model reads phantom files and the per-directory count overstates the tree. A duplicate path is also what a paged or concatenated count body produces, so it is reachable even though `finishCountMode` emits one row per file.
+// Rules: the fixture is large enough to clear MIN_LOCAL_GAIN — a three-file body is declined by `worthIt`, which is correct behaviour, so a small fixture would test the filter instead of the dedupe.
+test('condenseCountRows: a repeated path is summed into one entry, not listed twice', () => {
+	const rows: string[] = [];
+	for (let index = 0; index < 12; index += 1) {
+		rows.push(`src/m0/f0.ts:${index + 1}`);
+		rows.push(`src/m0/f${index + 1}.ts:2`);
+		rows.push(`src/m1/f${index + 20}.ts:3`);
+	}
+	const count = rows.join('\n');
+	const out = condenseCountRows(count);
+	assert.ok(out, 'the body is condensed');
+	assert.equal(out.match(/f0\.ts/g)?.length, 1, 'the repeated path is named once');
+	assert.match(out, /f0\.ts \(78\)/, 'its count is the sum of all twelve rows');
+	assert.match(out, /^25 files in 2 dirs:/, 'distinct files are counted, not rows');
+	assert.match(out, /src\/m0\/  \(13 files, 102 hits\)/, 'the directory claims the distinct file count and the total hits');
+});
+
+test('condensePaths: a count-mode row is refused, since its number is a count and not a line', () => {
+	const count = Array.from({length: 40}, (_, index) => `src/file${index}.ts:${(index % 10) + 1}`).join('\n');
+	assert.equal(condensePaths(count), null, 'a `path:count` row is not a bare path');
+
+	const oneHit = Array.from({length: 40}, (_, index) => `src/file${index}.ts:1`).join('\n');
+	assert.equal(condensePaths(oneHit), null, 'and a uniform count is refused too, not read as line 1 of forty files');
+});
+
 test('condensePaths: a prose line is refused', () => {
 	const mixed = [...Array.from({length: 40}, (_, index) => `src/f${index}.ts`), 'error: gone wrong'].join('\n');
 	assert.equal(condensePaths(mixed), null);
@@ -780,6 +825,7 @@ test('extractSpillNotices lifts both pointer forms and nothing else', async () =
 });
 
 // Rules: this runs on every result, and the split+join below costs 31 ms on a 700 KB body even when no pointer is present — which is almost always. The marker pre-check is what makes the common case free, and it must return the input byte-identical rather than a renormalised copy.
+// Rules: the timing assertion is a MEDIAN of repeated batches, not a mean of one batch. Measured: a single 20-call batch occasionally reported 146 ms/call in this container while the true cost is ~0.55 ms/call — an unrelated no-op loop shows the same multi-hundred-ms stalls, so a mean against a wall-clock bound is a flaky test, not a regression detector. The median of several batches ignores a stalled batch and still fails loudly if the marker pre-check is removed, since the split+join path costs ~31 ms/call.
 test('extractSpillNotices: a body with no pointer is returned unchanged, and cheaply', async () => {
 	const {extractSpillNotices} = await import('../mods/rtk.ts');
 	const plain = Array.from({length: 20_000}, (_, index) => `[build] compiling module ${index} ...`).join('\n');
@@ -787,9 +833,14 @@ test('extractSpillNotices: a body with no pointer is returned unchanged, and che
 	assert.equal(result.body, plain, 'the body is byte-identical');
 	assert.equal(result.notices, '', 'and nothing was lifted');
 	assert.equal(extractSpillNotices('no newline at all').body, 'no newline at all');
-	const started = performance.now();
-	for (let index = 0; index < 20; index += 1) extractSpillNotices(plain);
-	assert.ok((performance.now() - started) / 20 < 5, 'a 700 KB body costs almost nothing');
+	const batches: number[] = [];
+	for (let batch = 0; batch < 5; batch += 1) {
+		const started = performance.now();
+		for (let index = 0; index < 20; index += 1) extractSpillNotices(plain);
+		batches.push((performance.now() - started) / 20);
+	}
+	batches.sort((a, b) => a - b);
+	assert.ok(batches[2]! < 5, `a 700 KB body costs almost nothing (median ${batches[2]!.toFixed(2)} ms/call)`);
 });
 
 // Rules: the same mid-result pointer arrives on a grep result, and `condense` is shared — this pins that the grep path goes through it rather than around it.

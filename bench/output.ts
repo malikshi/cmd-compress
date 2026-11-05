@@ -13,7 +13,7 @@ import {join} from 'node:path';
 import {CAVEMAN_LEVELS, cavemanRule} from '../rules/caveman.ts';
 import {PONYTAIL_LEVELS, ponytailRule} from '../rules/ponytail.ts';
 import {resolveBin} from '../mods/shared.ts';
-import {canRefilterCompressed, condenseGrepRows, condensePaths, filterForShape, splitSegments, stripAnsi} from '../mods/rtk.ts';
+import {canRefilterCompressed, condenseCountRows, condenseGrepRows, condensePaths, filterForShape, splitSegments, stripAnsi} from '../mods/rtk.ts';
 import {
 	makeFindOutput,
 	makeGlobToolOutput,
@@ -140,6 +140,11 @@ function condenseTool(bin: string | null, filter: string | null, tool: string, i
 	const localPaths = condensePaths(plainBody);
 	if (localPaths !== null) {
 		return {stdout: `${head}${localPaths}${tail}`, fidelity: fidelityOf(head, tail, 'local path condenser')};
+	}
+	// Rules: the count-mode body is its own shape (`path:count`) and both condensers above refuse it, so the bench has to try this one for the published count-mode row to describe production.
+	const localCounts = condenseCountRows(plainBody);
+	if (localCounts !== null) {
+		return {stdout: `${head}${localCounts}${tail}`, fidelity: fidelityOf(head, tail, 'local count condenser')};
 	}
 	const filtered = pipeThrough(bin, shapeFilter, plainBody);
 	if (filtered === null) {

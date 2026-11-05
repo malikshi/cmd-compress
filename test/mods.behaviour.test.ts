@@ -998,6 +998,7 @@ test('sub-agent: caveman and ponytail both reach the child through the chained r
 });
 
 // Rules: measured — the child is told to type the prefix itself, and the host runs `command` raw while quoting only `args` (`buildCommand2`), so a path with a space arrives split: `/tmp/sp ace/rtk --version` exited 127 with `sh: /tmp/sp: not found`, and the same command quoted exited 0. Windows puts rtk under `C:\Program Files\`, so this is the default there, not an edge case.
+// Rules: the quote style is the one the MOD picks for the platform it is running on (`pinBinary`), so asserting POSIX single quotes made this fail on windows-latest — the mod was right and the expectation was hardcoded. `quote` is derived from the same rule instead: double quotes on win32 (cmd.exe gives `'` no meaning), single quotes elsewhere.
 test('rtk: the child is handed a shell-quoted path, so a space in it cannot split the command', async () => {
 	const spaced = join(mkdtempSync(join(tmpdir(), 'rtk sp-')), 'rtk');
 	copyFileSync(TEST_BIN, spaced);
@@ -1008,8 +1009,11 @@ test('rtk: the child is handed a shell-quoted path, so a space in it cannot spli
 	});
 	runHandler(fake.commands, 'rtk', 'on');
 	const result = (await firstHook(fake).beforeToolCall?.(AGENT_CALL)) as {input: {prompt: string}};
-	assert.ok(result.input.prompt.includes(`'${spaced}'`), 'the path is quoted, not bare');
-	assert.ok(result.input.prompt.includes(`\`'${spaced}' git status\``), 'and every example shows the quoted form');
+	const quoted = [`'${spaced}'`, `"${spaced}"`].find(form => result.input.prompt.includes(form));
+	assert.ok(quoted, 'the path is quoted, not bare');
+	assert.ok(result.input.prompt.includes(`\`${quoted!} git status\``), 'and every example shows the quoted form');
+	// Rules: the property that matters is that no example hands the child the BARE spaced path, which is the form that split. Asserting the absence directly keeps this test from mirroring whatever style the mod picked.
+	assert.ok(!result.input.prompt.includes(`\`${spaced} git status\``), 'no example uses the bare path');
 });
 
 test('rtk: subAgentGuidance quotes for the platform that will read it', () => {
@@ -1019,6 +1023,15 @@ test('rtk: subAgentGuidance quotes for the platform that will read it', () => {
 
 	const win = subAgentGuidance('C:\\Program Files\\rtk\\rtk.exe', 'win32');
 	assert.ok(win.includes('"C:\\Program Files\\rtk\\rtk.exe"'), 'cmd.exe has no single-quote meaning, so Windows gets double quotes');
+});
+
+// Rules: the block must say the prefixed command IS the run. Measured on real headless delegations: children that complied often ran every command bare AND prefixed "so both outputs are reported", which doubles the processes and puts the bare output back in context — the exact thing the prefix exists to keep out. It must also still name the `RTK_DISABLED=1` escape hatch, so a folded result can be re-run on purpose rather than sending the child back to bare commands by default.
+test('rtk: subAgentGuidance forbids the double run and keeps the escape hatch', () => {
+	const block = subAgentGuidance('/opt/rtk', 'linux');
+	assert.match(block, /IS the run/, 'the prefixed command is the only run');
+	assert.match(block, /do not also run it bare/i, 'the double run is called out explicitly');
+	assert.match(block, /RTK_DISABLED=1/, 'the unfiltered escape hatch survives');
+	assert.ok(/only when a result looks wrong/i.test(block), 'and it is scoped to a wrong-looking result, not offered as the default');
 });
 
 // Rules: a block a child cannot act on is paid for by every delegation and changes nothing. `explore` has glob/grep/read_file/read_directory and `plan` has read_file alone (measured in the bundled host on 1.88.2), so neither can run the prefix the block asks for.

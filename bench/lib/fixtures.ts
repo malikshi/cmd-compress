@@ -115,11 +115,10 @@ export function makeGrepFilesModeOutput(files = 300, dirs = 5): string {
 	return `Found ${files} files with pagination = limit: ${files}, offset: ${files}\n${paths.join('\n')}\n`;
 }
 
-export function makeGrepCountModeOutput(files = 40, perFile = 10): string {
-	const rows = Array.from({length: files}, (_, file) =>
-		Array.from({length: perFile}, (_, hit) => `src/file${file}.ts:${hit + 1}:  const x = compute(input)`).join('\n'),
-	);
-	return `${rows.join('\n')}\n\nFound ${files * perFile} total occurrences across ${files} files with pagination = limit: ${files * perFile}, offset: ${files * perFile}.\n`;
+// Rules: the host's count mode is NOT content rows — `finishCountMode` prints `compactPath(n.path):n.count`, one row per file, then the total-occurrences trailer. The old fixture emitted `path:line:text` content rows under a count-mode label, so it measured the row condenser against a shape the host never produces and reported 85.4% for a body that the real formatter never emits. This is the shape taken from the formatter itself.
+export function makeGrepCountModeOutput(files = 40, hitsPerFile = 10): string {
+	const rows = Array.from({length: files}, (_, file) => `src/file${file}.ts:${(file % hitsPerFile) + 1}`);
+	return `${rows.join('\n')}\n\nFound ${files * hitsPerFile} total occurrences across ${files} files with pagination = limit: ${files * hitsPerFile}, offset: ${files * hitsPerFile}.\n`;
 }
 
 // Rules: rtk's search filter prints its faithful baseline when capping would not shrink the output, so a multi-file grep reaches the model at full size. The mod's second pass is measured against exactly that shape: match rows, no recovery marker, no envelope.

@@ -1,6 +1,6 @@
 # Command output benchmark
 
-Measured: 2026-11-04T15:39:44.489Z
+Measured: 2026-11-05T16:51:09.663Z
 rtk binary: /root/.bun/bin/rtk
 
 Byte ratios reproduce across machines. Milliseconds do not — compare percentages.
@@ -12,17 +12,17 @@ Byte ratios reproduce across machines. Milliseconds do not — compare percentag
 | find | 260 paths in 10 dirs | 6,092 | 1,149 | 81.1% | 0 ms | 10/10 dirs named, header claims 260 files in 10 dirs |
 | glob tool | 260 paths + Found header | 4,326 | 788 | 81.8% | 0 ms | local path condenser, header kept |
 | glob tool, truncated | 260 paths + truncation notice | 5,021 | 964 | 80.8% | 0 ms | local path condenser, header kept, trailer kept |
-| grep tool, truncated | 240 matches + pagination notice | 15,540 | 1,333 | 91.4% | 0 ms | local row condenser, trailer kept |
+| grep tool, truncated | 240 matches + pagination notice | 15,540 | 1,333 | 91.4% | 1 ms | local row condenser, trailer kept |
 | grep tool, files mode | 300 paths + Found header (find filter takes over) | 4,448 | 439 | 90.1% | 0 ms | local path condenser, header kept |
-| grep tool, count mode | 400 hits + total-occurrences notice | 17,228 | 2,509 | 85.4% | 1 ms | local row condenser, trailer kept |
+| grep tool, count mode | 400 hits + total-occurrences notice | 722 | 231 | 68.0% | 0 ms | local count condenser, trailer kept |
 | shell tool | cargo failure + Exit code head | 2,769 | 324 | 88.3% | 13 ms | header kept |
-| shell tool, timed out | pytest failure + timeout notice | 5,889 | 339 | 94.2% | 12 ms | header kept, trailer kept |
-| shell tool, declined grep baseline | multi-file match rows rtk refused to group | 8,081 | 430 | 94.7% | 1 ms | local row condenser |
+| shell tool, timed out | pytest failure + timeout notice | 5,889 | 339 | 94.2% | 14 ms | header kept, trailer kept |
+| shell tool, declined grep baseline | multi-file match rows rtk refused to group | 8,081 | 430 | 94.7% | 0 ms | local row condenser |
 | shell tool, coloured build | 40 tsc errors with SGR colour | 5,274 | 3,474 | 34.1% | 14 ms | header kept |
 
 | Case | Commands | Rewritten | Mean | p95 |
 |---|---:|---:|---:|---:|
-| rewrite lookup | 12 | 12 | 153.8 ms | 582.5 ms |
+| rewrite lookup | 12 | 12 | 164.0 ms | 618.0 ms |
 
 ## Prompt overhead per mode
 

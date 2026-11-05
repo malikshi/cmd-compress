@@ -1,5 +1,5 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default, REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, hasGrepContext, canRefilterCompressed, condenseGrepRows, condensePaths, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, joinForRewrite, splitRewrite, guidanceText
+// exports: default, REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, hasGrepContext, canRefilterCompressed, condenseGrepRows, condenseCountRows, condensePaths, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, joinForRewrite, splitRewrite, guidanceText
 // used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts
 // related: mods/shared.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
@@ -13,11 +13,11 @@
 // rules: a sub-agent run gets no mod hooks at all, so the child's own shell calls are never rewritten from here. The `agent` call's prompt is the only channel: it carries a block telling the child to prefix commands with the resolved absolute binary, and it is added only when that binary is usable and new enough.
 // rules: `shell_command`'s `args` array is part of the command line the host runs, so the rewrite sees it; a `-A/-B/-C` grep result is never handed to rtk's grep filter, which keeps only match rows and would silently drop the context the caller asked for.
 // rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
-// agent: unknown | unknown | 2026-11-03 | unknown | two measured defects: `shell_command`'s `args` were never part of the rewrite lookup (every compound call missed), and a `-A/-B/-C` grep result had its context rows silently dropped by rtk's grep filter; forcing a filter on misdetected text measured destructive, so auto-detect stays
 // agent: unknown | xai | 2026-11-04 | 01a1a3cc | review fixes: split every consecutive host notice, recognise Windows drive-letter grep rows, refuse an inflated reassembly, and gate spawns on an executable binary without suppressing the colour strip
-// agent: unknown | unknown | 2026-11-04 | unknown | measured review: splitRewrite dropped every prefixed/chained/expanded rewrite (7 of 10 commands), the negation count refused rtk's row-eliding grouping (41,739 -> 11,252 bytes declined), and valueless prefix flags (`env -i`, `exec -c`) ate the payload; raw args join kept and documented because quoting makes rtk defer
-// agent: unknown | unknown | 2026-11-05 | unknown | performance review: GREP_BODY_ROW backtracted exponentially on a dotted line (122 ms at 63 chars, 698 ms at 5.6 KB, hang past that) and ran on every result — split into a linear shape match plus a path test; extractSpillNotices and isGrepRows gained native pre-checks (31 ms and 40 ms per 700 KB body); condense() no longer repeats the local pass
-// agent: unknown | unknown | 2026-11-05 | unknown | Windows review, measured: every parser split on `\n` and Windows shell/ripgrep emit CRLF, so a CRLF `Found 300 files` body condensed 0 bytes, `findTrailer` kept the `[cwd change …]` note in the body and lost the earlier of two consecutive notices, and condensed rows carried a stray `\r`; `splitSegments` now normalises CRLF once. The fidelity guard also missed the `NF:` header the local condenser itself emits, so an 80% single-file grouping was refused as `negation: 12 -> 1` whenever the matched code contained a negation
+// agent: unknown | unknown | 2026-11-05 | unknown | count-mode review, measured against the host's `finishCountMode`: `path:count` was reaching the path condenser and printing the match COUNT where a line number goes (`file0.ts:1`), because `grepBodyRow` needs a third field to recognise a row. `condenseCountRows` now condenses that shape with every number labelled (77% body, 68% with the trailer), `condensePaths` refuses it, and the bench fixture was corrected — it emitted content rows under a count-mode label, so the published 85.4% described a shape the host never produces
+// agent: unknown | unknown | 2026-11-05 | unknown | hot-path and duplicate review: both layouts deduped independently (27% of a 40k-row run) and were fully rendered before one was chosen; the dedupe now runs once as rows arrive and each layout writes to a `string[]` sink, taking the 2.17 MB body from 2.6 MB/s to 12.7 MB/s and the 30 KB host-capped body to p50 0.8 ms. `condenseCountRows` also listed a repeated path once per row, so it claimed more files than existed and printed the same name several times — a repeated path is now summed into a single entry and the header counts distinct files. Confirmed the >2 MB tail is container scheduling, not allocation: an unrelated no-op loop shows the same ~700 ms outliers.
+// agent: unknown | unknown | 2026-11-05 | unknown | Windows CI, measured on run 42054267199: `verify (windows-latest, 22|24)` failed only in `Tests`, on a test that hardcoded POSIX single quotes while `pinBinary` correctly switches to double quotes on win32. The mod was right and the expectation was wrong; the test now asserts the real property (the path is quoted and never bare in any example) on either platform. Both platform branches were re-verified from this host through `pinBinary`/`filterShell`/`pipeCommand`/`windowsPipeScript` with `platform` passed explicitly, so the win32 path is exercised on Linux too.
+// agent: unknown | unknown | 2026-11-05 | unknown | sub-agent path proved end-to-end on 1.88.3 with real headless delegation instead of reasoning about the bundle: the child's mod list really is `[continuationMod, createUserHooksMod]`, so no rtk/prompt hook reaches it and the `agent` prompt is the only channel. Measured the channel works (a child reproduced the block verbatim, quoted path included) but compliance is partial: 38 of 60 child shell calls used the prefix across nine delegations (63%, per-delegation 0-100%), and compliant children were running every command bare AND prefixed, doubling the work. The block now says the prefixed command IS the run (one task went 1/4 to 3/3) and the README no longer claims enforcement. `agentDefinitions()` is host-internal, so no stronger mechanism exists from a mod.
 
 import type {ModApi} from '@commandcode/harness';
 import {accessSync, constants, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -172,36 +172,39 @@ function grepBodyRow(line: string): [path: string, number: string, text: string]
 	return looksLikeFilePath(path) ? [path, number, text] : null;
 }
 
-interface GrepRow {
-	readonly number: string;
+interface GrepGroup {
+	readonly numbers: string[];
 	readonly text: string;
 }
 
+// Rules: a layout appends lines to an array instead of returning a joined string, so its byte length can be measured without building the string. Both layouts used to be joined in full and then compared, so a body producing two ~1 MB renderings paid for both and kept one.
+// Rules: the sink is a plain `string[]`, never a callback. A callback sink gave every `sink(...)` call site two different closure shapes (measure vs join), and V8 deoptimised `condenseGrepRows` and both layouts on `wrong call target` / `Insufficient type feedback` on every large body — measured as a bimodal 137 ms / 900 ms distribution on 2 MB. The array form is monomorphic and removed the spread.
+type LineSink = string[];
+
+// Rules: the byte length of `lines.join('\n') + '\n'` without joining: the content, plus one separator per line (n-1 between, 1 trailing).
+function sinkLength(lines: readonly string[]): number {
+	let content = 0;
+	for (const line of lines) content += line.length;
+	return content + lines.length;
+}
+
 // Rules: two layouts, both keeping every file name, and the smaller one wins. `[file] path (N):` pays a constant per file and a tab-indented row per line, which wins when a file has several hits; the `path:  (N)` directory tree pays one directory line and lists `name:numbers:text`, which wins when most files hold a single hit and a per-file header would add more than the row it introduces. Measured: the directory tree takes a 240-files-one-hit-each body from 0% to 23% and a 30-files-one-hit body from 30% to 58%, while the file-header layout stays ahead on a file with 20 hits (77% vs 75%) — so neither dominates and both are built.
-function layoutByFile(order: readonly string[], rowsByFile: ReadonlyMap<string, GrepRow[]>, perFileCap: number, total: number): string {
-	const out: string[] = [`${total} matches in ${order.length}F:`];
+// Rules: both layouts read the SAME pre-deduped structures. They used to dedupe independently, so a body was deduped twice and each layout rebuilt the per-file `Map` — profiled on a 40k-row body that was 27% of the run.
+function eachFileLine(sink: LineSink, order: readonly string[], groupsByFile: ReadonlyMap<string, GrepGroup[]>, rowCount: ReadonlyMap<string, number>, perFileCap: number, total: number): void {
+	sink.push(`${total} matches in ${order.length}F:`);
 	for (const path of order) {
-		const rows = rowsByFile.get(path) ?? [];
-		const groups: Array<{numbers: string[]; text: string}> = [];
-		const index = new Map<string, number>();
-		for (const row of rows) {
-			const at = index.get(row.text);
-			if (at === undefined) {
-				index.set(row.text, groups.length);
-				groups.push({numbers: [row.number], text: row.text});
-			} else groups[at]?.numbers.push(row.number);
-		}
+		const groups = groupsByFile.get(path) ?? [];
+		const rows = rowCount.get(path) ?? 0;
 		const shown = groups.slice(0, perFileCap);
-		out.push(`[file] ${path} (${rows.length}):`);
-		for (const group of shown) out.push(`  ${group.numbers.join(',')}:${group.text}`);
+		sink.push(`[file] ${path} (${rows}):`);
+		for (const group of shown) sink.push(`  ${group.numbers.join(',')}:${group.text}`);
 		const keptRows = shown.reduce((sum, group) => sum + group.numbers.length, 0);
-		if (rows.length > keptRows) out.push(`  +${rows.length - keptRows} more lines in this file`);
+		if (rows > keptRows) sink.push(`  +${rows - keptRows} more lines in this file`);
 	}
-	return `${out.join('\n')}\n`;
 }
 
 // Rules: the path is split on its last separator, so a Windows drive colon never becomes a directory boundary, and a relative root file lands under `./`.
-function layoutByDir(order: readonly string[], rowsByFile: ReadonlyMap<string, GrepRow[]>, perFileCap: number, total: number): string {
+function eachDirLine(sink: LineSink, order: readonly string[], groupsByFile: ReadonlyMap<string, GrepGroup[]>, rowCount: ReadonlyMap<string, number>, perFileCap: number, total: number): void {
 	const dirs: string[] = [];
 	const filesByDir = new Map<string, string[]>();
 	for (const path of order) {
@@ -215,62 +218,144 @@ function layoutByDir(order: readonly string[], rowsByFile: ReadonlyMap<string, G
 		}
 		files.push(path);
 	}
-	const out: string[] = [`${total} matches in ${order.length}F:`];
+	sink.push(`${total} matches in ${order.length}F:`);
 	for (const dir of dirs) {
 		const paths = filesByDir.get(dir) ?? [];
-		out.push(`${dir}  (${paths.length})`);
+		sink.push(`${dir}  (${paths.length})`);
 		for (const path of paths) {
 			const name = dir === './' && !path.includes('/') && !path.includes('\\') ? path : path.slice(dir.length);
-			const groups: Array<{numbers: string[]; text: string}> = [];
-			const index = new Map<string, number>();
-			for (const row of rowsByFile.get(path) ?? []) {
-				const at = index.get(row.text);
-				if (at === undefined) {
-					index.set(row.text, groups.length);
-					groups.push({numbers: [row.number], text: row.text});
-				} else groups[at]?.numbers.push(row.number);
-			}
-			for (const group of groups.slice(0, perFileCap)) out.push(`  ${name}:${group.numbers.join(',')}:${group.text}`);
-			if (groups.length > perFileCap) out.push(`  ${name}: +${groups.length - perFileCap} more lines`);
+			const groups = groupsByFile.get(path) ?? [];
+			const rows = rowCount.get(path) ?? 0;
+			const shown = groups.slice(0, perFileCap);
+			for (const group of shown) sink.push(`  ${name}:${group.numbers.join(',')}:${group.text}`);
+			const keptRows = shown.reduce((sum, group) => sum + group.numbers.length, 0);
+			// Rules: the count is ROWS, not groups, because the line it prints says `lines`. Counting groups understated it whenever a file repeated one match text on several lines, and the two layouts reported different numbers for the same elision.
+			if (rows > keptRows) sink.push(`  ${name}: +${rows - keptRows} more lines`);
 		}
 	}
-	return `${out.join('\n')}\n`;
 }
 
 // Rules: a reshape that saves almost nothing is not worth it — it spends the model's attention on a new layout for a byte or two, and it rewrites a diagnostic shape it may misread. Measured: a `file:line:col: message` linter listing parsed as match rows and came back 2,389 -> 2,340 (2%), so anything under 5% is declined and left exactly as it was. Real grep wins clear this by a wide margin (a 240-files-one-hit body is the floor at 9.8%).
 const MIN_LOCAL_GAIN = 0.05;
 
-function worthIt(original: string, condensed: string | null): boolean {
-	return condensed !== null && condensed.length < original.length * (1 - MIN_LOCAL_GAIN);
+function worthIt(original: string, condensedLength: number): boolean {
+	return condensedLength < original.length * (1 - MIN_LOCAL_GAIN);
 }
 
 export function condenseGrepRows(text: string, perFileCap = 6): string | null {
 	const order: string[] = [];
-	const rowsByFile = new Map<string, GrepRow[]>();
+	// Rules: dedupe happens as each row arrives, so no intermediate per-row record is kept. The old shape built a `GrepRow[]` per file and deduped it into a second structure; on a 40k-row body that was 4.4 MB of short-lived objects out of ~23 MB allocated for a 1 MB result, and the GC cost of it is what made the peak 5-6x the median on the large bodies. `rowCount` is kept separately because the elided count is measured in ROWS while the groups are measured in distinct texts.
+	const groupsByFile = new Map<string, GrepGroup[]>();
+	const indexByFile = new Map<string, Map<string, number>>();
+	const rowCount = new Map<string, number>();
+	let total = 0;
 	for (const line of text.split('\n')) {
 		if (!line.trim()) continue;
 		const row = grepBodyRow(line);
 		if (!row) return null;
 		const [path, number, body] = row;
-		let rows = rowsByFile.get(path);
-		if (!rows) {
-			rows = [];
-			rowsByFile.set(path, rows);
+		let groups = groupsByFile.get(path);
+		let index = indexByFile.get(path);
+		if (!groups || !index) {
+			groups = [];
+			index = new Map<string, number>();
+			groupsByFile.set(path, groups);
+			indexByFile.set(path, index);
+			rowCount.set(path, 0);
 			order.push(path);
 		}
-		rows.push({number, text: body});
+		rowCount.set(path, (rowCount.get(path) ?? 0) + 1);
+		total += 1;
+		const at = index.get(body);
+		if (at === undefined) {
+			index.set(body, groups.length);
+			groups.push({numbers: [number], text: body});
+		} else groups[at]?.numbers.push(number);
 	}
-	const total = [...rowsByFile.values()].reduce((sum, rows) => sum + rows.length, 0);
 	if (total < 2) return null;
 
-	const candidates = [layoutByFile(order, rowsByFile, perFileCap, total), layoutByDir(order, rowsByFile, perFileCap, total)];
-	let best: string | null = null;
-	for (const candidate of candidates) if (worthIt(text, candidate) && (best === null || candidate.length < best.length)) best = candidate;
-	return best;
+	// Rules: measure first, render once. Both layouts are rendered into arrays (cheap: one push per line, no string join), the winner is picked on exact byte length, and only that one is joined. The lossy choice is therefore made once and the losing rendering never becomes a string.
+	const renderings: LineSink[] = [[], []];
+	eachFileLine(renderings[0]!, order, groupsByFile, rowCount, perFileCap, total);
+	eachDirLine(renderings[1]!, order, groupsByFile, rowCount, perFileCap, total);
+	let best: LineSink | null = null;
+	let bestLength = Number.POSITIVE_INFINITY;
+	for (const lines of renderings) {
+		const length = sinkLength(lines);
+		if (!worthIt(text, length)) continue;
+		if (length < bestLength) {
+			bestLength = length;
+			best = lines;
+		}
+	}
+	return best === null ? null : `${best.join('\n')}\n`;
+}
+
+// Rules: the host's count mode is `path:count` — measured in `finishCountMode`: `compactPath(n.path):n.count`. `grepBodyRow` cannot recognise it (it needs a third field), so before this pass existed the row reached the path tree and printed `file0.ts:1`, putting the match COUNT exactly where a line number goes; a model reading that reopens the wrong line, and nothing downstream could tell the two apart. It is condensed by its own layout instead of being refused, because rtk's grep filter leaves this shape byte-identical and its find filter prints the count with no label at all.
+// Rules: a count is never emitted without a word beside it. The directory line states `N files, M hits` and every row prints `name (count)`, so no position in the output can be read as a line number. Every file is named, the per-directory cap only elides rows, and the elided count is printed.
+// Rules: the header is the `N files in M dirs:` form `condensePaths` emits, so `GROUPING_MARKER` recognises the result as grouped and a count body whose names happen to contain a negation word is not refused by the negation test.
+const COUNT_BODY_SHAPE = /^((?:[A-Za-z]:)?[^:\n]+):(\d+)$/;
+
+function countBodyRow(line: string): [path: string, count: number] | null {
+	const match = COUNT_BODY_SHAPE.exec(line);
+	if (!match) return null;
+	const [, path, count] = match as unknown as [string, string, string];
+	if (!looksLikeFilePath(path)) return null;
+	const value = Number(count);
+	return Number.isSafeInteger(value) ? [path, value] : null;
+}
+
+// Rules: a path repeated across rows is merged into ONE entry whose count is the sum. Listing it once per row made the output claim more files than exist (`10 files` over five names) and printed the same name several times, so the model reads phantom files; a repeated path is reachable because a paged or concatenated count body produces one. The distinct path count, not the row count, is what the header and each directory line report.
+export function condenseCountRows(text: string, perDirCap = 6): string | null {
+	const order: string[] = [];
+	const countsByDir = new Map<string, Array<{name: string; count: number}>>();
+	const indexByDir = new Map<string, Map<string, number>>();
+	let files = 0;
+	for (const line of text.split('\n')) {
+		if (!line.trim()) continue;
+		const row = countBodyRow(line.trim());
+		if (!row) return null;
+		const [path, count] = row;
+		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+		const dir = slash >= 0 ? path.slice(0, slash + 1) : './';
+		const name = slash >= 0 ? path.slice(slash + 1) : path;
+		let bucket = countsByDir.get(dir);
+		let index = indexByDir.get(dir);
+		if (!bucket || !index) {
+			bucket = [];
+			index = new Map<string, number>();
+			countsByDir.set(dir, bucket);
+			indexByDir.set(dir, index);
+			order.push(dir);
+		}
+		const at = index.get(name);
+		if (at === undefined) {
+			index.set(name, bucket.length);
+			bucket.push({name, count});
+			files += 1;
+		} else {
+			const entry = bucket[at];
+			if (entry) bucket[at] = {name: entry.name, count: entry.count + count};
+		}
+	}
+	if (files < 2) return null;
+
+	const out: string[] = [`${files} files in ${order.length} dirs:`];
+	for (const dir of order) {
+		const bucket = countsByDir.get(dir) ?? [];
+		const dirHits = bucket.reduce((sum, entry) => sum + entry.count, 0);
+		out.push(`${dir}  (${bucket.length} files, ${dirHits} hits)`);
+		for (const entry of bucket.slice(0, perDirCap)) out.push(`  ${entry.name} (${entry.count})`);
+		if (bucket.length > perDirCap) out.push(`  +${bucket.length - perDirCap}`);
+	}
+	const joined = `${out.join('\n')}\n`;
+	return worthIt(text, joined.length) ? joined : null;
 }
 
 // Rules: rtk's `find` filter groups by directory but elides whole directories once it has printed enough: on a 60-directory glob it named 19 of 60, so the model cannot tell which directories matched at all. This condenser prints every directory, caps only the file list inside one directory, and states the elided count. Measured 82-84% on a 260- and a 300-path glob versus rtk's 73-77%, and it needs no process.
-// Rules: a body that is not one clean path per line is refused, so a count-mode grep body or a shell listing with prose is never folded into a path tree. A `path:line:text` row is refused explicitly even though it passes `PATH_ROW` (a colon is not whitespace): the path condenser would read the line number and the match text as part of the file name and drop both. That case is `condenseGrepRows`' job, and when it declines the body is left for rtk.
+// Rules: a body that is not one clean path per line is refused, so a shell listing with prose is never folded into a path tree. A `path:line:text` row is refused explicitly even though it passes `PATH_ROW` (a colon is not whitespace): the path condenser would read the line number and the match text as part of the file name and drop both. That case is `condenseGrepRows`' job, and when it declines the body is left for rtk.
+// Rules: a `path:count` row is refused here too, for the same reason as the match row — `10` is a match count and the tree would print it where a line number belongs. `condenseCountRows` owns that shape.
+const COUNT_ROW = /:(\d+)$/;
 const PATH_ROW = /^\s*(?:\.{0,2}[\\/]|[A-Za-z]:[\\/]|[\w.$@+-]+[\\/])[^\s]*$/;
 
 export function condensePaths(text: string, perDirCap = 6): string | null {
@@ -279,7 +364,7 @@ export function condensePaths(text: string, perDirCap = 6): string | null {
 	for (const line of text.split('\n')) {
 		if (!line.trim()) continue;
 		if (GLOB_HEAD.test(`${line}\n`)) continue;
-		if (!PATH_ROW.test(line) || grepBodyRow(line.trim())) return null;
+		if (!PATH_ROW.test(line) || grepBodyRow(line.trim()) || COUNT_ROW.test(line.trim())) return null;
 		const path = line.trim();
 		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
 		const dir = slash >= 0 ? path.slice(0, slash + 1) : './';
@@ -303,7 +388,7 @@ export function condensePaths(text: string, perDirCap = 6): string | null {
 		if (files.length > perDirCap) out.push(`  +${files.length - perDirCap}`);
 	}
 	const joined = `${out.join('\n')}\n`;
-	return worthIt(text, joined) ? joined : null;
+	return worthIt(text, joined.length) ? joined : null;
 }
 
 // Rules: `grep` is not one shape. Its default `files_with_matches` mode prints a plain path list under a `Found N files` header, which the grep filter passes through untouched (measured 4,448 → 4,448 bytes) while the find filter condenses it (→ 630). Content mode is the opposite: `path:line:text` rows, where grep wins. So the filter is chosen from the body's shape, not from the tool name alone.
@@ -697,14 +782,16 @@ export function guidanceText(): string {
 }
 
 // Rules: a sub-agent never receives this mod, so nothing rewrites its shell calls. The parent cannot rewrite them either — its hooks only see its own tool calls, and the child's tool call ids never reach them. The one lever left is the `agent` call's prompt: tell the child to prefix commands itself, with the absolute path this mod resolved, because a bare `rtk` is exactly what `pinBinary` exists to avoid (rtk ships to ~/.local/bin, often off a GUI host's PATH).
+// Rules: this is a nudge, not a rewrite, and the measured compliance is partial — across 24 shell calls in four real headless delegations on 1.88.3, 14 (58%) used the prefix and the spread ran 0% to 80% depending on how much the task itself pointed at commands. A child may also call the block "an environment hint" and run everything bare, or comply by ALSO re-running unfiltered to double-check (which is the RTK_DISABLED advice working). So the block must never be described as enforcement, and there is no stronger mechanism available: a child's `systemPrompt` comes from its definition and `agentDefinitions()` is host-internal, so a mod cannot extend it.
 // Rules: the path is emitted through `pinBinary` so it arrives shell-quoted, for the same measured reason the rewrite path does. Raw, a path with a space breaks the line the child is told to type: `/opt/my tools/rtk git status` ran as `sh: /opt/my: not found`, and Windows puts rtk under `C:\Program Files\` by default.
 // Rules: the wording must not reuse GUIDANCE. That block says output is condensed *for* the reader and forbids typing `rtk` yourself — both false in a child, where nothing is rewritten unless the child does it.
 // Rules: an agent with no shell tool cannot follow the block, so it is not sent one. The names are the host's reserved ones and a custom file using them is ignored, so they always resolve to these bundled tool sets (measured on 1.88.2): `explore` is glob/grep/read_file/read_directory and `plan` is read_file alone. `general` and every custom agent may run shell, and an omitted `subagent_type` defaults to `general`, so those still get it.
 const NO_SHELL_AGENTS = new Set(['explore', 'plan']);
 
+// Rules: the block tells the child that the prefixed command IS the run, not a second opinion. Measured: children that complied often ran the command bare AND prefixed "so both outputs are reported" — twice the processes and twice the turns for one answer, and the bare run's output is exactly the ones the prefix was supposed to keep out of context. The `RTK_DISABLED=1` advice stays for the one case that justifies a re-run, an output that looks wrong or folded too far, so the escape hatch is still named rather than removed.
 export function subAgentGuidance(bin: string, platform: string = process.platform): string {
 	const quoted = pinBinary('rtk', bin, platform);
-	return `RTK is available here, but this sub-agent's own shell calls are NOT rewritten automatically — no hook reaches a sub-agent run. Prefix each command with ${quoted} so its output is condensed before you read it: \`${quoted} git status\`, \`${quoted} cargo build\`, \`${quoted} npm test\`. It keeps the failing test name, the assertion, the file and line, and may fold repeated paths into \`+N\`. Never prefix the same command twice, and re-run one unfiltered with \`RTK_DISABLED=1 <cmd>\` when you need every name or the result looks wrong.`;
+	return `RTK is available here, but this sub-agent's own shell calls are NOT rewritten automatically — no hook reaches a sub-agent run. Prefix each command with ${quoted} so its output is condensed before you read it: \`${quoted} git status\`, \`${quoted} cargo build\`, \`${quoted} npm test\`. The prefixed command IS the run — do not also run it bare to compare, and never prefix the same command twice; that doubles the work and puts the full output back in context. It keeps the failing test name, the assertion, the file and line, and may fold repeated paths into \`+N\`. Re-run one unfiltered with \`RTK_DISABLED=1 <cmd>\` only when a result looks wrong or you need every name.`;
 }
 
 export default function (cmd: ModApi): void {
@@ -859,10 +946,16 @@ export default function (cmd: ModApi): void {
 			const next = `${head}${notices ? `${local}\n${notices}` : local}${tail}`;
 			if (next.length < text.length) return next;
 		}
-		// Rules: the same reasoning applies to a path list. rtk's find filter loses whole directories on a wide tree (measured 19 of 60 named), and the local pass keeps every one for a few more percent. It is tried only when the body is one clean path per line, so a count-mode grep body and a shell listing still go to rtk.
+		// Rules: the same reasoning applies to a path list. rtk's find filter loses whole directories on a wide tree (measured 19 of 60 named), and the local pass keeps every one for a few more percent. It is tried only when the body is one clean path per line, so a shell listing still goes to rtk.
 		const localPaths = condensePaths(filterable);
 		if (localPaths !== null) {
 			const next = `${head}${notices ? `${localPaths}\n${notices}` : localPaths}${tail}`;
+			if (next.length < text.length) return next;
+		}
+		// Rules: the host's count mode is its own shape (`path:count`) and gets its own layout, because both other condensers refuse it: the row parser needs a third field, and the path tree would print the count where a line number goes. rtk leaves this shape byte-identical (measured 634 -> 634), so without this pass it reaches the model at full size.
+		const localCounts = condenseCountRows(filterable);
+		if (localCounts !== null) {
+			const next = `${head}${notices ? `${localCounts}\n${notices}` : localCounts}${tail}`;
 			if (next.length < text.length) return next;
 		}
 		return null;
