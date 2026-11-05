@@ -4,11 +4,13 @@
 // related: mods/rtk.ts
 // rules: Command Code's own tool output is not rtk's fixture — grep and glob wrap their body in a header or a trailer, and shell_command prefixes an exit status. A filter that folds those away deletes information the model needs, so each shape is pinned here against the installed rtk.
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
+// agent: unknown | unknown | 2026-11-05 | unknown | added the CRLF equivalence test and the two local-layout fidelity tests, after measuring that Windows parsing dropped every path list and that the guard refused the condenser's own `NF:` header
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile, execFileSync} from 'node:child_process';
 import {readFileSync} from 'node:fs';
+import {performance} from 'node:perf_hooks';
 import rtk, {canRefilterCompressed, checkFidelity, condenseGrepRows, condensePaths, hasGrepContext, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
 import {createFakeCmd, firstHook, resultText, runHandler, type FakeExecRequest} from './harness.ts';
 
@@ -106,6 +108,23 @@ test('splitSegments: the interpreted exit code line is split off with the head',
 test('splitSegments: ordinary output is one unsplit body', () => {
 	const split = splitSegments('shell_command', 'plain output\n');
 	assert.deepEqual(split, {head: '', body: 'plain output\n', tail: ''});
+});
+
+// Rules: Windows is a supported platform (the CI matrix runs windows-latest) and its shell and ripgrep emit CRLF. Every parser splits on `\n`, so a retained `\r` used to break all three: the `$`-anchored notice test stopped matching, `PATH_ROW`'s `[^\s]*$` refused every line, and condensed rows kept a stray `\r` inside the match text. Measured before the fix: a CRLF `Found 300 files` body condensed 0 bytes, and only the last of two consecutive notices was split off.
+test('splitSegments: a CRLF result parses exactly like the same result with LF', () => {
+	const notice = 'Exit code: 1\nrunning 2 tests\n\n[cwd change to C:\\repo]\n[PowerShell edition: Desktop 5.1]';
+	const crlf = notice.replace(/\n/g, '\r\n');
+	assert.deepEqual(splitSegments('powershell', crlf), splitSegments('powershell', notice));
+	assert.equal(splitSegments('powershell', crlf).tail, '\n\n[cwd change to C:\\repo]\n[PowerShell edition: Desktop 5.1]', 'both consecutive notices are split off');
+
+	const paths = Array.from({length: 300}, (_, index) => `src/d${index % 20}/m${index}.ts`).join('\n');
+	assert.notEqual(condensePaths(paths), null, 'the LF form condensed');
+	assert.equal(condensePaths(splitSegments('glob', `Found 300 files\n${paths}`.replace(/\n/g, '\r\n')).body), condensePaths(paths), 'and so does the CRLF form');
+
+	const rows = Array.from({length: 60}, (_, index) => `src/m${index % 6}/f${index}.ts:${index + 1}:  return compute(${index});`).join('\n');
+	const condensed = condenseGrepRows(splitSegments('grep', rows.replace(/\n/g, '\r\n')).body);
+	assert.equal(condensed, condenseGrepRows(rows), 'the row condenser agrees too');
+	assert.ok(!condensed?.includes('\r'), 'and no stray CR reaches the model');
 });
 
 // Rules: the grep tool's DEFAULT mode is `files_with_matches`, which prints a path list under a `Found N files` header — the same envelope glob uses. The grep filter passes that shape through untouched (measured 4,447 → 4,447 bytes) while the find filter condenses it (→ 620), so the shape decides the filter, not the tool name.
@@ -399,6 +418,21 @@ test('condenseGrepRows: a body that would not shrink is refused', () => {
 	assert.equal(condenseGrepRows(Array.from({length: 40}, (_, index) => `f${index}.ts:1:x`).join('\n')), null);
 });
 
+// Rules: the row pattern used to backtrack exponentially on a dotted line — one grep hit inside a minified bundle is exactly that shape, and this ran on every grep, glob and shell result. Measured on the old pattern: 122 ms at 63 chars, 698 ms at 5.6 KB, no answer past that. The parser is now one linear match plus a constant-time path test, so a 1 MB dotted row must finish in single-digit milliseconds.
+test('condenseGrepRows: a very long dotted row stays linear', () => {
+	for (const size of [200, 2_000, 20_000, 200_000]) {
+		const line = `src/min.js:1:${'a.b'.repeat(size)}`;
+		const started = performance.now();
+		condenseGrepRows(`${line}\n`);
+		const elapsed = performance.now() - started;
+		assert.ok(elapsed < 500, `${size} dotted segments took ${elapsed.toFixed(0)} ms`);
+	}
+	const longPath = `./${'a.b/'.repeat(20_000)}c.ts`;
+	const started = performance.now();
+	condensePaths(`${longPath}\n${longPath}\n`);
+	assert.ok(performance.now() - started < 500, 'and the path condenser stays linear too');
+});
+
 // Rules: rtk's find filter names only some directories on a wide tree (measured 19 of 60), so the local path pass exists to keep every one. It must refuse a match row, or it would read the line number into the file name.
 test('condensePaths: every directory is named and each file list is capped', () => {
 	const paths = Array.from({length: 240}, (_, index) => `./src/a${index % 24}/module-name${index}.ts`).join('\n');
@@ -419,7 +453,7 @@ test('condensePaths: a prose line is refused', () => {
 	assert.equal(condensePaths(mixed), null);
 });
 
-// Rules: the local passes now run on EVERY shell result before rtk, so each must refuse a shape that is not its own. A build log, a git status, a diff, an ls listing and a JSON blob all have `:` or path-like fragments; regrouping one would corrupt output that rtk used to leave alone.
+// Rules: the local condensers now run on EVERY shell result before rtk, so each must refuse a shape that is not its own. A build log, a git status, a diff, an ls listing and a JSON blob all have `:` or path-like fragments; regrouping one would corrupt output that rtk used to leave alone.
 test('the local condensers refuse every non-grep shell shape', () => {
 	const shapes: Record<string, string> = {
 		'git status': Array.from({length: 60}, (_, index) => `\tmodified:   src/file${index}.ts`).join('\n'),
@@ -745,6 +779,19 @@ test('extractSpillNotices lifts both pointer forms and nothing else', async () =
 	assert.equal(none.body, '[not a pointer] plain [full output stays here]');
 });
 
+// Rules: this runs on every result, and the split+join below costs 31 ms on a 700 KB body even when no pointer is present — which is almost always. The marker pre-check is what makes the common case free, and it must return the input byte-identical rather than a renormalised copy.
+test('extractSpillNotices: a body with no pointer is returned unchanged, and cheaply', async () => {
+	const {extractSpillNotices} = await import('../mods/rtk.ts');
+	const plain = Array.from({length: 20_000}, (_, index) => `[build] compiling module ${index} ...`).join('\n');
+	const result = extractSpillNotices(plain);
+	assert.equal(result.body, plain, 'the body is byte-identical');
+	assert.equal(result.notices, '', 'and nothing was lifted');
+	assert.equal(extractSpillNotices('no newline at all').body, 'no newline at all');
+	const started = performance.now();
+	for (let index = 0; index < 20; index += 1) extractSpillNotices(plain);
+	assert.ok((performance.now() - started) / 20 < 5, 'a 700 KB body costs almost nothing');
+});
+
 // Rules: the same mid-result pointer arrives on a grep result, and `condense` is shared — this pins that the grep path goes through it rather than around it.
 test('the spill pointer survives a condensed grep result too', async t => {
 	if (!hasRtk()) return t.skip('rtk is not installed here');
@@ -832,6 +879,20 @@ test('a grouped result that drops every negation is still refused', async () => 
 	const report = checkFidelity(rows, grouped, false);
 	assert.equal(report.ok, false);
 	assert.match(report.lost.join(' '), /negation: 40 -> 0/);
+});
+
+// Rules: the mod's OWN local condenser emits the abbreviated `NF:` header, so the grouping exemption has to recognise it or the two disagree. Measured before this was fixed: a 12-row single-file body whose rows all said `not` condensed 80% but the fidelity guard refused it (`negation: 12 -> 1`), so the local pass quietly did nothing on any search whose matched code contains a negation. Both layouts are pinned, because `layoutByDir` emits `NF:` and `layoutByFile` emits `[file]`.
+test('the fidelity guard accepts the local condenser\'s own two layouts', async () => {
+	const {condenseGrepRows, checkFidelity} = await import('../mods/rtk.ts');
+	const single = Array.from({length: 12}, (_, index) => `src/a.ts:${index + 1}:  return not ready;`).join('\n');
+	const fileLayout = condenseGrepRows(single);
+	assert.ok(fileLayout?.startsWith('12 matches in 1F:'), 'the file layout uses the abbreviated header');
+	assert.equal(checkFidelity(single, fileLayout ?? '', false).ok, true, 'and its elision is not mistaken for a lost negation');
+
+	const scattered = Array.from({length: 60}, (_, index) => `./src/d${index % 12}/f${index}.ts:${index + 1}:  return not ready_${index};`).join('\n');
+	const dirLayout = condenseGrepRows(scattered);
+	assert.ok(dirLayout?.startsWith('60 matches in 60F:'), 'the directory layout uses it too');
+	assert.equal(checkFidelity(scattered, dirLayout ?? '', false).ok, true, 'the directory layout is accepted as well');
 });
 
 // Rules: the host's `grep` tool supports `-A/-B/-C`, and ripgrep prints a context line as `path-line-text` where a match is `path:line:text`. rtk's grep filter keeps only the match form, so the context the caller explicitly asked for is dropped — measured end-to-end through the real mod, a 40-match result with 40 context lines went 3,178 -> 1,665 bytes with all 40 gone. The explicit-filter path skips the grouping test, so this needs its own check.

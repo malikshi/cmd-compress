@@ -13,11 +13,11 @@
 // rules: a sub-agent run gets no mod hooks at all, so the child's own shell calls are never rewritten from here. The `agent` call's prompt is the only channel: it carries a block telling the child to prefix commands with the resolved absolute binary, and it is added only when that binary is usable and new enough.
 // rules: `shell_command`'s `args` array is part of the command line the host runs, so the rewrite sees it; a `-A/-B/-C` grep result is never handed to rtk's grep filter, which keeps only match rows and would silently drop the context the caller asked for.
 // rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
-// agent: unknown | unknown | 2026-11-03 | unknown | pinBinary rewritten as a quote-aware scan after measuring two live bugs: `&` and newline separators it emits were left bare (a rewrite then failed as `rtk: not found` off PATH), and a `rtk` inside a quoted argument was rewritten, corrupting the argument
-// agent: unknown | unknown | 2026-11-03 | unknown | inspect rtk 1.1.0 against the mod: cover the `powershell` shell tool, accept rtk's abbreviated `NF:` grouping header in both the recovery and fidelity markers, and probe every documented install dir (rtk's own installer writes ~/.local/bin, not ~/.bun/bin)
 // agent: unknown | unknown | 2026-11-03 | unknown | two measured defects: `shell_command`'s `args` were never part of the rewrite lookup (every compound call missed), and a `-A/-B/-C` grep result had its context rows silently dropped by rtk's grep filter; forcing a filter on misdetected text measured destructive, so auto-detect stays
 // agent: unknown | xai | 2026-11-04 | 01a1a3cc | review fixes: split every consecutive host notice, recognise Windows drive-letter grep rows, refuse an inflated reassembly, and gate spawns on an executable binary without suppressing the colour strip
 // agent: unknown | unknown | 2026-11-04 | unknown | measured review: splitRewrite dropped every prefixed/chained/expanded rewrite (7 of 10 commands), the negation count refused rtk's row-eliding grouping (41,739 -> 11,252 bytes declined), and valueless prefix flags (`env -i`, `exec -c`) ate the payload; raw args join kept and documented because quoting makes rtk defer
+// agent: unknown | unknown | 2026-11-05 | unknown | performance review: GREP_BODY_ROW backtracted exponentially on a dotted line (122 ms at 63 chars, 698 ms at 5.6 KB, hang past that) and ran on every result — split into a linear shape match plus a path test; extractSpillNotices and isGrepRows gained native pre-checks (31 ms and 40 ms per 700 KB body); condense() no longer repeats the local pass
+// agent: unknown | unknown | 2026-11-05 | unknown | Windows review, measured: every parser split on `\n` and Windows shell/ripgrep emit CRLF, so a CRLF `Found 300 files` body condensed 0 bytes, `findTrailer` kept the `[cwd change …]` note in the body and lost the earlier of two consecutive notices, and condensed rows carried a stray `\r`; `splitSegments` now normalises CRLF once. The fidelity guard also missed the `NF:` header the local condenser itself emits, so an 80% single-file grouping was refused as `negation: 12 -> 1` whenever the matched code contained a negation
 
 import type {ModApi} from '@commandcode/harness';
 import {accessSync, constants, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -100,11 +100,19 @@ const RECOVERY_MARKER = /\bmatches in \d+(?: files?|F):|\+\d+ more|\+ \.\.\. mor
 // Rules: the rows are recognised by shape — `path:line:text` — and a majority is required, so a diff, a log, or a build log that happens to contain one such line is not mistaken for a match list.
 // Rules: a Windows match row is `C:\src\a.ts:12:text`; the drive colon is consumed explicitly so the rest of the path may not hide one. A bare `.*` would also read `http://host:8080:x` as a row. Own match on the same pattern so the path can be read back for the context test.
 const GREP_ROW = /^((?:[A-Za-z]:[\\/])?[^\s:][^:\n]*):\d+:[^\n]*$/;
+
+// Rules: this runs on every shell result, and a 700 KB body costs 40 ms of per-line regex — the answer is false almost every time. Two cheap native passes replace most of that: a body with no `:<digits>:` anywhere cannot hold a single row, and the loop bails as soon as the remaining lines can no longer reach the 0.5 majority. Both preserve the exact rule; neither changes a true answer.
+const ROW_HINT = /:\d+:/;
+
 export function isGrepRows(text: string): boolean {
+	if (!ROW_HINT.test(text)) return false;
 	const lines = text.split('\n').filter(line => line.trim());
 	if (lines.length < 2) return false;
 	let rows = 0;
-	for (const line of lines) if (GREP_ROW.test(line)) rows += 1;
+	for (let index = 0; index < lines.length; index += 1) {
+		if (GREP_ROW.test(lines[index] ?? '')) rows += 1;
+		else if ((rows + lines.length - index - 1) / lines.length < 0.5) return false;
+	}
 	return rows / lines.length >= 0.5;
 }
 
@@ -140,7 +148,29 @@ export function canRefilterCompressed(text: string): boolean {
 // Rules: the path must look like a file — a separator, or a dot before the colon — because this pass also sees shell output, and a log line is `2026-11-04 12:00:01: INFO started`, which a bare pattern reads as path `2026-11-04 12`, line `00`, text `01: INFO started`. Measured: 40 such lines were regrouped into one bogus file, losing every timestamp. A real match path carries `src/` or `.ts` before its first colon. A body with no such row anywhere is refused, so that log is returned untouched.
 // Rules: the cap only elides repeated *rows* inside one file, never a file, and never a whole directory. Every path still gets named, so the model can always see which files matched, and the dropped count is stated.
 // Rules: both layouts keep rtk's own recovery marker (`N matches in MF:`) so a grouped result is never fed back through the filter, and so `+N` reads the way the model already learned.
-const GREP_BODY_ROW = /^((?:[A-Za-z]:[\\/]|[\w.$@+-]*[\\/][^:\n]*|[^:\s/\\]+(?:\.[^:\s/\\]+)+)[^:\n]*?):(\d+):([^\n]*)$/;
+// Rules: the shape and the "looks like a file" test are SPLIT — one linear match, then a constant-time path check. They used to be a single alternation with two overlapping `[^:\n]*` repeats around a lazy tail, which is exponential on a dotted line: measured 122 ms at 63 chars, 31 ms at 57, 698 ms at 5.6 KB, and a timeout past that. One grep hit inside a minified bundle is exactly such a line, and this ran on every grep, glob and shell result.
+const GREP_BODY_SHAPE = /^((?:[A-Za-z]:)?[^:\n]+):(\d+):([^\n]*)$/;
+
+// Rules: the two shapes a match path really takes — a name after a separator (`src/a.ts`, `C:\a\b.ts`, `./x.ts`), or a bare `name.ext`. A bare `2026-11-04 12` has neither, which is what refuses the timestamp log.
+// Rules: these are the old alternation's branches, written out instead of backtracked. The separator branch keeps its original constraint — everything BEFORE the first separator must be word characters, which is what refuses `a b/c.ts` — while the part after it stays free, so `src/my dir/f.ts` is still a match.
+const WORD_PREFIX = /^[\w.$@+-]*$/;
+const DOTTED_NAME = /^[^:\s/\\]+(?:\.[^:\s/\\]+)+$/;
+
+function looksLikeFilePath(path: string): boolean {
+	if (!path) return false;
+	if (path.length > 2 && path[1] === ':' && (path[2] === '/' || path[2] === '\\')) return true;
+	const sep = path.search(/[\\/]/);
+	if (sep >= 0) return sep < path.length - 1 && WORD_PREFIX.test(path.slice(0, sep));
+	return DOTTED_NAME.test(path);
+}
+
+// Rules: one row parse for both condensers, so the path condenser's "this is a grep row, leave it to the row condenser" refusal cannot drift from the row condenser's own acceptance.
+function grepBodyRow(line: string): [path: string, number: string, text: string] | null {
+	const match = GREP_BODY_SHAPE.exec(line);
+	if (!match) return null;
+	const [, path, number, text] = match as unknown as [string, string, string, string];
+	return looksLikeFilePath(path) ? [path, number, text] : null;
+}
 
 interface GrepRow {
 	readonly number: string;
@@ -219,9 +249,9 @@ export function condenseGrepRows(text: string, perFileCap = 6): string | null {
 	const rowsByFile = new Map<string, GrepRow[]>();
 	for (const line of text.split('\n')) {
 		if (!line.trim()) continue;
-		const match = GREP_BODY_ROW.exec(line);
-		if (!match) return null;
-		const [, path, number, body] = match as unknown as [string, string, string, string];
+		const row = grepBodyRow(line);
+		if (!row) return null;
+		const [path, number, body] = row;
 		let rows = rowsByFile.get(path);
 		if (!rows) {
 			rows = [];
@@ -249,7 +279,7 @@ export function condensePaths(text: string, perDirCap = 6): string | null {
 	for (const line of text.split('\n')) {
 		if (!line.trim()) continue;
 		if (GLOB_HEAD.test(`${line}\n`)) continue;
-		if (!PATH_ROW.test(line) || GREP_BODY_ROW.test(line.trim())) return null;
+		if (!PATH_ROW.test(line) || grepBodyRow(line.trim())) return null;
 		const path = line.trim();
 		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
 		const dir = slash >= 0 ? path.slice(0, slash + 1) : './';
@@ -289,6 +319,8 @@ function tailFrom(trailer: {match: string; blank: string}): string {
 }
 
 export function splitSegments(toolName: string, text: string): Segments {
+	// Rules: normalise CRLF once, here, because every parser below splits on `\n` and a retained `\r` breaks each of them: the `$`-anchored notice test stops matching (the `[cwd change to …]` note was left in the body and the earlier of two consecutive notices was lost), `PATH_ROW`'s `[^\s]*$` refuses every line, and condensed match rows keep a stray `\r` inside their text. Windows shell and ripgrep output is CRLF, so this was every Windows result. The segments are rebuilt here anyway, so they come back LF; the model reads text, not bytes.
+	text = text.replace(/\r\n/g, '\n');
 	// Rules: `grep`'s default files mode opens with the same `Found N files` line `glob` does, so both split it off; a content-mode body starts with `path:line:text` and never matches.
 	if (toolName === 'glob' || toolName === 'grep') {
 		const head = GLOB_HEAD.exec(text);
@@ -331,7 +363,8 @@ export function stripAnsi(text: string): string {
 // Rules: the guard targets that failure, not an ideal of lossless compression. A readable filter summarises on purpose — `FAILURES (1): 1. tests::fails_here` is a good result — so the check is format-shaped instead of atom-by-atom: when rtk auto-detected and produced its grep/find grouping while the original was neither `path:line:text` rows nor a path list, the guess was wrong and the original is kept. Negation loss is refused too, since that inverts meaning and no legitimate summariser drops one.
 const NEGATION = /\b(?:not|no|never|without|cannot|can't|don't|doesn't|didn't|isn't|aren't|won't|wouldn't|shouldn't|couldn't|neither|nor)\b/gi;
 // Rules: the guard catches rtk's grouped form — a `N matches in M files:` header or a `[file] path:` block header — because that is what its grep/find filters emit when they summarise.
-const GROUPING_MARKER = /^\s*(?:\d+ matches in \d+ files?:|\d+ files? in \d+ dirs?:)$|^\[file\]\s/m;
+// Rules: the abbreviated `NF:` spelling is rtk's own (`pipe_cmd.rs`) and this mod's own local condenser emits it too, so it must count as grouped here. Without it, a legitimately elided block (which states its `+N`) was refused as `negation: 12 -> 1` and the 80% saving was lost on any search whose code contains a negation.
+const GROUPING_MARKER = /^\s*(?:\d+ matches in \d+(?: files?|F):|\d+ files? in \d+ dirs?:)$|^\[file\]\s/m;
 
 function countOf(text: string, pattern: RegExp): number {
 	pattern.lastIndex = 0;
@@ -391,10 +424,15 @@ function isSpillNotice(line: string): boolean {
 
 // Rules: split out of the body so rtk cannot fold them, and returned as one block so the caller can re-attach the pointer the model needs.
 // Rules: a notice's line is blanked, not dropped: dropping it would join the two halves the host truncated between, and a filter that reads position (a diff hunk, a numbered list) would then see a different body.
+// Rules: the marker pre-check is the whole cost of this call on a normal result. Almost no result was truncated, but every result goes through here, and the split+join below is 31 ms on a 700 KB body — paid twice per result, since the local pass and the rtk pass each call it. Native `includes` over the raw text answers "no notice" for a fraction of a millisecond, and the output is byte-identical because rejoining the split lines returns the input.
+const SPILL_MARKERS = ['[... output truncated', '[full output '];
+
 export function extractSpillNotices(text: string): {body: string; notices: string} {
+	if (!SPILL_MARKERS.some(marker => text.includes(marker))) return {body: text, notices: ''};
 	const kept: string[] = [];
 	const notices: string[] = [];
-	for (const line of text.split('\n')) {
+	// Rules: split on `\r?\n`. Windows shell and ripgrep output is CRLF, and a retained `\r` fails the `$`-anchored notice test, so the truncation pointer would be left in the body for the filter to delete.
+	for (const line of text.split(/\r?\n/)) {
 		if (isSpillNotice(line)) {
 			notices.push(line);
 			kept.push('');
@@ -810,7 +848,8 @@ export default function (cmd: ModApi): void {
 	}
 
 	// Rules: the local condensers are the only part that need no process, so they are split out. Every caller runs them first, whatever the binary state — that is what makes a grep or glob result still shrink on a machine with no rtk installed, and below the byte floor where a spawn would not be worth it.
-	function condenseLocally(toolName: string, filter: string | null, text: string): string | null {
+	// Rules: no filter argument. The two local passes are shape-selected internally (`condenseGrepRows` refuses anything that is not a match row, `condensePaths` anything that is not a bare path), so the tool's filter choice was already unused here — it is passed only to `condense()`, which is where rtk is actually asked to filter.
+	function condenseLocally(toolName: string, text: string): string | null {
 		const {head, body, tail} = splitSegments(toolName, text);
 		const plainBody = stripAnsi(body);
 		const {body: filterable, notices} = extractSpillNotices(plainBody);
@@ -833,6 +872,7 @@ export default function (cmd: ModApi): void {
 	// Rules: colour is removed from the body whether or not the rtk pass below succeeds. rtk keeps escapes, so a result it declines would otherwise arrive at full size and still carry 33% of bytes that mean nothing — the strip alone is the win on those, and it is why the byte floor is checked after it, not before.
 	// Rules: the spill pointer rides in the MIDDLE of the result, so it is lifted out before filtering and put back after. The host writes it where the elision happened; a result that lost it leaves the model with no way to reach the rest of the output, which was measured: a 2,951-byte pytest result came back at 296 bytes with both pointer lines gone.
 	// Rules: the byte floor gates the rtk SPAWN, not the local pass. The local condensers cost no process, so they run below it — an 870-byte body of 20 files x 3 hits still went 870 -> 360, and a 790-byte path list 790 -> 385. Skipping those would leave the cheapest win unused.
+	// Rules: the local pass is NOT repeated here. Every caller runs `condenseLocally` first and has already returned a non-null answer — that is what makes the free passes run below the byte floor and without a binary — so re-running it here doubled the work on every result that reached the rtk spawn (measured 0.6-1.4 ms per grep/glob result).
 	async function condense(toolName: string, filter: string | null, text: string): Promise<string | null> {
 		// Rules: the shape is read from the original result, because the split below removes the very header it looks for.
 		const shapeFilter = filterForShape(toolName, filter, text);
@@ -843,8 +883,6 @@ export default function (cmd: ModApi): void {
 			const plain = `${head}${plainBody}${tail}`;
 			return plain.length < text.length ? plain : null;
 		};
-		const local = condenseLocally(toolName, filter, text);
-		if (local !== null) return local;
 		if (plainBody.trim().length < MIN_FILTER_BYTES) return plainResult();
 		const {body: filterable, notices} = extractSpillNotices(plainBody);
 		const filtered = await filterThroughRtk(shapeFilter, filterable);
@@ -988,7 +1026,7 @@ export default function (cmd: ModApi): void {
 			if (filter) {
 				if (cmd.getFlag('rtk-filter') === false) return stripped;
 				// Rules: the local pass needs no binary and no byte floor, so it is tried before either guard. A session without rtk still gets its grep and glob results grouped, and a body under 1,200 bytes still shrinks. The guards below only gate the spawn.
-				const local = condenseLocally(toolName, filter, text);
+				const local = condenseLocally(toolName, text);
 				if (local) return {content: [{type: 'text', text: local}]};
 				if (text.length < MIN_FILTER_BYTES || !supported() || !binUsable()) return stripped;
 				const filtered = await condense(toolName, filter, text);
@@ -1005,7 +1043,7 @@ export default function (cmd: ModApi): void {
 				return stripped;
 			}
 			// Rules: a rewritten call that rtk declined is a match list or a path list by construction, which is exactly what the local pass handles, and it needs no second process. It runs before the binary guard for the same reason as on the grep path.
-			const local = condenseLocally(toolName, null, text);
+			const local = condenseLocally(toolName, text);
 			if (local) return {content: [{type: 'text', text: local}]};
 			if (!supported() || !binUsable()) return stripped;
 			if (text.length < MIN_FILTER_BYTES) return stripped;
