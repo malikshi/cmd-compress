@@ -5,6 +5,7 @@
 // rules: these must not import the mods' factory (it reads cmd.store at load); only the pure helpers are imported.
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
 // agent: unknown | xai | 2026-11-06 | unknown | wrapper requote execution test, quoted assignment prefixes, guidance pinned-path test
+// agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: double-quoted wrapper execution test and `$`-in-path guidance replacement test
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -221,6 +222,13 @@ test('guidanceText: direct rtk commands use the resolved binary path', () => {
 	assert.doesNotMatch(text, /`rtk read/);
 });
 
+// Rules: `String.replace` treats `$1`, `$&`, `` $` `` and `$'` in a replacement string as patterns. A binary path can contain `$`, so a template replacement corrupted every command that followed; the callback form keeps the path literal.
+test('guidanceText: a $ in the binary path is not a replacement pattern', () => {
+	const text = guidanceText('/opt/rtk$1', 'linux');
+	assert.match(text, /'\/opt\/rtk\$1' recall/);
+	assert.doesNotMatch(text, /rtkrecall/);
+});
+
 // Rules: a named subcommand can exist while a flag it is shown with does not — `--level aggressive` and `--keys-only` are both taught by the guidance, so each flag is checked against that subcommand's own help.
 test('the injected guidance only names flags each subcommand actually takes', async t => {
 	const {execFileSync} = await import('node:child_process');
@@ -349,6 +357,22 @@ test('pinBinary: a single-quoted wrapper keeps its double quotes and special pat
 		assert.match(out, /<a b>/, 'the quoted argument stays one word');
 		assert.doesNotMatch(out, /<a><b>/, 'the argument was not split');
 		assert.match(out, /RTK:done/, 'the pinned wrapper ran the stub');
+	} finally {
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
+// Rules: a double-quoted wrapper keeps its own expansions, so the pinned path must be escaped only for the outer double quotes. A path containing `$` was expanded by the outer shell before the inner script saw it; the wrapper then ran a different path.
+test('pinBinary: a double-quoted wrapper escapes a special pinned path', t => {
+	if (process.platform === 'win32') return t.skip('POSIX wrapper quoting only');
+	const dir = mkdtempSync(join(tmpdir(), 'rtk-pin-'));
+	const stub = join(dir, 'rtk$proof');
+	writeFileSync(stub, '#!/bin/sh\nprintf "RTK:%s\\n" "$*"\n', {mode: 0o755});
+	chmodSync(stub, 0o755);
+	try {
+		const pinned = pinBinary('sh -c "rtk done"', stub, 'linux');
+		const out = execFileSync('/bin/sh', ['-c', pinned], {encoding: 'utf8', env: {...process.env, PATH: `${dir}:${process.env.PATH ?? ''}`}});
+		assert.equal(out, 'RTK:done\n', 'the literal $ path reached the stub');
 	} finally {
 		rmSync(dir, {recursive: true, force: true});
 	}

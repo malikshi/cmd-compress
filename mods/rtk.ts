@@ -10,19 +10,21 @@
 // rules: the emitted `rtk` is pinned to the resolved absolute path. rtk ships to ~/.local/bin (its installer default), ~/.bun/bin or ~/.cargo/bin, and a GUI host often has none of them on PATH, so a bare name would turn a working command into `rtk: not found`. The pin is a quote-aware single pass, because rtk emits `&`, newlines, and prefix commands, and a quoted argument may contain both `rtk` and a separator. The one quoted form it does reach into is a shell wrapper's script (`bash -c "rtk …"`), which rtk rewrites and which is a command line in its own right.
 // rules: `shell_command` and `powershell` are both shell tools with the same result envelope, so every path keys off `isShellTool`, not the one name — a Windows session would otherwise get no rewrite and no condensing at all.
 // rules: a rewritten shell call is skipped unless rtk left its faithful baseline — no recovery marker and a majority of `path:line:text` rows — because rtk's own never-worse guard declines to compress multi-file grep output by default.
+// rules: the rewrite cache key carries the rule-file mtime/size stamp, because rtk checks a deny before it rewrites — a rewrite cached before a rule edit would skip the new deny. Only rewrite verdicts are cached; pass and deny are re-asked.
+// rules: context detection keys off the loose `path:line:` row shape, not the strict file-like test: a dotless, dotfile, spaced, or non-ASCII path must register as a known path, or rtk's grouping can drop its `-A/-B/-C` rows. Compression stays strict, where a false positive only costs bytes.
 // rules: a sub-agent run gets no mod hooks at all, so the child's own shell calls are never rewritten from here. The `agent` call's prompt is the only channel: it carries a block telling the child to prefix commands with the resolved absolute binary, and it is added only when that binary is usable and new enough.
 // rules: `shell_command`'s `args` array is part of the command line the host runs, so the rewrite sees it; a `-A/-B/-C` grep result is never handed to rtk's grep filter, which keeps only match rows and would silently drop the context the caller asked for.
 // rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
-// agent: unknown | unknown | 2026-11-05 | unknown | count-mode review, measured against the host's `finishCountMode`: `path:count` was reaching the path condenser and printing the match COUNT where a line number goes (`file0.ts:1`), because `grepBodyRow` needs a third field to recognise a row. `condenseCountRows` now condenses that shape with every number labelled (77% body, 68% with the trailer), `condensePaths` refuses it, and the bench fixture was corrected — it emitted content rows under a count-mode label, so the published 85.4% described a shape the host never produces
 // agent: unknown | unknown | 2026-11-05 | unknown | hot-path and duplicate review: both layouts deduped independently (27% of a 40k-row run) and were fully rendered before one was chosen; the dedupe now runs once as rows arrive and each layout writes to a `string[]` sink, taking the 2.17 MB body from 2.6 MB/s to 12.7 MB/s and the 30 KB host-capped body to p50 0.8 ms. `condenseCountRows` also listed a repeated path once per row, so it claimed more files than existed and printed the same name several times — a repeated path is now summed into a single entry and the header counts distinct files. Confirmed the >2 MB tail is container scheduling, not allocation: an unrelated no-op loop shows the same ~700 ms outliers.
 // agent: unknown | unknown | 2026-11-05 | unknown | Windows CI, measured on run 42054267199: `verify (windows-latest, 22|24)` failed only in `Tests`, on a test that hardcoded POSIX single quotes while `pinBinary` correctly switches to double quotes on win32. The mod was right and the expectation was wrong; the test now asserts the real property (the path is quoted and never bare in any example) on either platform. Both platform branches were re-verified from this host through `pinBinary`/`filterShell`/`pipeCommand`/`windowsPipeScript` with `platform` passed explicitly, so the win32 path is exercised on Linux too.
 // agent: unknown | unknown | 2026-11-05 | unknown | sub-agent path proved end-to-end on 1.88.3 with real headless delegation instead of reasoning about the bundle: the child's mod list really is `[continuationMod, createUserHooksMod]`, so no rtk/prompt hook reaches it and the `agent` prompt is the only channel. Measured the channel works (a child reproduced the block verbatim, quoted path included) but compliance is partial: 38 of 60 child shell calls used the prefix across nine delegations (63%, per-delegation 0-100%), and compliant children were running every command bare AND prefixed, doubling the work. The block now says the prefixed command IS the run (one task went 1/4 to 3/3) and the README no longer claims enforcement. `agentDefinitions()` is host-internal, so no stronger mechanism exists from a mod.
 // agent: unknown | xai | 2026-11-06 | unknown | review fixes: strict `isGrepRows` (timestamp logs are refused), escaped wrapper requotes, no pass cache, quoted assignment prefixes, pinned guidance path, `+N files` labels; host proof harness validated on 1.88.3
+// agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: loose `GREP_ROW` for context only (dotless paths were losing `-A/-B/-C` rows), rule-file stamp in the rewrite cache (a mid-session deny was bypassed), `escapeForOuter` for a `$` in a double-quoted wrapper path, callback-based guidance replacement, and `version pending` separated from `version unreadable`
 
 import type {ModApi} from '@commandcode/harness';
 import {accessSync, constants, mkdtempSync, rmSync, statSync, writeFileSync} from 'node:fs';
-import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {homedir, tmpdir} from 'node:os';
+import {dirname, join} from 'node:path';
 import {AGENT_TOOL, announceMode, filterShell, isShellTool, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, withAgentBlock, wrapBlock, writeOwnMode, OFF} from './shared.ts';
 
 export const REWRITE_TIMEOUT_MS = 2000;
@@ -101,6 +103,10 @@ const RECOVERY_MARKER = /\bmatches in \d+(?: files?|F):|\+\d+ more|\+ \.\.\. mor
 // Rules: this runs on every shell result, and a 700 KB body costs 40 ms of per-line regex — the answer is false almost every time. Two cheap native passes replace most of that: a body with no `:<digits>:` anywhere cannot hold a single row, and the loop bails as soon as the remaining lines can no longer reach the 0.5 majority. Both preserve the exact rule; neither changes a true answer.
 const ROW_HINT = /:\d+:/;
 
+// Rules: context detection uses the loose shape, not the strict file-like check. A real host path can be a dotless `Makefile`, a `.env`, a directory with a space, or a non-ASCII path; a false negative here accepts rtk's grouping and drops every context row. A false positive only refuses a grouping, so it cannot lose data.
+// Rules: a Windows match row is `C:\src\a.ts:12:text`; the drive colon is consumed explicitly so the rest of the path may not hide one.
+const GREP_ROW = /^((?:[A-Za-z]:[\\/])?[^\s:][^:\n]*):\d+:[^\n]*$/;
+
 export function isGrepRows(text: string): boolean {
 	if (!ROW_HINT.test(text)) return false;
 	const lines = text.split('\n').filter(line => line.trim());
@@ -121,12 +127,12 @@ export function hasGrepContext(text: string): boolean {
 	const lines = text.split('\n').filter(line => line.trim());
 	const knownPaths = new Set<string>();
 	for (const line of lines) {
-		const row = grepBodyRow(line.trim());
-		if (row) knownPaths.add(row[0]);
+		const path = GREP_ROW.exec(line)?.[1];
+		if (path !== undefined) knownPaths.add(path);
 	}
 	if (knownPaths.size === 0) return false;
 	for (const line of lines) {
-		if (grepBodyRow(line.trim())) continue;
+		if (GREP_ROW.test(line)) continue;
 		const path = GREP_CONTEXT_ROW.exec(line)?.[1];
 		if (path !== undefined && knownPaths.has(path)) return true;
 	}
@@ -717,12 +723,17 @@ function wrapperScriptAt(text: string, start: number): {scriptStart: number; scr
 	return {scriptStart: open + 1, scriptEnd: close, quote};
 }
 
-export function pinBinary(command: string, bin: string, platform: string = process.platform): string {
+export function pinBinary(command: string, bin: string, platform: string = process.platform, escapeForOuter = false): string {
+	const posix = `'${bin.replace(/'/g, `'\\''`)}'`;
 	const quoted = platform === 'win32'
 		? `"${bin.replace(/"/g, '""')}"`
-		: `'${bin.replace(/'/g, `'\\''`)}'`;
+		: escapeForOuter
+			? posix.replace(/[\\"$`]/g, '\\$&')
+			: posix;
 	// Rules: the wrapper pass runs first, then the normal scan. It recurses through the public entry so a nested wrapper is pinned too, and so `win32` quoting is not duplicated here.
-	const pin = (text: string) => pinBinary(text, bin, platform);
+	const pin = (text: string) => pinBinary(text, bin, platform, escapeForOuter);
+	const pinNormal = (text: string) => pinBinary(text, bin, platform, false);
+	const pinOuter = (text: string) => pinBinary(text, bin, platform, true);
 	let out = '';
 	let index = 0;
 	// Rules: the command position is true at the start of the string and again after a separator, so the scan carries one flag instead of re-deriving it from a lookbehind.
@@ -734,10 +745,10 @@ export function pinBinary(command: string, bin: string, platform: string = proce
 			const script = wrapperScriptAt(command, index);
 			if (script) {
 				const inner = command.slice(script.scriptStart, script.scriptEnd);
-				const pinnedInner = pin(inner);
+				const pinnedInner = script.quote === '"' ? pinOuter(inner) : pinNormal(inner);
 				const requote = script.quote === '"' || !hasExpansion(inner);
 				if (pinnedInner !== inner && requote) {
-					// Rules: the script is re-emitted inside double quotes, because a single-quoted container cannot hold the `'\''` escaping a POSIX path may need. A single-quoted script has no expansion of its own, so every `"`, `\`, `$` and backtick in the pinned form is escaped for the outer double quotes; without that, `rtk grep "a b"` lost its quotes and the path's `$` expanded. A double-quoted script keeps its own escapes and expansions.
+					// Rules: the script is re-emitted inside double quotes, because a single-quoted container cannot hold the `'\''` escaping a POSIX path may need. A single-quoted script has no expansion of its own, so every `"`, `\`, `$` and backtick in the pinned form is escaped for the outer double quotes. A double-quoted script keeps its own escapes and expansions, so only the pinned path is escaped; without that, a path containing `$` or a backtick was expanded by the outer shell.
 					const requoted = script.quote === '"' ? pinnedInner : pinnedInner.replace(/[\\"$`]/g, '\\$&');
 					out += `${command.slice(index, script.scriptStart - 1)}"${requoted}"`;
 					index = script.scriptEnd + 1;
@@ -809,7 +820,7 @@ Condensed output states its own recovery path. An elided span prints a count suc
 export function guidanceText(bin?: string, platform: string = process.platform): string {
 	if (!bin) return GUIDANCE;
 	const quoted = pinBinary('rtk', bin, platform);
-	return `The resolved rtk binary is \`${quoted}\`; use it for every direct rtk command below.\n\n${GUIDANCE.replace(/`rtk ([a-z-]+)/g, `\`${quoted} $1`)}`;
+	return `The resolved rtk binary is \`${quoted}\`; use it for every direct rtk command below.\n\n${GUIDANCE.replace(/`rtk ([a-z-]+)/g, (_match, name: string) => `\`${quoted} ${name}\``)}`;
 }
 
 // Rules: a sub-agent never receives this mod, so nothing rewrites its shell calls. The parent cannot rewrite them either — its hooks only see its own tool calls, and the child's tool call ids never reach them. The one lever left is the `agent` call's prompt: tell the child to prefix commands itself, with the absolute path this mod resolved, because a bare `rtk` is exactly what `pinBinary` exists to avoid (rtk ships to ~/.local/bin, often off a GUI host's PATH).
@@ -857,8 +868,47 @@ export default function (cmd: ModApi): void {
 	// Rules: the rewrite is judged against the session's rules, so it runs in the session cwd; a deny file above it is found the same way rtk finds it for any other host.
 	const cwd = typeof cmd.cwd === 'string' && cmd.cwd ? cmd.cwd : undefined;
 
+	// Rules: rtk checks a deny before it rewrites, so a cached rewrite is also a deferred deny. The cache key carries a stamp of every reachable rule file; a file added or edited mid-session changes the stamp and the command is asked again. A false positive only costs a spawn. The names are the ones rtk 1.1.0 reports for its own pipeline and filters.
+	const RULE_FILE_NAMES = ['pipeline.toml', '.rtk/pipeline.toml', '.rtk/filters.toml'];
+	const HOME_RULE_FILE_NAMES = ['pipeline.toml', 'filters.toml'];
+	function ruleStamp(): string {
+		const roots: string[] = [];
+		let dir = cwd ?? process.cwd();
+		for (;;) {
+			roots.push(dir);
+			const parent = dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+		const home = homedir();
+		const config = process.env.XDG_CONFIG_HOME?.trim() || join(home, '.config');
+		const parts: string[] = [];
+		for (const root of roots) {
+			for (const name of RULE_FILE_NAMES) {
+				const file = join(root, name);
+				try {
+					const stat = statSync(file);
+					parts.push(`${file}:${stat.mtimeMs}:${stat.size}`);
+				} catch {
+					parts.push(`${file}:none`);
+				}
+			}
+		}
+		for (const name of HOME_RULE_FILE_NAMES) {
+			const file = join(config, 'rtk', name);
+			try {
+				const stat = statSync(file);
+				parts.push(`${file}:${stat.mtimeMs}:${stat.size}`);
+			} catch {
+				parts.push(`${file}:none`);
+			}
+		}
+		return parts.join('|');
+	}
+
 	let version: RtkVersion | null = null;
 	let versionProbe: Promise<void> | null = null;
+	let isVersionProbed = false;
 	// undefined means undecided; a mode change clears it so a re-enable decides again.
 	let guidanceDecided: boolean | undefined;
 	const supported = () => isSupportedVersion(version);
@@ -870,7 +920,9 @@ export default function (cmd: ModApi): void {
 	};
 	// Rules: one probe per session. onSessionStart runs fire-and-forget, so the first round would otherwise spawn a second `rtk --version` while the first is still in flight; memoising keeps it to one.
 	const versionSettled = () => {
-		versionProbe ??= readVersion();
+		versionProbe ??= readVersion().finally(() => {
+			isVersionProbed = true;
+		});
 		return versionProbe;
 	};
 
@@ -889,8 +941,16 @@ export default function (cmd: ModApi): void {
 		return true;
 	});
 	cmd.expose('getMode', () => mode);
-	// Rules: the stored mode says what the user asked for, not what the session can do. `compress` prints one line for three mods, so it needs to know that `rtk=on` condenses nothing without a usable, new-enough binary — otherwise that line claims a capability the session does not have. The reason is returned rather than a bare boolean, because "no binary" and "too old" call for different fixes.
-	cmd.expose('inactiveReason', () => (!binUsable() ? 'no binary' : !supported() ? `rtk too old, needs >= 0.${MIN_SUPPORTED_RTK_MINOR}.0` : null));
+	// Rules: the stored mode says what the user asked for, not what the session can do. `compress` prints one line for three mods, so it needs to know that `rtk=on` condenses nothing without a usable, new-enough binary — otherwise that line claims a capability the session does not have. The reason is returned rather than a bare boolean, because "no binary", "too old", and "version unreadable" call for different fixes. A first paint can happen before the probe answers; start it here and say "version pending" rather than claiming the binary works. `version` stays null both before and after an unreadable probe, so the settled flag separates the two.
+	cmd.expose('inactiveReason', () => {
+		if (!binUsable()) return 'no binary';
+		if (!isVersionProbed) {
+			void versionSettled();
+			return 'version pending';
+		}
+		if (!version) return 'rtk version unreadable';
+		return supported() ? null : `rtk too old, needs >= 0.${MIN_SUPPORTED_RTK_MINOR}.0`;
+	});
 
 	// Rules: `cmd.exec` accepts no timeout (it ignores the option), so abort through a signal or a hung rtk blocks the tool call forever.
 	async function exec(options: {command: string; args: string[]}, timeoutMs: number) {
@@ -914,21 +974,22 @@ export default function (cmd: ModApi): void {
 		}
 	}
 
-	// Rules: a rewrite is a pure function of the command line and the resolved binary, and a session repeats the same few commands constantly (`git status`, `git diff`, `npm test` six times in a row is normal). Each `rtk rewrite` measured 30-160 ms here, so a session cache removes most of that cost. Only a `rewrite` verdict is cached: a deny depends on rules the user can edit mid-session, and a pass depends on those same rules — serving a cached pass would bypass a rule added after the first call. A `pass` is therefore re-asked; the cost is one spawn on a repeated command with no equivalent.
+	// Rules: a rewrite is a pure function of the command line and the resolved binary, and a session repeats the same few commands constantly (`git status`, `git diff`, `npm test` six times in a row is normal). Each `rtk rewrite` measured 30-160 ms here, so a session cache removes most of that cost. The key carries the rule-file stamp: rtk checks a deny before it rewrites, so a rewrite cached before a rule edit would bypass the new deny. A deny or pass is never cached; a pass is re-asked because the next call can add a rule.
 	// Rules: bounded so a long session cannot grow it without limit, and keyed on the exact line, so a different argument set is a different entry.
 	const rewriteCache = new Map<string, RewriteVerdict>();
 
 	async function rewrite(command: string): Promise<RewriteVerdict> {
 		const bin = binPath();
 		if (!bin || !supported()) return {kind: 'pass'};
-		const cached = rewriteCache.get(command);
+		const cacheKey = `${ruleStamp()}\0${command}`;
+		const cached = rewriteCache.get(cacheKey);
 		if (cached) return cached;
 		try {
 			const {stdout, code} = await exec({command: bin, args: ['rewrite', command]}, REWRITE_TIMEOUT_MS);
 			const verdict = classifyRewrite(code, stdout, command);
 			if (verdict.kind === 'rewrite') {
 				if (rewriteCache.size >= 128) rewriteCache.clear();
-				rewriteCache.set(command, verdict);
+				rewriteCache.set(cacheKey, verdict);
 			}
 			return verdict;
 		} catch {

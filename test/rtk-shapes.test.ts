@@ -6,11 +6,14 @@
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
 // agent: unknown | unknown | 2026-11-05 | unknown | added the CRLF equivalence test and the two local-layout fidelity tests, after measuring that Windows parsing dropped every path list and that the guard refused the condenser's own `NF:` header
 // agent: unknown | xai | 2026-11-06 | unknown | review fixes: timestamp-log data-loss test, pass-cache regression, median timing batches, count/path `+N files` assertions
+// agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: dotless-path context loss test and a rule-file-added-mid-session cache test
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile, execFileSync} from 'node:child_process';
-import {readFileSync} from 'node:fs';
+import {mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {performance} from 'node:perf_hooks';
 import rtk, {canRefilterCompressed, checkFidelity, condenseCountRows, condenseGrepRows, condensePaths, hasGrepContext, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
 import {createFakeCmd, firstHook, resultText, runHandler, type FakeExecRequest} from './harness.ts';
@@ -565,6 +568,40 @@ test('rewrite: a pass is re-asked, so a new deny is not bypassed', async () => {
 	assert.match(blocked?.additionalContext ?? '', /pipeline rule forbids it/);
 });
 
+// Rules: rtk checks a deny before it rewrites, so a cached rewrite is also a deferred deny. The cache key carries a rule-file stamp; adding the project rule file mid-session must re-ask rtk and block the command.
+test('rewrite: a rule file added mid-session invalidates the cache', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'rtk-rules-'));
+	let calls = 0;
+	let deny = false;
+	const fake = createFakeCmd({
+		exec: async request => {
+			if (request.args?.[0] === '--version') return {stdout: 'rtk 1.1.0', stderr: '', code: 0};
+			calls += 1;
+			return deny
+				? {stdout: 'pipeline rule forbids it', stderr: '', code: 2}
+				: {stdout: 'rtk git status', stderr: '', code: 0};
+		},
+	});
+	fake.cmd.name = 'probe';
+	fake.cmd.cwd = dir;
+	rtk(fake.cmd as never);
+	const setMode = fake.exposed.get('probe')?.get('setMode') as ((value: unknown) => boolean) | undefined;
+	setMode?.('on');
+	const call = (id: string) => firstHook(fake).beforeToolCall?.({toolCallId: id, toolName: 'shell_command', input: {command: 'git status'}});
+	try {
+		assert.ok(await call('r1'), 'the first call rewrites');
+		assert.equal(calls, 1);
+		mkdirSync(join(dir, '.rtk'), {recursive: true});
+		writeFileSync(join(dir, '.rtk', 'pipeline.toml'), '[pipeline]\n');
+		deny = true;
+		const blocked = (await call('r2')) as {block?: boolean} | undefined;
+		assert.equal(calls, 2, 'the changed rule stamp re-asked rtk');
+		assert.equal(blocked?.block, true, 'the new deny blocks the command');
+	} finally {
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
 // Rules: the local condensers cost no process, so they must not be gated on the binary or on the 1,200-byte spawn floor. This is the whole point on a machine with no rtk: the grep result still shrinks. A stub whose every spawn fails is a session with no binary.
 test('grep: a body below the spawn floor still shrinks, with no process', async () => {
 	const spawned: string[] = [];
@@ -1008,14 +1045,18 @@ test('a grep result carrying -A/-B/-C context is not handed to the grep filter',
 	assert.equal(checkFidelity(bareRows, grouped, false).ok, true, 'a context-free match list is still accepted');
 });
 
+// Rules: a host path can be a dotless `Makefile`, a `.env`, or a directory with a space or non-ASCII; the context guard must use the loose `path:line:text` shape for known paths. A strict file-like check returned no known paths, so rtk's grouped result was accepted and every `-A/-B/-C` context row was dropped. Measured on a real `Makefile` context body: 2,162 bytes in, 288 bytes out, 0/40 context rows, `checkFidelity` reported ok.
+test('a context row for a dotless path is refused', () => {
+	const rows = Array.from({length: 40}, (_, index) => `Makefile:${index + 1}:all\nMakefile-${index + 2}-\techo target${index}`).join('\n');
+	assert.equal(hasGrepContext(rows), true, 'the loose row shape registers Makefile as a known path');
+	const grouped = '40 matches in 1F:\n\n[file] Makefile (40):\n     1: all';
+	assert.equal(checkFidelity(rows, grouped, false).ok, false, 'the context loss is refused');
+	assert.match(checkFidelity(rows, grouped, false).lost.join(' '), /context/);
+});
+
 // Rules: a path may itself contain `-<digits>-`, so a delimiter-only test reads `src/v2-feat-12-bar1.ts` as a context row and refuses a legitimate find-mode grouping (measured: a 40-path list was refused). The context path must be one the match rows already named.
 // Rules: the mixed case is the one that discriminates — real match rows present (so the early return cannot mask the bug) plus a path-shaped line that is not their context. A paths-only list exits before the delimiter test ever runs.
 test('a path containing -N- is not mistaken for grep context', async () => {
-	const {hasGrepContext, checkFidelity} = await import('../mods/rtk.ts');
-	const paths = Array.from({length: 40}, (_, index) => `src/v2-feat-12-bar${index}.ts`);
-	assert.equal(hasGrepContext(paths.join('\n')), false, 'a plain path list carries no context');
-	assert.equal(checkFidelity(paths.join('\n'), '40 files in 2 dirs:\n\n  src/  (40)', false).ok, true, 'and its grouping is accepted');
-
 	const rows = Array.from({length: 40}, (_, index) => `src/a.ts:${index + 1}:  hit${index}`).join('\n');
 	const withContext = Array.from({length: 40}, (_, index) => `src/a.ts:${index + 1}:  hit${index}\nsrc/a.ts-${index + 2}-  ctx${index}`).join('\n');
 	assert.equal(hasGrepContext(rows), false, 'match rows alone are not context');

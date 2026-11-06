@@ -5,6 +5,7 @@
 // rules: setups run each mod through its exported default factory, so the wiring and the hooks are covered, not only the pure helpers.
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
 // agent: unknown | xai | 2026-11-06 | unknown | timestamp-log rewritten-call regression; wrapper and cache covered here or in the pure suites
+// agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: footer pending/settled version paint, non-vacuous directory guidance, `compress` waits for the probe
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -535,8 +536,11 @@ test('compress: an unknown preset prints usage and changes nothing', () => {
 
 // Rules: the footer must not wait for a turn boundary. `cmd.store` is per mod, so `compress` cannot read a sibling's write, and `onRunEnd` only fires when the turn ends — a `/caveman ultra` typed at the prompt left the footer reading `compress off` until the next turn finished. Measured before the fix: the status line still said `compress off` while `getMode()` answered `ultra`. The shared bus closes that gap.
 // Rules: one cmd object shared by all four mods, the way the host does it — each mod bound to its own store by name. Four separate fakes would get four separate buses, so the announcement would never be observed and the test would pass without testing anything.
-test('compress: the footer repaints as soon as a sibling mode changes', () => {
-	const fake = createFakeCmd({flags: {'rtk-bin': TEST_BIN}});
+test('compress: the footer repaints as soon as a sibling mode changes', async () => {
+	const fake = createFakeCmd({
+		flags: {'rtk-bin': TEST_BIN},
+		exec: async request => (request.args?.[0] === '--version' ? {stdout: 'rtk 1.1.0', stderr: '', code: 0} : {stdout: '', stderr: '', code: 0}),
+	});
 	const mods = [['caveman', caveman], ['ponytail', ponytail], ['rtk', rtk], ['compress', compress]] as const;
 	for (const [name, factory] of mods) {
 		fake.bindStore(name);
@@ -551,7 +555,10 @@ test('compress: the footer repaints as soon as a sibling mode changes', () => {
 	assert.equal((fake.exposed.get('caveman')?.get('getMode') as () => string)(), 'ultra', 'the mode actually changed');
 	assert.equal(fake.statuses.at(-1), 'caveman=ultra pony=off rtk=off', 'and the footer already says so, with no turn end');
 
-	runHandler(fake.commands, 'rtk', 'on');
+	await runHandler(fake.commands, 'rtk', 'on');
+	// Rules: the mode event fires while `inactiveReason` is still waiting on the version probe, so the immediate paint is honest about the wait; the next paint at the turn boundary carries the settled answer. Both states are asserted so a regression to either lie is caught.
+	assert.equal(fake.statuses.at(-1), 'caveman=ultra pony=off rtk=on (version pending)');
+	for (const hook of fake.hooks) hook.onRunEnd?.();
 	assert.equal(fake.statuses.at(-1), 'caveman=ultra pony=off rtk=on');
 });
 
@@ -779,16 +786,37 @@ test('compress: an rtk that is too old is annotated with its own reason', async 
 	assert.match(messageOf(runHandler(fake.commands, 'compress', 'max')), /rtk=on \(rtk too old/);
 });
 
-test('compress: a usable rtk stays unannotated', () => {
-	const fake = createFakeCmd({flags: {'rtk-bin': TEST_BIN}});
+// Rules: a settled probe that printed no version is not "pending" — that state ends the moment the probe answers, and claiming a wait that will never finish hides a binary this session cannot use.
+test('compress: an unreadable rtk version is annotated, not left pending', async () => {
+	const fake = createFakeCmd({
+		flags: {'rtk-bin': TEST_BIN},
+		exec: async request => (request.args?.[0] === '--version' ? {stdout: 'unknown build', stderr: '', code: 0} : {stdout: '', stderr: '', code: 1}),
+	});
 	for (const [name, factory] of [['caveman', caveman], ['ponytail', ponytail], ['rtk', rtk], ['compress', compress]] as const) {
 		fake.bindStore(name);
 		fake.cmd.name = name;
 		factory(fake.cmd as never);
 	}
+	await runHandler(fake.commands, 'rtk', 'status');
 	const line = messageOf(runHandler(fake.commands, 'compress', 'max'));
+	assert.match(line, /rtk=on \(rtk version unreadable\)/);
+	assert.doesNotMatch(line, /version pending/);
+});
+
+test('compress: a usable rtk stays unannotated', async () => {
+	const fake = createFakeCmd({
+		flags: {'rtk-bin': TEST_BIN},
+		exec: async request => (request.args?.[0] === '--version' ? {stdout: 'rtk 1.1.0', stderr: '', code: 0} : {stdout: '', stderr: '', code: 1}),
+	});
+	for (const [name, factory] of [['caveman', caveman], ['ponytail', ponytail], ['rtk', rtk], ['compress', compress]] as const) {
+		fake.bindStore(name);
+		fake.cmd.name = name;
+		factory(fake.cmd as never);
+	}
+	await runHandler(fake.commands, 'rtk', 'status');
+	const line = messageOf(await runHandler(fake.commands, 'compress', 'max'));
 	assert.match(line, /rtk=on/);
-	assert.doesNotMatch(line, /no binary/);
+	assert.doesNotMatch(line, /no binary|too old|version pending/);
 });
 
 test('compress: a missing sibling is reported as unchanged, never as applied', () => {
@@ -850,6 +878,8 @@ test('rtk: a real --rtk-bin is still reported as the binary', async () => {
 test('rtk: a directory is reported as NOT FOUND, not as the binary', async () => {
 	const fake = load(rtk, {flags: {'rtk-bin': tmpdir()}});
 	assert.match(messageOf(await runHandler(fake.commands, 'rtk', 'status')), /binary: NOT FOUND/);
+	const setMode = fake.exposed.get('probe')?.get('setMode') as ((value: unknown) => boolean) | undefined;
+	setMode?.('on');
 	assert.equal(await appends(fake), '', 'no guidance for a path that cannot execute');
 });
 

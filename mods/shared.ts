@@ -4,13 +4,13 @@
 // related: rules/caveman.ts, rules/ponytail.ts
 // rules: cmd.store is namespaced per mod, so a mod persists ONLY its own key; a sibling's mode is read through cmd.use.
 // rules: prompt text must be byte-stable per mode so the provider prefix cache survives across rounds.
-// agent: unknown | unknown | 2026-11-02 | unknown | initial — per-mod store key after learning each mod gets its own file
 // agent: unknown | unknown | 2026-11-03 | unknown | turnOffSiblings — "normal mode" must end every mode, and transformInput short-circuits on handled
 // agent: unknown | unknown | 2026-11-03 | unknown | announceMode + MODE_EVENT so the compress status repaints on any mode change; drop promptHas, which no caller or test ever referenced
 // agent: unknown | unknown | 2026-11-04 | unknown | AGENT_TOOL + withAgentBlock — a sub-agent run gets no mod hooks, so the `agent` call's prompt is the only channel a mode block can reach it through
 // agent: unknown | xai | 2026-11-06 | unknown | review fixes: CodeDNA section dividers removed; `NORMAL_MODE`/`ModeName` added to exports; POSIX pipe paths single-quoted and Windows `%` escaped
+// agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: `resolveBin` now requires a regular executable file, so a same-named directory cannot shadow a later real binary
 
-import {accessSync, constants, existsSync} from 'node:fs';
+import {accessSync, constants, existsSync, statSync} from 'node:fs';
 import {delimiter, join} from 'node:path';
 import {homedir} from 'node:os';
 
@@ -167,12 +167,12 @@ export function resolveBin(
 	for (const dir of dirs) {
 		const candidate = join(dir, exe);
 		try {
-			if (existsSync(candidate)) {
+			if (existsSync(candidate) && statSync(candidate).isFile()) {
 				accessSync(candidate, constants.X_OK);
 				return candidate;
 			}
 		} catch {
-			// Rules: a candidate that is not executable is skipped; keep probing.
+			// Rules: a candidate that is not a regular executable file is skipped; keep probing.
 		}
 	}
 	return null;
