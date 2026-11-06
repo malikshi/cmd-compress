@@ -347,7 +347,7 @@ test('rtk: hostile grep output reaches the filter as data, not as shell source',
 	assert.ok(filterCommand, 'the filter ran');
 	assert.ok(!filterCommand.includes('/tmp/pwned'), 'payload is not in the command line');
 	assert.ok(!filterCommand.includes('rm -rf'), 'payload is not in the command line');
-	assert.match(filterCommand, / pipe -f grep < '/, 'the payload arrives through a redirected file');
+	assert.match(filterCommand, / pipe -f grep < ["']/, 'the payload arrives through a redirected file');
 });
 
 // Rules: rtk's exit 2 is a deny in its own contract — running the command anyway would ignore a rule the operator wrote.
@@ -408,7 +408,7 @@ test('rtk: unrewritten shell output is still condensed by auto-detect', async ()
 		isError: false,
 	})) as {content: Array<{text: string}>};
 	assert.equal(filtered.content[0]?.text, 'FAILURES (1):\n');
-	assert.match(calls.at(-1) ?? '', / pipe < '/, 'auto-detect runs with no -f');
+	assert.match(calls.at(-1) ?? '', / pipe < ["']/, 'auto-detect runs with no -f');
 });
 
 // Rules: a rewritten call was already filtered by rtk itself, so a second pass would cost a process and gain nothing.
