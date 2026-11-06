@@ -456,6 +456,61 @@ test('condensePaths: a match row is refused, so a grep body is left to the row c
 	assert.equal(condensePaths(rows), null);
 });
 
+// Rules: the cap exists to shorten a LONG file list, but it used to be applied unconditionally. Measured on seven `./src/d0/xN.ts` paths before the comparison existed: the capped tree was returned at 93 bytes and dropped `x6.ts`, while the uncapped tree was 90 and kept every name. The two layouts are now compared, so no name is spent to make a result larger.
+test('condensePaths: the cap never makes a result larger than keeping every name', () => {
+	const text = Array.from({length: 7}, (_, index) => `./src/d0/x${index}.ts`).join('\n');
+	const out = condensePaths(text);
+	assert.ok(out, 'the body is condensed');
+	assert.doesNotMatch(out, /\+\d+ files/, 'eliding saves nothing here, so every name stays');
+	assert.ok(out.includes('x6.ts'), 'the name the cap would have dropped survives');
+	assert.ok(out.length < text.length, 'and it is still smaller than the input');
+});
+
+// Rules: the same property on a body that spans several directories, because the cap is applied per directory. A chosen layout must never be larger than the layout that keeps every name.
+// Rules: the uncapped layout is itself gated by the 5% floor, so it can be null while the capped one clears it — seven 31-character names under `./src/d0/` is such a body (capped 12.9%, uncapped 4.9%). A null uncapped answer therefore means "no competitor", not "the test cannot run", and the comparison treats it as unbounded.
+test('condensePaths: a chosen layout is never larger than the uncapped one', () => {
+	const cases = [
+		Array.from({length: 7}, (_, index) => `./src/one/f${index}.ts`),
+		Array.from({length: 20}, (_, index) => `./src/one/f${index}.ts`),
+		Array.from({length: 240}, (_, index) => `./src/a${index % 24}/module-name${index}.ts`),
+		Array.from({length: 24 * 7}, (_, index) => `./src/d${index % 24}/${index}`),
+		Array.from({length: 7}, (_, index) => `./src/d0/n${'x'.repeat(29)}${index}`),
+	];
+	for (const paths of cases) {
+		const text = paths.join('\n');
+		const chosen = condensePaths(text);
+		assert.ok(chosen !== null, `the body is condensed (${paths.length} paths)`);
+		const uncapped = condensePaths(text, Number.POSITIVE_INFINITY);
+		assert.ok(chosen.length <= (uncapped?.length ?? Number.POSITIVE_INFINITY), `the chosen layout is never larger (${paths.length} paths)`);
+	}
+});
+
+// Rules: an exact tie between the two layouts is the case where the cap drops a name for no gain at all. Measured: seven four-character names under `./src/widgets/` render to 116 bytes either way, so the layout that keeps every name must win. `smallestWorthIt` keeps the FIRST of two equal candidates, which is why the uncapped rendering is passed first.
+test('condensePaths: an exact tie keeps the name, since eliding buys nothing', () => {
+	const names = Array.from({length: 7}, (_, index) => `nnnn${index}.ts`);
+	const text = names.map(name => `./src/widgets/${name}`).join('\n');
+	const capped = condensePaths(text, 6);
+	const uncapped = condensePaths(text, Number.POSITIVE_INFINITY);
+	assert.ok(capped && uncapped, 'both layouts exist');
+	assert.equal(capped.length, uncapped.length, 'the two layouts cost the same');
+	const out = condensePaths(text);
+	assert.ok(out, 'the body is condensed');
+	assert.ok(out.includes('nnnn6.ts'), 'and the name is kept, because dropping it saves nothing');
+});
+
+// Rules: the same tie case in the count layout, where a dropped row and the elision marker are the same width. Measured: seven 4-character names under a 10-character directory (`./dddddddddd/a.ts:1` …) give 130 bytes either way, because `  g.ts (1)` and `  +1 files` are both ten characters. Pre-fix the tie dropped `g.ts` for no gain.
+test('condenseCountRows: an exact tie keeps the name, since eliding buys nothing', () => {
+	const names = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
+	const text = names.map((name, index) => `./dddddddddd/${name}.ts:${(index % 3) + 1}`).join('\n');
+	const capped = condenseCountRows(text, 6);
+	const uncapped = condenseCountRows(text, Number.POSITIVE_INFINITY);
+	assert.ok(capped && uncapped, 'both layouts exist');
+	assert.equal(capped.length, uncapped.length, 'the two layouts cost the same');
+	const out = condenseCountRows(text);
+	assert.ok(out, 'the body is condensed');
+	assert.ok(out.includes('g.ts'), 'and the name is kept, because dropping it saves nothing');
+});
+
 // Rules: the host's count mode emits `path:count` (`finishCountMode`: `compactPath(n.path):n.count`), which `grepBodyRow` cannot recognise because it needs a third field. That row used to reach the path tree and print `file0.ts:1`, where `1` is the match COUNT sitting exactly where a line number goes — a model reading that reopens the wrong line. It now has its own layout, where every number is labelled, so no position in the output can be read as a line number.
 test('condenseCountRows: a count body is grouped, and no number is left where a line number goes', () => {
 	const count = Array.from({length: 40}, (_, index) => `src/file${index}.ts:${(index % 10) + 1}`).join('\n');
@@ -467,6 +522,12 @@ test('condenseCountRows: a count body is grouped, and no number is left where a 
 	assert.match(out, /\+34 files/, 'the elided file names are counted and labelled');
 	assert.doesNotMatch(out, /^\s+\S+:\d+/m, 'no bare `name:number` position can be misread as a line number');
 	assert.ok(out.length < count.length, 'and it is smaller than the input');
+});
+
+// Rules: the 5% floor is separate from "did it shrink at all". This body does shrink — its layout is 258 bytes against a 271-byte input, 4.8% — and is still declined, so the test fails if the floor is removed or lowered. An earlier version used a body whose layout was LARGER than its input, which a bare `length < input` check would also reject, so it proved nothing about the floor.
+test('condenseCountRows: a body the layout cannot shrink by 5% is left alone', () => {
+	const text = Array.from({length: 8}, (_, index) => `./d/${'x'.repeat(26)}${index}:1`).join('\n');
+	assert.equal(condenseCountRows(text), null, 'under 5% saved is not worth a new layout');
 });
 
 test('condenseCountRows: a path list, a match body and a log are all refused', () => {

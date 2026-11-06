@@ -7,6 +7,7 @@
 // rules: ANSI is stripped on every path, because colour carries no fact and no binary is needed for the strip.
 // rules: a rewritten call is re-filtered only when it carries no recovery marker and is still a majority match list.
 // agent: unknown | xai | 2026-11-06 | unknown | split out of mods/rtk.ts after review (F1); no behaviour change
+// agent: unknown | xai | 2026-11-06 | unknown | condensePaths and condenseCountRows compare the capped and uncapped layouts and keep the smaller, uncapped first so an exact tie keeps every name
 
 import {rmSync} from 'node:fs';
 import {isShellTool} from './shared.ts';
@@ -218,6 +219,22 @@ function worthIt(original: string, condensedLength: number): boolean {
 	return condensedLength < original.length * (1 - MIN_LOCAL_GAIN);
 }
 
+// Rules: every condenser that has a cap must consider the uncapped layout too, or the cap can cost bytes while dropping names. Measured on seven `./src/d0/xN.ts` paths: the capped tree was 93 bytes and dropped `x6.ts`, where the uncapped tree was 90 and kept it — `+1 files` costs more than the name it replaces whenever a directory barely exceeds the cap.
+// Rules: the caller passes the uncapped rendering FIRST, because the loop keeps the first of two equal-length candidates. On an exact tie — measured on seven `./src/widgets/nnnN.ts` names, both 116 bytes — the capped tree drops a name for zero byte gain, so the layout that keeps every name has to win it.
+function smallestWorthIt(original: string, renderings: readonly LineSink[]): LineSink | null {
+	let best: LineSink | null = null;
+	let bestLength = Number.POSITIVE_INFINITY;
+	for (const lines of renderings) {
+		const length = sinkLength(lines);
+		if (!worthIt(original, length)) continue;
+		if (length < bestLength) {
+			bestLength = length;
+			best = lines;
+		}
+	}
+	return best;
+}
+
 export function condenseGrepRows(text: string, perFileCap = 6): string | null {
 	const order: string[] = [];
 	// Rules: dedupe happens as each row arrives, so no intermediate per-row record is kept. The old shape built a `GrepRow[]` per file and deduped it into a second structure; on a 40k-row body that was 4.4 MB of short-lived objects out of ~23 MB allocated for a 1 MB result, and the GC cost of it is what made the peak 5-6x the median on the large bodies. `rowCount` is kept separately because the elided count is measured in ROWS while the groups are measured in distinct texts.
@@ -251,19 +268,11 @@ export function condenseGrepRows(text: string, perFileCap = 6): string | null {
 	if (total < 2) return null;
 
 	// Rules: measure first, render once. Both layouts are rendered into arrays (cheap: one push per line, no string join), the winner is picked on exact byte length, and only that one is joined. The lossy choice is therefore made once and the losing rendering never becomes a string.
+	// Rules: no uncapped-first tie-break here, unlike `condensePaths`: both layouts apply the same `perFileCap` and drop the same rows, so an exact tie costs no detail — the order only decides which format wins at equal bytes. The order is therefore kept as it was, so tie output does not shift for no gain.
 	const renderings: LineSink[] = [[], []];
 	eachFileLine(renderings[0]!, order, groupsByFile, rowCount, perFileCap, total);
 	eachDirLine(renderings[1]!, order, groupsByFile, rowCount, perFileCap, total);
-	let best: LineSink | null = null;
-	let bestLength = Number.POSITIVE_INFINITY;
-	for (const lines of renderings) {
-		const length = sinkLength(lines);
-		if (!worthIt(text, length)) continue;
-		if (length < bestLength) {
-			bestLength = length;
-			best = lines;
-		}
-	}
+	const best = smallestWorthIt(text, renderings);
 	return best === null ? null : `${best.join('\n')}\n`;
 }
 
@@ -316,16 +325,21 @@ export function condenseCountRows(text: string, perDirCap = 6): string | null {
 	}
 	if (files < 2) return null;
 
-	const out: string[] = [`${files} files in ${order.length} dirs:`];
-	for (const dir of order) {
-		const bucket = countsByDir.get(dir) ?? [];
-		const dirHits = bucket.reduce((sum, entry) => sum + entry.count, 0);
-		out.push(`${dir}  (${bucket.length} files, ${dirHits} hits)`);
-		for (const entry of bucket.slice(0, perDirCap)) out.push(`  ${entry.name} (${entry.count})`);
-		if (bucket.length > perDirCap) out.push(`  +${bucket.length - perDirCap} files`);
-	}
-	const joined = `${out.join('\n')}\n`;
-	return worthIt(text, joined.length) ? joined : null;
+	// Rules: same treatment as `condensePaths`, for the same reason and with the same uncapped-first tie-break: `+N files` costs more than a `name (count)` row when the directory path is long. Over a sweep of one-directory bodies the uncapped layout was never strictly smaller, but exact ties do occur — seven 4-character names under a 10-character directory (`./dddddddddd/a.ts:1` … `./dddddddddd/g.ts:1`, a 139-byte body) give 130 bytes either way, because `  g.ts (1)` and `  +1 files` are both ten characters. Pre-fix that tie dropped `g.ts` for no gain. The capped rendering is built only when some directory overflows, since otherwise the two are byte-identical.
+	const render = (cap: number): LineSink => {
+		const lines: string[] = [`${files} files in ${order.length} dirs:`];
+		for (const dir of order) {
+			const bucket = countsByDir.get(dir) ?? [];
+			const dirHits = bucket.reduce((sum, entry) => sum + entry.count, 0);
+			lines.push(`${dir}  (${bucket.length} files, ${dirHits} hits)`);
+			for (const entry of bucket.slice(0, cap)) lines.push(`  ${entry.name} (${entry.count})`);
+			if (bucket.length > cap) lines.push(`  +${bucket.length - cap} files`);
+		}
+		return lines;
+	};
+	const overflows = [...countsByDir.values()].some(bucket => bucket.length > perDirCap);
+	const best = smallestWorthIt(text, overflows ? [render(Number.POSITIVE_INFINITY), render(perDirCap)] : [render(Number.POSITIVE_INFINITY)]);
+	return best === null ? null : `${best.join('\n')}\n`;
 }
 
 // Rules: rtk's `find` filter groups by directory but elides whole directories once it has printed enough: on a 60-directory glob it named 19 of 60, so the model cannot tell which directories matched at all. This condenser prints every directory, caps only the file list inside one directory, and states the elided file count. Measured 82-84% on a 260- and a 300-path glob versus rtk's 73-77%, and it needs no process.
@@ -356,15 +370,21 @@ export function condensePaths(text: string, perDirCap = 6): string | null {
 	const total = [...filesByDir.values()].reduce((sum, files) => sum + files.length, 0);
 	if (total < 2) return null;
 
-	const out: string[] = [`${total} files in ${order.length} dirs:`];
-	for (const dir of order) {
-		const files = filesByDir.get(dir) ?? [];
-		out.push(`${dir}  (${files.length})`);
-		for (const file of files.slice(0, perDirCap)) out.push(`  ${file}`);
-		if (files.length > perDirCap) out.push(`  +${files.length - perDirCap} files`);
-	}
-	const joined = `${out.join('\n')}\n`;
-	return worthIt(text, joined.length) ? joined : null;
+	// Rules: a directory barely over the cap is the case the cap must NOT fire on. Measured on seven `./src/d0/xN.ts` paths before the comparison existed: the capped tree was returned at 93 bytes and dropped `x6.ts`, while the uncapped tree was 90 and kept every name. Both layouts are now built and the smaller wins, so eliding happens only when it pays; it still fires on a long list (a 20-file directory is 62.7% capped against 18.5% uncapped).
+	// Rules: the capped rendering is built only when some directory actually exceeds the cap. When none does the two renderings are byte-identical, so building the second would double the allocation on the common shape — measured on a 900-path body over 150 directories holding exactly 6 each: 431 KB and 1.04 ms for one rendering, 670 KB and 1.20 ms when a second was forced by bumping every directory to 7. The uncapped one goes first so it wins an exact tie (see `smallestWorthIt`).
+	const render = (cap: number): LineSink => {
+		const lines: string[] = [`${total} files in ${order.length} dirs:`];
+		for (const dir of order) {
+			const files = filesByDir.get(dir) ?? [];
+			lines.push(`${dir}  (${files.length})`);
+			for (const file of files.slice(0, cap)) lines.push(`  ${file}`);
+			if (files.length > cap) lines.push(`  +${files.length - cap} files`);
+		}
+		return lines;
+	};
+	const overflows = [...filesByDir.values()].some(files => files.length > perDirCap);
+	const best = smallestWorthIt(text, overflows ? [render(Number.POSITIVE_INFINITY), render(perDirCap)] : [render(Number.POSITIVE_INFINITY)]);
+	return best === null ? null : `${best.join('\n')}\n`;
 }
 
 // Rules: `grep` is not one shape. Its default `files_with_matches` mode prints a plain path list under a `Found N files` header, which the grep filter passes through untouched (measured 4,448 → 4,448 bytes) while the find filter condenses it (→ 630). Content mode is the opposite: `path:line:text` rows, where grep wins. So the filter is chosen from the body's shape, not from the tool name alone.
