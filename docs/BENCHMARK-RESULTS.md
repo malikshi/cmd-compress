@@ -36,7 +36,7 @@ From `npm run bench`. No model involved; these bytes are the same on any machine
 |---|---|---:|---:|---:|---|
 | grep, clustered | 240 matches in 6 files | 16,130 | 1,377 | **91.5%** | 6/6 files named, 240 of 240 match lines kept |
 | grep, scattered | 240 matches in 240 files | 14,874 | 13,421 | **9.8%** | 240/240 files named |
-| find | 260 paths in 10 dirs | 6,092 | 1,149 | **81.1%** | 10/10 dirs named, header correct |
+| find | 260 paths in 10 dirs | 6,092 | 1,209 | **80.2%** | 10/10 dirs named, header correct |
 
 ### Command Code's own tool shapes
 
@@ -44,11 +44,11 @@ The raw rows above are rtk's fixture, not what this host produces. A `glob` resu
 
 | Case | Envelope | Bytes in | Bytes out | Saved | Fidelity |
 |---|---|---:|---:|---:|---|
-| glob tool | `Found 260 files` header | 4,326 | 788 | **81.8%** | header kept, local path condenser |
-| glob tool, truncated | header + truncation notice | 5,021 | 964 | **80.8%** | header kept, trailer kept |
+| glob tool | `Found 260 files` header | 4,326 | 848 | **80.4%** | header kept, local path condenser |
+| glob tool, truncated | header + truncation notice | 5,021 | 1,024 | **79.6%** | header kept, trailer kept |
 | grep tool, truncated | pagination notice | 15,540 | 1,333 | **91.4%** | trailer kept, local row condenser |
-| grep tool, files mode | `Found 300 files …` header | 4,448 | 439 | **90.1%** | header kept, local path condenser |
-| grep tool, count mode | total-occurrences notice | 722 | 231 | **68.0%** | trailer kept, local count condenser |
+| grep tool, files mode | `Found 300 files …` header | 4,448 | 469 | **89.5%** | header kept, local path condenser |
+| grep tool, count mode | total-occurrences notice | 722 | 237 | **67.2%** | trailer kept, local count condenser |
 | shell tool | `Exit code: 1` head | 2,769 | 324 | **88.3%** | header kept |
 | shell tool, timed out | header + timeout notice | 5,889 | 339 | **94.2%** | header kept, trailer kept |
 | shell tool, declined grep baseline | none — rtk refused to group | 8,081 | 430 | **94.7%** | local row condenser |
@@ -82,13 +82,13 @@ Those rows exist because an earlier build lost or skipped every one of them. Eac
 - **Colour survived every filter, and the host's spill pointer did not.** `rtk pipe` returns every ANSI escape intact: 10,110 bytes of coloured test output came back at 10,110 bytes with 720 escapes still in it, while the escape-free text is 6,750 bytes. The strip is now unconditional and measured at **34.1%** on a 40-error `tsc` shape. Separately, a result the host truncated in the middle carries `[... output truncated: …]` and `[full output saved to: …]` there — measured, rtk deleted both when it compressed a 2,951-byte pytest result down to 296 bytes, so the pointer is now lifted out and re-attached.
 - **rtk's auto-detect can destroy a build failure.** Its `never_worse` guard only compares sizes. A cargo-shaped block of twenty `error[E0xx]: cannot find value …` lines (1,919 bytes) came back as 156 bytes of grep grouping — `20 matches in 1F: [file] --> src/lib.rs (20): 0: 5 1: 5 …` — with every error message gone and no recovery hint. That is a wrong format guess, not compression. A format-shaped fidelity guard now refuses a grouping whose input was neither a match list nor a path list, and refuses any result that dropped a negation; the original then reaches the model unchanged.
 
-Rewrite: 12 of 12 commands rewritten, ~78 ms mean, ~84 ms p95.
+Rewrite: 12 of 12 commands rewritten, ~304 ms mean, ~740 ms p95 on this container (milliseconds do not reproduce; compare percentages).
 
 **The scattered row is the honest floor.** 240 matches across 240 files saves 9.8%, because a per-file row cannot be dropped without dropping the file. Reporting only the clustered case would have claimed 91% as if it were universal. The claim is *"a shell result that groups by file gets much smaller; a result with one hit per file still moves, but only a little."* Before the local condenser this row was **0.0%** — rtk's `never_worse` guard refused the regrouping outright.
 
 **Why the local pass exists.** rtk's own grep filter groups by file but repeats the full path and match text on every row, so on a hit-dense file it barely moves: a body of 20 files × 5 hits came back 6,850 → 6,591 (**3%**), 30 files × 1 hit came back 1,671 → 1,671 (**0%**), and a 400-row count-mode body 17,140 → 14,331 (**16%**). The mod's in-process condenser groups *and* dedupes — identical lines collapse to one row with their line numbers joined — and lands at **77%** on the 20-files × 5-hits body. Two layouts are built and the smaller wins: `[file] path (N):` blocks for a file with several hits, and a `dir/  (N)` tree of `name:numbers:text` rows for a body that is mostly one hit per file — the layout that takes the 240-files-one-hit case from 0% to 9.8%. A one-hit-per-file body is shape-dependent rather than a fixed win: 5–7% inside a single shallow directory (below the 5% floor only marginally, so it is left alone), 15–23% across several directories, 41% under one deep shared prefix. It runs in 0 ms: no process, no temp file, and it works with no rtk installed at all. rtk's `find` filter loses whole directories on a wide tree (19 of 60 named on one measured glob), which the local path pass does not.
 
-**Count mode has its own pass.** The host's `finishCountMode` emits `path:count`, not content rows — one row per file with the number of matches. The row condenser cannot parse it (it needs a third field) and the path condenser must not: reading `src/file0.ts:1` as a path with line `1` is wrong, because `1` is that file's match count. `condenseCountRows` groups the shape with every number labelled — `dir/  (N files, M hits)` and `name (count)` rows — so nothing can be mistaken for a line number. Measured: the 40-file body alone **77.4%** (633 → 143), and **68.0%** (722 → 231) with the total-occurrences trailer re-attached. Through rtk alone this shape is unchanged (measured 634 → 634 with `-f grep`; `-f find` saves 73% but prints the count with no label at all).
+**Count mode has its own pass.** The host's `finishCountMode` emits `path:count`, not content rows — one row per file with the number of matches. The row condenser cannot parse it (it needs a third field) and the path condenser must not: reading `src/file0.ts:1` as a path with line `1` is wrong, because `1` is that file's match count. `condenseCountRows` groups the shape with every number labelled — `dir/  (N files, M hits)` and `name (count)` rows — so nothing can be mistaken for a line number. Measured: the 40-file body alone **76.5%** (633 → 149), and **67.2%** (722 → 237) with the total-occurrences trailer re-attached. Through rtk alone this shape is unchanged (measured 634 → 634 with `-f grep`; `-f find` saves 73% but prints the count with no label at all).
 
 **Fidelity has a cost.** Clustered grep keeps every file name but caps the distinct lines shown per file at six, folding each file's tail behind `+N more lines in this file`. Fewer bytes, every named file still present, but a grep result where those folded lines mattered will read worse, not better.
 
@@ -162,7 +162,7 @@ Worth it only if the reader wants that register. On a code task it is a cost wit
 
 | Claim | Supported? |
 |---|---|
-| Shell output gets smaller | **Conditionally, exactly measured.** 91.5% on file-clustered grep, 81.1% on `find`, **9.8%** when hits are one-per-file. |
+| Shell output gets smaller | **Conditionally, exactly measured.** 91.5% on file-clustered grep, 80.2% on `find`, **9.8%** when hits are one-per-file. |
 | A mode adds prompt overhead | **Yes, reproducible.** Within 10% of the static estimate for a single mode; presets read ~20% above it. |
 | Caveman shortens replies | **Only `ultra`, by ~12–13%**, and only on open prompts. `full` costs more in both runs. |
 | The mode pays for itself in one turn | **No.** `ultra` saves ~50–70 reply tokens against a 232-token block. |

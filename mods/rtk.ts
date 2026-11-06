@@ -15,11 +15,11 @@
 // rules: a sub-agent run gets no mod hooks at all, so the child's own shell calls are never rewritten from here. The `agent` call's prompt is the only channel: it carries a block telling the child to prefix commands with the resolved absolute binary, and it is added only when that binary is usable and new enough.
 // rules: `shell_command`'s `args` array is part of the command line the host runs, so the rewrite sees it; a `-A/-B/-C` grep result is never handed to rtk's grep filter, which keeps only match rows and would silently drop the context the caller asked for.
 // rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
-// agent: unknown | unknown | 2026-11-05 | unknown | hot-path and duplicate review: both layouts deduped independently (27% of a 40k-row run) and were fully rendered before one was chosen; the dedupe now runs once as rows arrive and each layout writes to a `string[]` sink, taking the 2.17 MB body from 2.6 MB/s to 12.7 MB/s and the 30 KB host-capped body to p50 0.8 ms. `condenseCountRows` also listed a repeated path once per row, so it claimed more files than existed and printed the same name several times — a repeated path is now summed into a single entry and the header counts distinct files. Confirmed the >2 MB tail is container scheduling, not allocation: an unrelated no-op loop shows the same ~700 ms outliers.
 // agent: unknown | unknown | 2026-11-05 | unknown | Windows CI, measured on run 42054267199: `verify (windows-latest, 22|24)` failed only in `Tests`, on a test that hardcoded POSIX single quotes while `pinBinary` correctly switches to double quotes on win32. The mod was right and the expectation was wrong; the test now asserts the real property (the path is quoted and never bare in any example) on either platform. Both platform branches were re-verified from this host through `pinBinary`/`filterShell`/`pipeCommand`/`windowsPipeScript` with `platform` passed explicitly, so the win32 path is exercised on Linux too.
 // agent: unknown | unknown | 2026-11-05 | unknown | sub-agent path proved end-to-end on 1.88.3 with real headless delegation instead of reasoning about the bundle: the child's mod list really is `[continuationMod, createUserHooksMod]`, so no rtk/prompt hook reaches it and the `agent` prompt is the only channel. Measured the channel works (a child reproduced the block verbatim, quoted path included) but compliance is partial: 38 of 60 child shell calls used the prefix across nine delegations (63%, per-delegation 0-100%), and compliant children were running every command bare AND prefixed, doubling the work. The block now says the prefixed command IS the run (one task went 1/4 to 3/3) and the README no longer claims enforcement. `agentDefinitions()` is host-internal, so no stronger mechanism exists from a mod.
 // agent: unknown | xai | 2026-11-06 | unknown | review fixes: strict `isGrepRows` (timestamp logs are refused), escaped wrapper requotes, no pass cache, quoted assignment prefixes, pinned guidance path, `+N files` labels; host proof harness validated on 1.88.3
 // agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: loose `GREP_ROW` for context only (dotless paths were losing `-A/-B/-C` rows), rule-file stamp in the rewrite cache (a mid-session deny was bypassed), `escapeForOuter` for a `$` in a double-quoted wrapper path, callback-based guidance replacement, and `version pending` separated from `version unreadable`
+// agent: unknown | xai | 2026-11-06 | unknown | review follow-up: a nested single-quoted wrapper inside a double-quoted one is left bare instead of requoted through another escaping layer (the line was corrupted), versionNote names an unreadable version, guidance fences a backtick path, and the unused pin closure is gone
 
 import type {ModApi} from '@commandcode/harness';
 import {accessSync, constants, mkdtempSync, rmSync, statSync, writeFileSync} from 'node:fs';
@@ -731,7 +731,6 @@ export function pinBinary(command: string, bin: string, platform: string = proce
 			? posix.replace(/[\\"$`]/g, '\\$&')
 			: posix;
 	// Rules: the wrapper pass runs first, then the normal scan. It recurses through the public entry so a nested wrapper is pinned too, and so `win32` quoting is not duplicated here.
-	const pin = (text: string) => pinBinary(text, bin, platform, escapeForOuter);
 	const pinNormal = (text: string) => pinBinary(text, bin, platform, false);
 	const pinOuter = (text: string) => pinBinary(text, bin, platform, true);
 	let out = '';
@@ -745,12 +744,20 @@ export function pinBinary(command: string, bin: string, platform: string = proce
 			const script = wrapperScriptAt(command, index);
 			if (script) {
 				const inner = command.slice(script.scriptStart, script.scriptEnd);
+				// Rules: a nested single-quoted script inside a double-quoted outer script cannot hold a pinned POSIX path without another layer of escaping, and a wrong guess corrupts the command line. Leave that inner `rtk` bare rather than emit a broken line; the next pass over a top-level script still pins it.
+				if (escapeForOuter && script.quote === "'") {
+					out += command.slice(index, script.scriptEnd + 1);
+					index = script.scriptEnd + 1;
+					atCommand = false;
+					continue;
+				}
 				const pinnedInner = script.quote === '"' ? pinOuter(inner) : pinNormal(inner);
 				const requote = script.quote === '"' || !hasExpansion(inner);
 				if (pinnedInner !== inner && requote) {
-					// Rules: the script is re-emitted inside double quotes, because a single-quoted container cannot hold the `'\''` escaping a POSIX path may need. A single-quoted script has no expansion of its own, so every `"`, `\`, `$` and backtick in the pinned form is escaped for the outer double quotes. A double-quoted script keeps its own escapes and expansions, so only the pinned path is escaped; without that, a path containing `$` or a backtick was expanded by the outer shell.
+					// Rules: the script is re-emitted inside double quotes, because a single-quoted container cannot hold the `'\''` escaping a POSIX path may need. A single-quoted script has no expansion of its own, so every `"`, `\`, `$` and backtick in the pinned form is escaped for the outer double quotes. A double-quoted script keeps its own escapes and expansions, so only the pinned path is escaped; without that, a path containing `$` or a backtick was expanded by the outer shell. When this pass is already inside an outer double-quoted script, its own delimiters are escaped too, or the nested script closes the outer container and the command is corrupted.
 					const requoted = script.quote === '"' ? pinnedInner : pinnedInner.replace(/[\\"$`]/g, '\\$&');
-					out += `${command.slice(index, script.scriptStart - 1)}"${requoted}"`;
+					const delimiter = escapeForOuter ? '\\"' : '"';
+					out += `${command.slice(index, script.scriptStart - 1)}${delimiter}${requoted}${delimiter}`;
 					index = script.scriptEnd + 1;
 					atCommand = false;
 					continue;
@@ -817,10 +824,17 @@ Condensed output states its own recovery path. An elided span prints a count suc
 
 // Rules: exported so a test can check every named subcommand against the installed binary instead of trusting the prose.
 // Rules: a direct rtk command must name the resolved absolute binary. This block is injected when the binary is usable, including a managed install that is off PATH — the same case `pinBinary` exists for — so a bare `rtk read` in the examples would fail exactly where the block is needed. The block stays byte-stable per session because the path is fixed once resolved.
+// Rules: a binary path may contain a backtick, and a one-backtick span would be cut short by it; the fence is always one longer than the longest run inside the path.
+function codeSpan(text: string): string {
+	const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map(run => run.length));
+	const fence = '`'.repeat(longest + 1);
+	return `${fence}${text}${fence}`;
+}
+
 export function guidanceText(bin?: string, platform: string = process.platform): string {
 	if (!bin) return GUIDANCE;
 	const quoted = pinBinary('rtk', bin, platform);
-	return `The resolved rtk binary is \`${quoted}\`; use it for every direct rtk command below.\n\n${GUIDANCE.replace(/`rtk ([a-z-]+)/g, (_match, name: string) => `\`${quoted} ${name}\``)}`;
+	return `The resolved rtk binary is ${codeSpan(quoted)}; use it for every direct rtk command below.\n\n${GUIDANCE.replace(/`rtk ([a-z-]+)/g, (_match, name: string) => codeSpan(`${quoted} ${name}`))}`;
 }
 
 // Rules: a sub-agent never receives this mod, so nothing rewrites its shell calls. The parent cannot rewrite them either — its hooks only see its own tool calls, and the child's tool call ids never reach them. The one lever left is the `agent` call's prompt: tell the child to prefix commands itself, with the absolute path this mod resolved, because a bare `rtk` is exactly what `pinBinary` exists to avoid (rtk ships to ~/.local/bin, often off a GUI host's PATH).
@@ -914,7 +928,7 @@ export default function (cmd: ModApi): void {
 	const supported = () => isSupportedVersion(version);
 	const versionNote = () => {
 		if (!binUsable()) return 'binary: NOT FOUND';
-		if (!version) return `binary: ${binPath()}`;
+		if (!version) return isVersionProbed ? `binary: ${binPath()} (version unreadable)` : `binary: ${binPath()}`;
 		const label = `${version.major}.${version.minor}.${version.patch}`;
 		return supported() ? `binary: ${label}` : `binary: ${label} (too old — need >= 0.${MIN_SUPPORTED_RTK_MINOR}.0)`;
 	};

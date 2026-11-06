@@ -6,6 +6,7 @@
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
 // agent: unknown | xai | 2026-11-06 | unknown | wrapper requote execution test, quoted assignment prefixes, guidance pinned-path test
 // agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: double-quoted wrapper execution test and `$`-in-path guidance replacement test
+// agent: unknown | xai | 2026-11-06 | unknown | review follow-up: nested single-quoted wrapper inside a double-quoted one stays executable
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -373,6 +374,23 @@ test('pinBinary: a double-quoted wrapper escapes a special pinned path', t => {
 		const pinned = pinBinary('sh -c "rtk done"', stub, 'linux');
 		const out = execFileSync('/bin/sh', ['-c', pinned], {encoding: 'utf8', env: {...process.env, PATH: `${dir}:${process.env.PATH ?? ''}`}});
 		assert.equal(out, 'RTK:done\n', 'the literal $ path reached the stub');
+	} finally {
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
+// Rules: a nested single-quoted script inside a double-quoted outer script cannot take a pinned POSIX path without another escaping layer, so it is left bare instead of emitting a corrupted line. A bare rtk on PATH still runs; a broken quote did not.
+test('pinBinary: a nested wrapper inside a double-quoted script stays executable', t => {
+	if (process.platform === 'win32') return t.skip('POSIX wrapper quoting only');
+	const dir = mkdtempSync(join(tmpdir(), 'rtk-pin-'));
+	const stub = join(dir, 'rtk');
+	writeFileSync(stub, '#!/bin/sh\nprintf "BARE:%s\\n" "$*"\n', {mode: 0o755});
+	chmodSync(stub, 0o755);
+	try {
+		const pinned = pinBinary(`bash -c "echo start; sh -c 'rtk git log'"`, join(dir, 'other$path'), 'linux');
+		assert.match(pinned, /sh -c 'rtk git log'/, 'the nested script is left intact');
+		const out = execFileSync('/bin/sh', ['-c', pinned], {encoding: 'utf8', env: {...process.env, PATH: `${dir}:${process.env.PATH ?? ''}`}});
+		assert.equal(out, 'start\nBARE:git log\n', 'the nested command ran instead of a corrupted path');
 	} finally {
 		rmSync(dir, {recursive: true, force: true});
 	}

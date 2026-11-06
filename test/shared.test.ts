@@ -6,13 +6,14 @@
 // agent: unknown | unknown | 2026-11-02 | unknown | initial; per-mod key after learning each mod gets its own store file
 // agent: unknown | unknown | 2026-11-03 | unknown | drop the stripBlock/shortPaths tests with the functions: the host rebuilds the append list every round, so neither had a production caller
 // agent: unknown | xai | 2026-11-06 | unknown | POSIX pipe paths are single-quoted; added literal `$` execution and Windows `%` escaping tests
+// agent: unknown | xai | 2026-11-06 | unknown | resolveBin regression: a directory named like the binary is skipped
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
+import {mkdirSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {delimiter, join} from 'node:path';
 import {
 	DEFAULT_MODE,
 	filterShell,
@@ -93,6 +94,23 @@ test('wrapBlock: surrounding whitespace is trimmed and the tag is closed', () =>
 test('resolveBin: a binary that exists on PATH is found, a missing one is null', () => {
 	assert.ok(resolveBin('sh'));
 	assert.equal(resolveBin('definitely-not-a-real-binary-xyz'), null);
+});
+
+// Rules: a directory named like the binary must not shadow a real file later on PATH — returning it would pass the existence check and make every spawn fail with EACCES or EISDIR.
+test('resolveBin: a directory named like the binary is skipped', () => {
+	const shadow = mkdtempSync(join(tmpdir(), 'rtk-shadow-'));
+	const real = mkdtempSync(join(tmpdir(), 'rtk-real-'));
+	const saved = process.env.PATH;
+	try {
+		mkdirSync(join(shadow, 'rtk-probe'));
+		writeFileSync(join(real, 'rtk-probe'), '#!/bin/sh\nexit 0\n', {mode: 0o755});
+		process.env.PATH = `${shadow}${delimiter}${real}`;
+		assert.equal(resolveBin('rtk-probe', []), join(real, 'rtk-probe'));
+	} finally {
+		process.env.PATH = saved;
+		rmSync(shadow, {recursive: true, force: true});
+		rmSync(real, {recursive: true, force: true});
+	}
 });
 
 // Rules: the filter redirect must run through the platform's own shell; on POSIX that is /bin/sh -c with no extra quoting, and only Windows needs the cmd.exe /d /s /c form with the line wrapped again.
