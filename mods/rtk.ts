@@ -834,7 +834,7 @@ function codeSpan(text: string): string {
 export function guidanceText(bin?: string, platform: string = process.platform): string {
 	if (!bin) return GUIDANCE;
 	const quoted = pinBinary('rtk', bin, platform);
-	return `The resolved rtk binary is ${codeSpan(quoted)}; use it for every direct rtk command below.\n\n${GUIDANCE.replace(/`rtk ([a-z-]+)/g, (_match, name: string) => codeSpan(`${quoted} ${name}`))}`;
+	return `The resolved rtk binary is ${codeSpan(quoted)}; use it for every direct rtk command below.\n\n${GUIDANCE.replace(/`rtk ([a-z-]+)([^`\n]*)`/g, (_match, name: string, rest: string) => codeSpan(`${quoted} ${name}${rest}`))}`;
 }
 
 // Rules: a sub-agent never receives this mod, so nothing rewrites its shell calls. The parent cannot rewrite them either — its hooks only see its own tool calls, and the child's tool call ids never reach them. The one lever left is the `agent` call's prompt: tell the child to prefix commands itself, with the absolute path this mod resolved, because a bare `rtk` is exactly what `pinBinary` exists to avoid (rtk ships to ~/.local/bin, often off a GUI host's PATH).

@@ -797,7 +797,8 @@ test('compress: an unreadable rtk version is annotated, not left pending', async
 		fake.cmd.name = name;
 		factory(fake.cmd as never);
 	}
-	await runHandler(fake.commands, 'rtk', 'status');
+	const status = messageOf(await runHandler(fake.commands, 'rtk', 'status'));
+	assert.match(status, /version unreadable/, 'status and the footer name the same state');
 	const line = messageOf(runHandler(fake.commands, 'compress', 'max'));
 	assert.match(line, /rtk=on \(rtk version unreadable\)/);
 	assert.doesNotMatch(line, /version pending/);

@@ -230,6 +230,15 @@ test('guidanceText: a $ in the binary path is not a replacement pattern', () => 
 	assert.doesNotMatch(text, /rtkrecall/);
 });
 
+// Rules: the substitution must replace the whole example span, not only its opening fence — a leftover closing backtick starts a new span and swallows the text after it.
+test('guidanceText: each pinned example stays inside one code span', () => {
+	const text = guidanceText('/opt/rtk', 'linux');
+	assert.match(text, /`'\/opt\/rtk' read <file> --level aggressive`/);
+	assert.match(text, /`'\/opt\/rtk' recall <hash>`/);
+	assert.doesNotMatch(text, /'\/opt\/rtk' read` <file>/);
+	assert.doesNotMatch(text, /'\/opt\/rtk' recall` <hash>/);
+});
+
 // Rules: a named subcommand can exist while a flag it is shown with does not — `--level aggressive` and `--keys-only` are both taught by the guidance, so each flag is checked against that subcommand's own help.
 test('the injected guidance only names flags each subcommand actually takes', async t => {
 	const {execFileSync} = await import('node:child_process');

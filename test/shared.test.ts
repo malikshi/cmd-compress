@@ -101,11 +101,12 @@ test('resolveBin: a directory named like the binary is skipped', () => {
 	const shadow = mkdtempSync(join(tmpdir(), 'rtk-shadow-'));
 	const real = mkdtempSync(join(tmpdir(), 'rtk-real-'));
 	const saved = process.env.PATH;
+	const exe = process.platform === 'win32' ? 'rtk-probe.exe' : 'rtk-probe';
 	try {
-		mkdirSync(join(shadow, 'rtk-probe'));
-		writeFileSync(join(real, 'rtk-probe'), '#!/bin/sh\nexit 0\n', {mode: 0o755});
+		mkdirSync(join(shadow, exe));
+		writeFileSync(join(real, exe), '#!/bin/sh\nexit 0\n', {mode: 0o755});
 		process.env.PATH = `${shadow}${delimiter}${real}`;
-		assert.equal(resolveBin('rtk-probe', []), join(real, 'rtk-probe'));
+		assert.equal(resolveBin('rtk-probe', []), join(real, exe));
 	} finally {
 		process.env.PATH = saved;
 		rmSync(shadow, {recursive: true, force: true});
