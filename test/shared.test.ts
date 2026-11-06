@@ -7,6 +7,7 @@
 // agent: unknown | unknown | 2026-11-03 | unknown | drop the stripBlock/shortPaths tests with the functions: the host rebuilds the append list every round, so neither had a production caller
 // agent: unknown | xai | 2026-11-06 | unknown | POSIX pipe paths are single-quoted; added literal `$` execution and Windows `%` escaping tests
 // agent: unknown | xai | 2026-11-06 | unknown | resolveBin regression: a directory named like the binary is skipped
+// agent: unknown | xai | 2026-11-06 | unknown | block-comparison and batch-file guard tests
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,6 +24,7 @@ import {
 	wrapBlock,
 	resolveBin,
 	windowsPipeScript,
+	withAgentBlock,
 } from '../mods/shared.ts';
 
 function fakeStore(initial: Record<string, unknown> = {}) {
@@ -223,5 +225,28 @@ test('windowsPipeScript: a literal % in a path is doubled for cmd.exe', () => {
 	const script = windowsPipeScript('C:\\100%\\rtk.exe', null, 'C:\\a%20b\\in.txt');
 	assert.match(script, /100%%/);
 	assert.match(script, /a%%20b/);
+});
+
+test('pipeCommand: a wrapped shell without a batch file throws instead of emitting the rejected line', () => {
+	const shell = filterShell('win32', 'cmd.exe');
+	assert.throws(() => pipeCommand('C:\\rtk.exe', 'grep', 'C:\\in.txt', shell), /batch file/);
+});
+
+test('pipe builders: the filter is validated, because it is written as a bare shell word', () => {
+	assert.throws(() => windowsPipeScript('rtk', 'grep; rm -rf /', 'in.txt'), /pipe filter/);
+	assert.throws(() => pipeCommand('rtk', '$(id)', 'in.txt', filterShell('linux')), /pipe filter/);
+	assert.doesNotThrow(() => pipeCommand('rtk', 'find', 'in.txt', filterShell('linux')));
+});
+
+test('withAgentBlock: a prose mention of the tag does not suppress the block', () => {
+	const input = {prompt: 'Explain what `<rtk>` means in the docs.'};
+	const next = withAgentBlock(input, 'rtk', 'RTK block') as {prompt: string};
+	assert.ok(next.prompt.includes('<rtk>\nRTK block\n</rtk>'), 'the block is appended');
+});
+
+test('withAgentBlock: a call that already carries the block is not doubled', () => {
+	const first = withAgentBlock({prompt: 'task'}, 'rtk', 'RTK block') as {prompt: string};
+	assert.equal(first.prompt, 'task\n\n<rtk>\nRTK block\n</rtk>');
+	assert.equal(withAgentBlock(first, 'rtk', 'RTK block'), undefined);
 });
 

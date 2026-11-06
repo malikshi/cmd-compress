@@ -1,854 +1,85 @@
 // rtk — condensed command output: rewrites shell_command through `rtk rewrite`, condenses the output a rewrite cannot cover, and filters grep/glob results.
-// exports: default, REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES, MIN_SUPPORTED_RTK_MINOR, shouldRewrite, pinBinary, splitSegments, findTrailer, filterNameFor, filterForShape, isGrepRows, hasGrepContext, canRefilterCompressed, condenseGrepRows, condenseCountRows, condensePaths, stripAnsi, extractSpillNotices, checkFidelity, parseRtkVersion, isSupportedVersion, classifyRewrite, joinForRewrite, splitRewrite, guidanceText, subAgentGuidance, Segments, RtkVersion, RewriteVerdict, FidelityReport
+// exports: default, REWRITE_TIMEOUT_MS, MIN_FILTER_BYTES
 // used_by: package.json (commandcode.mods), mods/compress.ts, bench/output.ts, test/rtk-shapes.test.ts, test/mods.test.ts, test/mods.behaviour.test.ts
-// related: mods/shared.ts
+// related: mods/shared.ts, mods/rtk-cli.ts, mods/rtk-local.ts
 // rules: fail open on every path — a missing binary, an abort, an unexpected exit code, or a malformed payload leaves the original untouched.
-// rules: exit 2 is a deny from rtk's own contract: a message on stdout names the rule that blocked it, so it becomes a block; empty means a Claude-only deny rule the host does not own, so it passes.
-// rules: the host's own envelope — a `Found N files` header, a pagination notice, an `Exit code:` line — is split off before filtering and re-attached after. The head is re-attached byte-for-byte; the tail keeps its notice text exactly, with the blank run before it capped at one line. rtk folds those as noise; they carry the count, the truncation, and the failure.
-// rules: a shell result can end with two consecutive notices (the cwd note, then the PowerShell edition banner); every consecutive notice is split off, never just the last, or rtk deletes the earlier one with the body.
-// rules: never return a reassembled result larger than the original. rtk's never-worse guard covers only the body it saw; the envelope and re-attached notices can add bytes.
-// rules: the emitted `rtk` is pinned to the resolved absolute path. rtk ships to ~/.local/bin (its installer default), ~/.bun/bin or ~/.cargo/bin, and a GUI host often has none of them on PATH, so a bare name would turn a working command into `rtk: not found`. The pin is a quote-aware single pass, because rtk emits `&`, newlines, and prefix commands, and a quoted argument may contain both `rtk` and a separator. The one quoted form it does reach into is a shell wrapper's script (`bash -c "rtk …"`), which rtk rewrites and which is a command line in its own right.
-// rules: `shell_command` and `powershell` are both shell tools with the same result envelope, so every path keys off `isShellTool`, not the one name — a Windows session would otherwise get no rewrite and no condensing at all.
-// rules: a rewritten shell call is skipped unless rtk left its faithful baseline — no recovery marker and a majority of `path:line:text` rows — because rtk's own never-worse guard declines to compress multi-file grep output by default.
-// rules: the rewrite cache key carries the rule-file mtime/size stamp, because rtk checks a deny before it rewrites — a rewrite cached before a rule edit would skip the new deny. Only rewrite verdicts are cached; pass and deny are re-asked.
-// rules: context detection keys off the loose `path:line:` row shape, not the strict file-like test: a dotless, dotfile, spaced, or non-ASCII path must register as a known path, or rtk's grouping can drop its `-A/-B/-C` rows. Compression stays strict, where a false positive only costs bytes.
-// rules: a sub-agent run gets no mod hooks at all, so the child's own shell calls are never rewritten from here. The `agent` call's prompt is the only channel: it carries a block telling the child to prefix commands with the resolved absolute binary, and it is added only when that binary is usable and new enough.
-// rules: `shell_command`'s `args` array is part of the command line the host runs, so the rewrite sees it; a `-A/-B/-C` grep result is never handed to rtk's grep filter, which keeps only match rows and would silently drop the context the caller asked for.
-// rules: ANSI escapes are stripped from the body before rtk runs, and from a result the rtk pass declined. Measured: rtk returns all 10,110 bytes of a coloured test result with all 720 escapes intact, and the escape-free text is 6,750 bytes — 33.2% smaller. A tsc-shaped failure is 34.2% smaller. Colour carries no fact, so this is the one compression that needs no binary.
-// agent: unknown | unknown | 2026-11-05 | unknown | Windows CI, measured on run 42054267199: `verify (windows-latest, 22|24)` failed only in `Tests`, on a test that hardcoded POSIX single quotes while `pinBinary` correctly switches to double quotes on win32. The mod was right and the expectation was wrong; the test now asserts the real property (the path is quoted and never bare in any example) on either platform. Both platform branches were re-verified from this host through `pinBinary`/`filterShell`/`pipeCommand`/`windowsPipeScript` with `platform` passed explicitly, so the win32 path is exercised on Linux too.
-// agent: unknown | unknown | 2026-11-05 | unknown | sub-agent path proved end-to-end on 1.88.3 with real headless delegation instead of reasoning about the bundle: the child's mod list really is `[continuationMod, createUserHooksMod]`, so no rtk/prompt hook reaches it and the `agent` prompt is the only channel. Measured the channel works (a child reproduced the block verbatim, quoted path included) but compliance is partial: 38 of 60 child shell calls used the prefix across nine delegations (63%, per-delegation 0-100%), and compliant children were running every command bare AND prefixed, doubling the work. The block now says the prefixed command IS the run (one task went 1/4 to 3/3) and the README no longer claims enforcement. `agentDefinitions()` is host-internal, so no stronger mechanism exists from a mod.
-// agent: unknown | xai | 2026-11-06 | unknown | review fixes: strict `isGrepRows` (timestamp logs are refused), escaped wrapper requotes, no pass cache, quoted assignment prefixes, pinned guidance path, `+N files` labels; host proof harness validated on 1.88.3
-// agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: loose `GREP_ROW` for context only (dotless paths were losing `-A/-B/-C` rows), rule-file stamp in the rewrite cache (a mid-session deny was bypassed), `escapeForOuter` for a `$` in a double-quoted wrapper path, callback-based guidance replacement, and `version pending` separated from `version unreadable`
-// agent: unknown | xai | 2026-11-06 | unknown | review follow-up: a nested single-quoted wrapper inside a double-quoted one is left bare instead of requoted through another escaping layer (the line was corrupted), versionNote names an unreadable version, guidance fences a backtick path, and the unused pin closure is gone
+// rules: exit 2 is a deny from rtk's own contract: a message on stdout names the rule that blocked it, so it becomes a block; empty means a host-only deny rule, so it passes.
+// rules: the host's envelope — `Found N files`, a pagination notice, an `Exit code:` line — is split off before filtering and re-attached after, so its count, truncation, and failure survive.
+// rules: never return a reassembled result larger than the original; the envelope and re-attached notices can add bytes the body filter never saw.
+// rules: `shell_command` and `powershell` are both shell tools with the same result envelope, so every path keys off `isShellTool`.
+// rules: a rewritten shell call skips the second filter unless rtk declined to compress it and left its faithful baseline.
+// rules: the rewrite cache key carries the rule-file stamp, because a rewrite cached before a rule edit would skip the new deny. Only rewrites are cached.
+// rules: a sub-agent run gets no mod hooks, so the `agent` call's prompt is the only channel; it is added only with a usable, new-enough binary.
+// rules: `shell_command`'s `args` array is part of the line the host runs, so the rewrite sees it; a `-A/-B/-C` result is never handed to rtk's grep filter.
+// agent: unknown | unknown | 2026-11-05 | unknown | sub-agent path proved end-to-end on 1.88.3; compliance measured at 38/60 prefixed child calls
+// agent: unknown | xai | 2026-11-06 | unknown | review fixes: strict isGrepRows, escaped wrapper requotes, no pass cache, quoted assignment prefixes, pinned guidance path
+// agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: loose GREP_ROW for context only, rule-file stamp in the rewrite cache, escapeForOuter, callback-based guidance
+// agent: unknown | xai | 2026-11-06 | unknown | review follow-up: nested quoted wrapper left bare, versionNote names an unreadable version, guidance fences a backtick path
+// agent: unknown | xai | 2026-11-06 | unknown | split into rtk-local.ts + rtk-cli.ts; probe awaited before spawn gates; temp-dir cleanup cannot escape afterToolCall
 
 import type {ModApi} from '@commandcode/harness';
-import {accessSync, constants, mkdtempSync, rmSync, statSync, writeFileSync} from 'node:fs';
+import {accessSync, constants, mkdtempSync, statSync, writeFileSync} from 'node:fs';
 import {homedir, tmpdir} from 'node:os';
 import {dirname, join} from 'node:path';
-import {AGENT_TOOL, announceMode, filterShell, isShellTool, NORMAL_MODE, pipeCommand, readOwnMode, resolveBin, turnOffSiblings, windowsPipeScript, withAgentBlock, wrapBlock, writeOwnMode, OFF} from './shared.ts';
+import {
+	canRefilterCompressed,
+	checkFidelity,
+	condenseCountRows,
+	condenseGrepRows,
+	condensePaths,
+	extractSpillNotices,
+	filterForShape,
+	filterNameFor,
+	splitSegments,
+	stripAnsi,
+	removeTree,
+} from './rtk-local.ts';
+import {
+	classifyRewrite,
+	guidanceText,
+	isSupportedVersion,
+	joinForRewrite,
+	MIN_SUPPORTED_RTK_MINOR,
+	parseRtkVersion,
+	pinBinary,
+	type RewriteVerdict,
+	type RtkVersion,
+	shouldRewrite,
+	splitRewrite,
+	subAgentGuidance,
+} from './rtk-cli.ts';
+import {
+	AGENT_TOOL,
+	announceMode,
+	filterShell,
+	isShellTool,
+	NORMAL_MODE,
+	pipeCommand,
+	readOwnMode,
+	resolveBin,
+	turnOffSiblings,
+	windowsPipeScript,
+	withAgentBlock,
+	wrapBlock,
+	writeOwnMode,
+	OFF,
+} from './shared.ts';
 
 export const REWRITE_TIMEOUT_MS = 2000;
 
 // Rules: below this the extra process costs more than the filter saves.
 export const MIN_FILTER_BYTES = 1200;
 
-// Rules: `rtk rewrite` first appears in 0.25.0 — verified against the upstream tree, where v0.24.0 has no Rewrite subcommand and v0.25.0 does. An older binary fails every rewrite open, so say so instead of pretending to work.
-export const MIN_SUPPORTED_RTK_MINOR = 25;
 
 const FILTER_TIMEOUT_MS = 5000;
-
-const FILTER_BY_TOOL: Record<string, string> = {grep: 'grep', glob: 'find'};
-
-// Rules: owned-key lookup only. `FILTER_BY_TOOL[name]` walks the prototype chain, so a tool named `toString` or `constructor` answers a function, which would reach `rtk pipe -f` as the filter name and spawn a pointless process for a name rtk does not know.
-export function filterNameFor(toolName: string): string | undefined {
-	return Object.hasOwn(FILTER_BY_TOOL, toolName) ? FILTER_BY_TOOL[toolName] : undefined;
-}
-
-
-export interface Segments {
-	readonly head: string;
-	readonly body: string;
-	readonly tail: string;
-}
-
-// Rules: the last lines of a Command Code result often carry the truth the body hides. Each form is taken from the host's own formatter, not guessed: grep's content mode closes with `[Showing results with pagination = …]`, its count mode with `Found N total occurrences across M files[ with pagination = …].`, and the grep tool times out with `[Search timed out — …]`; glob closes with `(Results are truncated: …)` or `(Search timed out …)`; a `shell_command` that ends early appends `Command aborted` or `Command timed out after Nms (exit code 124). …`, and `formatResult2` puts the cwd note and the PowerShell edition banner after the output. rtk folds all of them away as noise, so they are cut off before the filter and re-attached after it.
-// Rules: anchored to the end of the whole result, not to any line end — a notice that merely appears mid-output is body text and must be filtered with it.
-// Rules: every notice is a SINGLE line at the end of the result. A leading `\n*` plus a trailing `[\s]*$` made the engine retry every offset and re-scan the tail each time, which is quadratic in a long blank run: measured 825 ms at 20k newlines and 9.8 s at 60k, on a result the session is blocked on. Stripping the blank padding first makes it one pass.
-const NOTICE_SOURCE =
-	'\\[(?:Showing results with pagination|Search timed out)[^\\]\\n]*\\]' +
-	'|\\(Results are truncated: [^)\\n]*\\)' +
-	'|\\(Search timed out[^)\\n]*\\)' +
-	'|\\[cwd change to [^\\]\\n]*\\]' +
-	'|\\[PowerShell edition: [^\\]\\n]*\\]' +
-	'|Found \\d+ total occurrences? across \\d+ files?(?: with pagination = [^\\n]*)?\\.' +
-	'|Command (?:aborted|timed out after [^\\n]*)';
-
-// Rules: the host appends more than one notice to some results (`formatResult2` writes the cwd note, then the PowerShell edition banner), so a single match would leave the earlier notice in the body for rtk to fold away. The shared source feeds the whole-line test.
-const NOTICE_LINE = new RegExp(`^(?:${NOTICE_SOURCE})$`);
-
-// Rules: `formatResult2` puts the exit status and the signal on the first lines, before any output, and follows the exit status with a parenthesised interpretation (`(No matches found)`, `(test failure)`). Both are host words, not output, and rtk drops them, so they are split with the head. The interpretation is only recognised directly after an `Exit code:` line, so a body that happens to start with a parenthesis is not eaten.
-const SHELL_HEAD = /^(?:(?:(?:Exit code|Signal):[^\n]*\n)(?:\([^)\n]*\)\n)?)+/;
-
-// Rules: the notice is the last non-blank line, so the scan starts there. `index` is the start of the blank run in front of it — the same boundary the old `\n*` prefix produced, so the body never carries the padding. `blank` is the separator to re-attach (capped at two newlines, matching what the tests pin).
-export function findTrailer(text: string): {index: number; match: string; blank: string} | null {
-	let end = text.length;
-	while (end > 0 && /\s/.test(text[end - 1] ?? '')) end -= 1;
-	if (end === 0) return null;
-	// Rules: trailing whitespace after the notice must be trimmed before matching, or the notice is missed and rtk folds it away with the body. The old pattern consumed it with `[\s]*$`; doing it here keeps the match to one pass.
-	const trimmed = text.slice(0, end);
-	let first = trimmed.lastIndexOf('\n') + 1;
-	if (!NOTICE_LINE.test(trimmed.slice(first))) return null;
-	// Rules: consume every consecutive notice line, not just the last. A shell result can carry a cwd note followed by the PowerShell banner; splitting only the banner feeds the note to rtk, which deletes it.
-	while (first > 0) {
-		const prevEnd = first - 1;
-		const prevStart = trimmed.lastIndexOf('\n', prevEnd - 1) + 1;
-		if (!NOTICE_LINE.test(trimmed.slice(prevStart, prevEnd))) break;
-		first = prevStart;
-	}
-	let runStart = first;
-	while (runStart > 0 && trimmed[runStart - 1] === '\n') runStart -= 1;
-	const blank = first - runStart >= 2 ? '\n\n' : '\n';
-	return {index: runStart, match: trimmed.slice(first), blank};
-}
-
-// Rules: `glob` prints `Found N files` and then one indented path per line. The find filter reads that header line as a path, so it is split off rather than fed in.
-const GLOB_HEAD = /^Found \d+ files?[^\n]*\n/;
-
-// Rules: every form rtk emits when it actually compressed something, taken from its own source (`core/tee.rs`, `core/runner.rs`, `cmds/system/search.rs`, `cmds/system/pipe_cmd.rs`, `cmds/js/lint_cmd.rs`): the grouped-search header (two spellings — `N matches in M files:` from `search.rs`, `N matches in MF:` from `pipe_cmd.rs`), a per-file or per-run elision count, and the three recall hints. A result carrying one of these has already been reduced and may hold a recall hash the filter would drop, so it is never fed back in.
-const RECOVERY_MARKER = /\bmatches in \d+(?: files?|F):|\+\d+ more|\+ \.\.\. more files|hidden: rtk recall |\[full output:/;
-
-// Rules: rtk's search filter prints its faithful baseline whenever capping would not shrink the output, which is the normal case for a multi-file grep (measured 4,026 -> 4,026 bytes). That baseline is exempt from the filter by construction, so a shell call rtk rewrote can still arrive uncompressed.
-// Rules: the rows are recognised by the same parser the condensers use — `path:line:text` with a path that looks like a file — and a majority is required, so a diff, a log, or a build log that happens to contain one such line is not mistaken for a match list. A timestamped log line (`2026-11-04 12:00:01: INFO…`) is refused here too; the loose shape test alone read it as a row and let a second filter pass replace the log with a grouped summary.
-// Rules: a Windows match row is `C:\src\a.ts:12:text`; the drive colon is consumed explicitly so the rest of the path may not hide one. A bare `.*` would also read `http://host:8080:x` as a row. `grepBodyRow` owns the path check so this test cannot drift from `condenseGrepRows`.
-// Rules: this runs on every shell result, and a 700 KB body costs 40 ms of per-line regex — the answer is false almost every time. Two cheap native passes replace most of that: a body with no `:<digits>:` anywhere cannot hold a single row, and the loop bails as soon as the remaining lines can no longer reach the 0.5 majority. Both preserve the exact rule; neither changes a true answer.
-const ROW_HINT = /:\d+:/;
-
-// Rules: context detection uses the loose shape, not the strict file-like check. A real host path can be a dotless `Makefile`, a `.env`, a directory with a space, or a non-ASCII path; a false negative here accepts rtk's grouping and drops every context row. A false positive only refuses a grouping, so it cannot lose data.
-// Rules: a Windows match row is `C:\src\a.ts:12:text`; the drive colon is consumed explicitly so the rest of the path may not hide one.
-const GREP_ROW = /^((?:[A-Za-z]:[\\/])?[^\s:][^:\n]*):\d+:[^\n]*$/;
-
-export function isGrepRows(text: string): boolean {
-	if (!ROW_HINT.test(text)) return false;
-	const lines = text.split('\n').filter(line => line.trim());
-	if (lines.length < 2) return false;
-	let rows = 0;
-	for (let index = 0; index < lines.length; index += 1) {
-		if (grepBodyRow(lines[index] ?? '')) rows += 1;
-		else if ((rows + lines.length - index - 1) / lines.length < 0.5) return false;
-	}
-	return rows / lines.length >= 0.5;
-}
-
-// Rules: ripgrep separates a match from its context with different delimiters — `path:line:text` for a match, `path-line-text` for a `-A/-B/-C` context line (verified with `rg -A1`: `2:beta` then `3-gamma`). rtk's grep filter only understands the match form, so every context line is dropped (measured: 40 match rows plus 40 context rows, 3,178 -> 1,665 bytes with all 40 context lines gone). The context is the reason the caller passed `-A/-B/-C`.
-// Rules: the file prefix must match one the match rows already named, because a path alone is not evidence — `src/v2-feat-12-bar1.ts` has the shape `<path>-<digits>-` and a bare delimiter test reads it as a context row (measured: a 40-path find-mode list was refused as lost context). Requiring a known path removes that false positive while keeping the single-file form, where the prefix is empty on both rows.
-const GREP_CONTEXT_ROW = /^([\s\S]*?)-\d+-/;
-
-export function hasGrepContext(text: string): boolean {
-	const lines = text.split('\n').filter(line => line.trim());
-	const knownPaths = new Set<string>();
-	for (const line of lines) {
-		const path = GREP_ROW.exec(line)?.[1];
-		if (path !== undefined) knownPaths.add(path);
-	}
-	if (knownPaths.size === 0) return false;
-	for (const line of lines) {
-		if (GREP_ROW.test(line)) continue;
-		const path = GREP_CONTEXT_ROW.exec(line)?.[1];
-		if (path !== undefined && knownPaths.has(path)) return true;
-	}
-	return false;
-}
-
-// Rules: a rewritten call is normally left alone because rtk already filtered it. The exception is the baseline rtk declined to compress: it carries no recovery hint, so a second pass recovers rows it refused to group instead of discarding information.
-export function canRefilterCompressed(text: string): boolean {
-	return !RECOVERY_MARKER.test(text) && isGrepRows(text);
-}
-
-
-// Rules: rtk's own `grep` filter is its weakest path. Measured against 1.1.0: 20 files x 5 hits came back 6,850 -> 6,591 (3%), 30 files x 1 hit 1,671 -> 1,671 (0%), a 400-row count-mode body 17,140 -> 14,331 (16%). It groups by file but repeats the path and the whole match text on every row. This condenser groups AND dedupes the text, so identical lines collapse to one row with their line numbers joined — 75%, 56% and 85% on the same three inputs — and it never drops a file.
-// Rules: the row parser is stricter than `GREP_ROW` on purpose: any non-blank line that is not `path:line:text` makes the whole body ineligible, so a build log that happens to hold a few match rows is never regrouped. That also means a `-A/-B/-C` context row opts the body out for free, matching the explicit `hasGrepContext` refusal.
-// Rules: the path must look like a file — a separator, or a dot before the colon — because this pass also sees shell output, and a log line is `2026-11-04 12:00:01: INFO started`, which a bare pattern reads as path `2026-11-04 12`, line `00`, text `01: INFO started`. Measured: 40 such lines were regrouped into one bogus file, losing every timestamp. A real match path carries `src/` or `.ts` before its first colon. A body with no such row anywhere is refused, so that log is returned untouched.
-// Rules: the cap only elides repeated *rows* inside one file, never a file, and never a whole directory. Every path still gets named, so the model can always see which files matched, and the dropped count is stated.
-// Rules: both layouts keep rtk's own recovery marker (`N matches in MF:`) so a grouped result is never fed back through the filter, and so `+N` reads the way the model already learned.
-// Rules: the shape and the "looks like a file" test are SPLIT — one linear match, then a constant-time path check. They used to be a single alternation with two overlapping `[^:\n]*` repeats around a lazy tail, which is exponential on a dotted line: measured 122 ms at 63 chars, 31 ms at 57, 698 ms at 5.6 KB, and a timeout past that. One grep hit inside a minified bundle is exactly such a line, and this ran on every grep, glob and shell result.
-const GREP_BODY_SHAPE = /^((?:[A-Za-z]:)?[^:\n]+):(\d+):([^\n]*)$/;
-
-// Rules: the two shapes a match path really takes — a name after a separator (`src/a.ts`, `C:\a\b.ts`, `./x.ts`), or a bare `name.ext`. A bare `2026-11-04 12` has neither, which is what refuses the timestamp log.
-// Rules: these are the old alternation's branches, written out instead of backtracked. The separator branch keeps its original constraint — everything BEFORE the first separator must be word characters, which is what refuses `a b/c.ts` — while the part after it stays free, so `src/my dir/f.ts` is still a match.
-const WORD_PREFIX = /^[\w.$@+-]*$/;
-const DOTTED_NAME = /^[^:\s/\\]+(?:\.[^:\s/\\]+)+$/;
-
-function looksLikeFilePath(path: string): boolean {
-	if (!path) return false;
-	if (path.length > 2 && path[1] === ':' && (path[2] === '/' || path[2] === '\\')) return true;
-	const sep = path.search(/[\\/]/);
-	if (sep >= 0) return sep < path.length - 1 && WORD_PREFIX.test(path.slice(0, sep));
-	return DOTTED_NAME.test(path);
-}
-
-// Rules: one row parse for both condensers, so the path condenser's "this is a grep row, leave it to the row condenser" refusal cannot drift from the row condenser's own acceptance.
-function grepBodyRow(line: string): [path: string, number: string, text: string] | null {
-	const match = GREP_BODY_SHAPE.exec(line);
-	if (!match) return null;
-	const [, path, number, text] = match as unknown as [string, string, string, string];
-	return looksLikeFilePath(path) ? [path, number, text] : null;
-}
-
-interface GrepGroup {
-	readonly numbers: string[];
-	readonly text: string;
-}
-
-// Rules: a layout appends lines to an array instead of returning a joined string, so its byte length can be measured without building the string. Both layouts used to be joined in full and then compared, so a body producing two ~1 MB renderings paid for both and kept one.
-// Rules: the sink is a plain `string[]`, never a callback. A callback sink gave every `sink(...)` call site two different closure shapes (measure vs join), and V8 deoptimised `condenseGrepRows` and both layouts on `wrong call target` / `Insufficient type feedback` on every large body — measured as a bimodal 137 ms / 900 ms distribution on 2 MB. The array form is monomorphic and removed the spread.
-type LineSink = string[];
-
-// Rules: the byte length of `lines.join('\n') + '\n'` without joining: the content, plus one separator per line (n-1 between, 1 trailing).
-function sinkLength(lines: readonly string[]): number {
-	let content = 0;
-	for (const line of lines) content += line.length;
-	return content + lines.length;
-}
-
-// Rules: two layouts, both keeping every file name, and the smaller one wins. `[file] path (N):` pays a constant per file and a tab-indented row per line, which wins when a file has several hits; the `path:  (N)` directory tree pays one directory line and lists `name:numbers:text`, which wins when most files hold a single hit and a per-file header would add more than the row it introduces. Measured: the directory tree takes a 240-files-one-hit-each body from 0% to 23% and a 30-files-one-hit body from 30% to 58%, while the file-header layout stays ahead on a file with 20 hits (77% vs 75%) — so neither dominates and both are built.
-// Rules: both layouts read the SAME pre-deduped structures. They used to dedupe independently, so a body was deduped twice and each layout rebuilt the per-file `Map` — profiled on a 40k-row body that was 27% of the run.
-function eachFileLine(sink: LineSink, order: readonly string[], groupsByFile: ReadonlyMap<string, GrepGroup[]>, rowCount: ReadonlyMap<string, number>, perFileCap: number, total: number): void {
-	sink.push(`${total} matches in ${order.length}F:`);
-	for (const path of order) {
-		const groups = groupsByFile.get(path) ?? [];
-		const rows = rowCount.get(path) ?? 0;
-		const shown = groups.slice(0, perFileCap);
-		sink.push(`[file] ${path} (${rows}):`);
-		for (const group of shown) sink.push(`  ${group.numbers.join(',')}:${group.text}`);
-		const keptRows = shown.reduce((sum, group) => sum + group.numbers.length, 0);
-		if (rows > keptRows) sink.push(`  +${rows - keptRows} more lines in this file`);
-	}
-}
-
-// Rules: the path is split on its last separator, so a Windows drive colon never becomes a directory boundary, and a relative root file lands under `./`.
-function eachDirLine(sink: LineSink, order: readonly string[], groupsByFile: ReadonlyMap<string, GrepGroup[]>, rowCount: ReadonlyMap<string, number>, perFileCap: number, total: number): void {
-	const dirs: string[] = [];
-	const filesByDir = new Map<string, string[]>();
-	for (const path of order) {
-		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-		const dir = slash >= 0 ? path.slice(0, slash + 1) : './';
-		let files = filesByDir.get(dir);
-		if (!files) {
-			files = [];
-			filesByDir.set(dir, files);
-			dirs.push(dir);
-		}
-		files.push(path);
-	}
-	sink.push(`${total} matches in ${order.length}F:`);
-	for (const dir of dirs) {
-		const paths = filesByDir.get(dir) ?? [];
-		sink.push(`${dir}  (${paths.length})`);
-		for (const path of paths) {
-			const name = dir === './' && !path.includes('/') && !path.includes('\\') ? path : path.slice(dir.length);
-			const groups = groupsByFile.get(path) ?? [];
-			const rows = rowCount.get(path) ?? 0;
-			const shown = groups.slice(0, perFileCap);
-			for (const group of shown) sink.push(`  ${name}:${group.numbers.join(',')}:${group.text}`);
-			const keptRows = shown.reduce((sum, group) => sum + group.numbers.length, 0);
-			// Rules: the count is ROWS, not groups, because the line it prints says `lines`. Counting groups understated it whenever a file repeated one match text on several lines, and the two layouts reported different numbers for the same elision.
-			if (rows > keptRows) sink.push(`  ${name}: +${rows - keptRows} more lines`);
-		}
-	}
-}
-
-// Rules: a reshape that saves almost nothing is not worth it — it spends the model's attention on a new layout for a byte or two, and it rewrites a diagnostic shape it may misread. Measured: a `file:line:col: message` linter listing parsed as match rows and came back 2,389 -> 2,340 (2%), so anything under 5% is declined and left exactly as it was. Real grep wins clear this by a wide margin (a 240-files-one-hit body is the floor at 9.8%).
-const MIN_LOCAL_GAIN = 0.05;
-
-function worthIt(original: string, condensedLength: number): boolean {
-	return condensedLength < original.length * (1 - MIN_LOCAL_GAIN);
-}
-
-export function condenseGrepRows(text: string, perFileCap = 6): string | null {
-	const order: string[] = [];
-	// Rules: dedupe happens as each row arrives, so no intermediate per-row record is kept. The old shape built a `GrepRow[]` per file and deduped it into a second structure; on a 40k-row body that was 4.4 MB of short-lived objects out of ~23 MB allocated for a 1 MB result, and the GC cost of it is what made the peak 5-6x the median on the large bodies. `rowCount` is kept separately because the elided count is measured in ROWS while the groups are measured in distinct texts.
-	const groupsByFile = new Map<string, GrepGroup[]>();
-	const indexByFile = new Map<string, Map<string, number>>();
-	const rowCount = new Map<string, number>();
-	let total = 0;
-	for (const line of text.split('\n')) {
-		if (!line.trim()) continue;
-		const row = grepBodyRow(line);
-		if (!row) return null;
-		const [path, number, body] = row;
-		let groups = groupsByFile.get(path);
-		let index = indexByFile.get(path);
-		if (!groups || !index) {
-			groups = [];
-			index = new Map<string, number>();
-			groupsByFile.set(path, groups);
-			indexByFile.set(path, index);
-			rowCount.set(path, 0);
-			order.push(path);
-		}
-		rowCount.set(path, (rowCount.get(path) ?? 0) + 1);
-		total += 1;
-		const at = index.get(body);
-		if (at === undefined) {
-			index.set(body, groups.length);
-			groups.push({numbers: [number], text: body});
-		} else groups[at]?.numbers.push(number);
-	}
-	if (total < 2) return null;
-
-	// Rules: measure first, render once. Both layouts are rendered into arrays (cheap: one push per line, no string join), the winner is picked on exact byte length, and only that one is joined. The lossy choice is therefore made once and the losing rendering never becomes a string.
-	const renderings: LineSink[] = [[], []];
-	eachFileLine(renderings[0]!, order, groupsByFile, rowCount, perFileCap, total);
-	eachDirLine(renderings[1]!, order, groupsByFile, rowCount, perFileCap, total);
-	let best: LineSink | null = null;
-	let bestLength = Number.POSITIVE_INFINITY;
-	for (const lines of renderings) {
-		const length = sinkLength(lines);
-		if (!worthIt(text, length)) continue;
-		if (length < bestLength) {
-			bestLength = length;
-			best = lines;
-		}
-	}
-	return best === null ? null : `${best.join('\n')}\n`;
-}
-
-// Rules: the host's count mode is `path:count` — measured in `finishCountMode`: `compactPath(n.path):n.count`. `grepBodyRow` cannot recognise it (it needs a third field), so before this pass existed the row reached the path tree and printed `file0.ts:1`, putting the match COUNT exactly where a line number goes; a model reading that reopens the wrong line, and nothing downstream could tell the two apart. It is condensed by its own layout instead of being refused, because rtk's grep filter leaves this shape byte-identical and its find filter prints the count with no label at all.
-// Rules: a count is never emitted without a word beside it. The directory line states `N files, M hits` and every row prints `name (count)`, so no position in the output can be read as a line number. The per-directory cap elides file rows and prints `+N files`; it never drops a directory.
-// Rules: the header is the `N files in M dirs:` form `condensePaths` emits, so `GROUPING_MARKER` recognises the result as grouped and a count body whose names happen to contain a negation word is not refused by the negation test.
-const COUNT_BODY_SHAPE = /^((?:[A-Za-z]:)?[^:\n]+):(\d+)$/;
-
-function countBodyRow(line: string): [path: string, count: number] | null {
-	const match = COUNT_BODY_SHAPE.exec(line);
-	if (!match) return null;
-	const [, path, count] = match as unknown as [string, string, string];
-	if (!looksLikeFilePath(path)) return null;
-	const value = Number(count);
-	return Number.isSafeInteger(value) ? [path, value] : null;
-}
-
-// Rules: a path repeated across rows is merged into ONE entry whose count is the sum. Listing it once per row made the output claim more files than exist (`10 files` over five names) and printed the same name several times, so the model reads phantom files; a repeated path is reachable because a paged or concatenated count body produces one. The distinct path count, not the row count, is what the header and each directory line report.
-export function condenseCountRows(text: string, perDirCap = 6): string | null {
-	const order: string[] = [];
-	const countsByDir = new Map<string, Array<{name: string; count: number}>>();
-	const indexByDir = new Map<string, Map<string, number>>();
-	let files = 0;
-	for (const line of text.split('\n')) {
-		if (!line.trim()) continue;
-		const row = countBodyRow(line.trim());
-		if (!row) return null;
-		const [path, count] = row;
-		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-		const dir = slash >= 0 ? path.slice(0, slash + 1) : './';
-		const name = slash >= 0 ? path.slice(slash + 1) : path;
-		let bucket = countsByDir.get(dir);
-		let index = indexByDir.get(dir);
-		if (!bucket || !index) {
-			bucket = [];
-			index = new Map<string, number>();
-			countsByDir.set(dir, bucket);
-			indexByDir.set(dir, index);
-			order.push(dir);
-		}
-		const at = index.get(name);
-		if (at === undefined) {
-			index.set(name, bucket.length);
-			bucket.push({name, count});
-			files += 1;
-		} else {
-			const entry = bucket[at];
-			if (entry) bucket[at] = {name: entry.name, count: entry.count + count};
-		}
-	}
-	if (files < 2) return null;
-
-	const out: string[] = [`${files} files in ${order.length} dirs:`];
-	for (const dir of order) {
-		const bucket = countsByDir.get(dir) ?? [];
-		const dirHits = bucket.reduce((sum, entry) => sum + entry.count, 0);
-		out.push(`${dir}  (${bucket.length} files, ${dirHits} hits)`);
-		for (const entry of bucket.slice(0, perDirCap)) out.push(`  ${entry.name} (${entry.count})`);
-		if (bucket.length > perDirCap) out.push(`  +${bucket.length - perDirCap} files`);
-	}
-	const joined = `${out.join('\n')}\n`;
-	return worthIt(text, joined.length) ? joined : null;
-}
-
-// Rules: rtk's `find` filter groups by directory but elides whole directories once it has printed enough: on a 60-directory glob it named 19 of 60, so the model cannot tell which directories matched at all. This condenser prints every directory, caps only the file list inside one directory, and states the elided file count. Measured 82-84% on a 260- and a 300-path glob versus rtk's 73-77%, and it needs no process.
-// Rules: a body that is not one clean path per line is refused, so a shell listing with prose is never folded into a path tree. A `path:line:text` row is refused explicitly even though it passes `PATH_ROW` (a colon is not whitespace): the path condenser would read the line number and the match text as part of the file name and drop both. That case is `condenseGrepRows`' job, and when it declines the body is left for rtk.
-// Rules: a `path:count` row is refused here too, for the same reason as the match row — `10` is a match count and the tree would print it where a line number belongs. `condenseCountRows` owns that shape.
-const COUNT_ROW = /:(\d+)$/;
-const PATH_ROW = /^\s*(?:\.{0,2}[\\/]|[A-Za-z]:[\\/]|[\w.$@+-]+[\\/])[^\s]*$/;
-
-export function condensePaths(text: string, perDirCap = 6): string | null {
-	const order: string[] = [];
-	const filesByDir = new Map<string, string[]>();
-	for (const line of text.split('\n')) {
-		if (!line.trim()) continue;
-		if (GLOB_HEAD.test(`${line}\n`)) continue;
-		if (!PATH_ROW.test(line) || grepBodyRow(line.trim()) || COUNT_ROW.test(line.trim())) return null;
-		const path = line.trim();
-		const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-		const dir = slash >= 0 ? path.slice(0, slash + 1) : './';
-		const name = slash >= 0 ? path.slice(slash + 1) : path;
-		let files = filesByDir.get(dir);
-		if (!files) {
-			files = [];
-			filesByDir.set(dir, files);
-			order.push(dir);
-		}
-		files.push(name);
-	}
-	const total = [...filesByDir.values()].reduce((sum, files) => sum + files.length, 0);
-	if (total < 2) return null;
-
-	const out: string[] = [`${total} files in ${order.length} dirs:`];
-	for (const dir of order) {
-		const files = filesByDir.get(dir) ?? [];
-		out.push(`${dir}  (${files.length})`);
-		for (const file of files.slice(0, perDirCap)) out.push(`  ${file}`);
-		if (files.length > perDirCap) out.push(`  +${files.length - perDirCap} files`);
-	}
-	const joined = `${out.join('\n')}\n`;
-	return worthIt(text, joined.length) ? joined : null;
-}
-
-// Rules: `grep` is not one shape. Its default `files_with_matches` mode prints a plain path list under a `Found N files` header, which the grep filter passes through untouched (measured 4,448 → 4,448 bytes) while the find filter condenses it (→ 630). Content mode is the opposite: `path:line:text` rows, where grep wins. So the filter is chosen from the body's shape, not from the tool name alone.
-export function filterForShape(toolName: string, filter: string | null, text: string): string | null {
-	if (toolName === 'grep' && GLOB_HEAD.test(text)) return 'find';
-	return filter;
-}
-
-// Rules: a result is split into the envelope the host wrote and the body rtk should condense; only the body is ever filtered, so no host information is lost.
-// Rules: the tail keeps the host's own separator, capped at one blank line — enough to keep the notice visually separate without carrying a run of blank lines the filter just folded.
-function tailFrom(trailer: {match: string; blank: string}): string {
-	return `${trailer.blank}${trailer.match.trimStart()}`;
-}
-
-export function splitSegments(toolName: string, text: string): Segments {
-	// Rules: normalise CRLF once, here, because every parser below splits on `\n` and a retained `\r` breaks each of them: the `$`-anchored notice test stops matching (the `[cwd change to …]` note was left in the body and the earlier of two consecutive notices was lost), `PATH_ROW`'s `[^\s]*$` refuses every line, and condensed match rows keep a stray `\r` inside their text. Windows shell and ripgrep output is CRLF, so this was every Windows result. The segments are rebuilt here anyway, so they come back LF; the model reads text, not bytes.
-	text = text.replace(/\r\n/g, '\n');
-	// Rules: `grep`'s default files mode opens with the same `Found N files` line `glob` does, so both split it off; a content-mode body starts with `path:line:text` and never matches.
-	if (toolName === 'glob' || toolName === 'grep') {
-		const head = GLOB_HEAD.exec(text);
-		if (head) {
-			const rest = text.slice(head[0].length);
-			const trailer = findTrailer(rest);
-			if (!trailer) return {head: head[0], body: rest, tail: ''};
-			return {head: head[0], body: rest.slice(0, trailer.index), tail: tailFrom(trailer)};
-		}
-	}
-	const trailer = findTrailer(text);
-	if (trailer) {
-		const body = text.slice(0, trailer.index);
-		const head = SHELL_HEAD.exec(body);
-		const tail = tailFrom(trailer);
-		return head ? {head: head[0], body: body.slice(head[0].length), tail} : {head: '', body, tail};
-	}
-	if (isShellTool(toolName)) {
-		const head = SHELL_HEAD.exec(text);
-		if (head) return {head: head[0], body: text.slice(head[0].length), tail: ''};
-	}
-	return {head: '', body: text, tail: ''};
-}
-
-
-// Rules: a test runner or a build tool emits colour by default, and rtk's filters pass the escapes straight through — measured on 10,110 bytes of realistic coloured test output, rtk returned all 10,110 bytes with all 720 escapes intact, while the same text without them was 6,750 bytes (33.2% smaller). Colour carries nothing the model reads, so it is removed before anything else.
-// Rules: only text-carrying sequences are matched — CSI (colour, cursor), OSC (titles, hyperlinks, clipboard writes) and the two-byte escapes. Anything else is left alone rather than eaten by a pattern wide enough to swallow real output.
-// eslint-disable-next-line no-control-regex
-const ANSI = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001B]*(?:\u0007|\u001B\\)|[@-Z\\-_])/g;
-
-// Rules: the fast path matters — every large result goes through here, and most have no escape at all.
-export function stripAnsi(text: string): string {
-	return text.includes('\u001B') ? text.replace(ANSI, '') : text;
-}
-
-
-// Rules: rtk's own byte guard (`never_worse`) only asks whether the output got smaller, never whether it still says the same thing, and its auto-detect can pick the wrong filter. Measured against the real binary: a cargo-style block of 20 `error[E0xx]: cannot find value …` lines plus context came back from `rtk pipe` as 156 bytes reading `20 matches in 1F:` then `[file] --> src/lib.rs (20):` — every one of the 20 error messages was gone, with no recovery hint. The same text is what an agent needs to fix a build.
-// Rules: the guard targets that failure, not an ideal of lossless compression. A readable filter summarises on purpose — `FAILURES (1): 1. tests::fails_here` is a good result — so the check is format-shaped instead of atom-by-atom: when rtk auto-detected and produced its grep/find grouping while the original was neither `path:line:text` rows nor a path list, the guess was wrong and the original is kept. Negation loss is refused too, since that inverts meaning and no legitimate summariser drops one.
-const NEGATION = /\b(?:not|no|never|without|cannot|can't|don't|doesn't|didn't|isn't|aren't|won't|wouldn't|shouldn't|couldn't|neither|nor)\b/gi;
-// Rules: the guard catches rtk's grouped form — a `N matches in M files:` header or a `[file] path:` block header — because that is what its grep/find filters emit when they summarise.
-// Rules: the abbreviated `NF:` spelling is rtk's own (`pipe_cmd.rs`) and this mod's own local condenser emits it too, so it must count as grouped here. Without it, a legitimately elided block (which states its `+N`) was refused as `negation: 12 -> 1` and the 80% saving was lost on any search whose code contains a negation.
-const GROUPING_MARKER = /^\s*(?:\d+ matches in \d+(?: files?|F):|\d+ files? in \d+ dirs?:)$|^\[file\]\s/m;
-
-function countOf(text: string, pattern: RegExp): number {
-	pattern.lastIndex = 0;
-	let count = 0;
-	for (const _match of text.matchAll(pattern)) count += 1;
-	return count;
-}
-
-export interface FidelityReport {
-	readonly ok: boolean;
-	readonly lost: readonly string[];
-}
-
-export function checkFidelity(original: string, filtered: string, autoDetected: boolean): FidelityReport {
-	const lost: string[] = [];
-
-	// Rules: the count test only holds when the filter kept every row. rtk's grep and find grouping ELIDES repeated rows by design (`+N`), so a 300-row file whose lines say `not` legitimately comes back with 10 — measured against rtk 1.1.0, a real grouped grep of `returns not ready_N` rows went 41,739 -> 11,252 bytes and was refused as `negation: 200 -> 80`, which suppressed the compression for every search that touches code containing a negation. So the counting test is skipped when the output is grouped; the `format:` and `context:` guards below still cover the harmful grouping cases.
-	// Rules: total loss is still refused even when grouped, because a group that drops every negation inverts the meaning no matter how many rows it elided.
-	const grouped = GROUPING_MARKER.test(filtered);
-	const negationsIn = countOf(original, NEGATION);
-	const negationsOut = countOf(filtered, NEGATION);
-	if (negationsIn > 0 && negationsOut === 0) lost.push(`negation: ${negationsIn} -> 0`);
-	else if (!grouped && negationsOut < negationsIn) lost.push(`negation: ${negationsIn} -> ${negationsOut}`);
-
-	// Rules: an explicit `-f grep` is rtk's grep filter, and that filter keeps only `path:line:text` rows. A result from the host's `grep` tool with `-A/-B/-C` carries `path-line-text` rows too, and every one of them is dropped (measured end-to-end: 40 context lines in, 0 out, accepted). The check runs for the explicit filter as well, because `autoDetected` is false on that path and the grouping test below would never see it.
-	// Rules: no `isGrepRows` precondition — one context line per match row is still a 50% row ratio, so the majority test would wave through exactly the case that loses the most context.
-	if (GROUPING_MARKER.test(filtered) && hasGrepContext(original)) {
-		lost.push('context: rtk dropped the grep context lines the caller asked for');
-	}
-
-	if (autoDetected && GROUPING_MARKER.test(filtered)) {
-		const rows = isGrepRows(original);
-		const paths = pathLineRatio(original);
-		if (!rows && paths < 0.5) lost.push('format: rtk grouped a result that was not a match list or a path list');
-	}
-
-	return {ok: lost.length === 0, lost};
-}
-
-// Rules: a find result is one path per line, so the majority test is what tells a genuine path list from a build log that happens to contain a couple of paths.
-function pathLineRatio(text: string): number {
-	const lines = text.split('\n').filter(line => line.trim());
-	if (lines.length < 2) return 0;
-	const paths = lines.filter(line => /^\s*(?:\.{0,2}[\\/]|[A-Za-z]:[\\/]|[\w.-]+[\\/])[^\s:]*$/.test(line)).length;
-	return paths / lines.length;
-}
-
-
-// Rules: the host's envelope is not only at the edges. A large foreground result is truncated in the MIDDLE and given a two-line pointer there: `[... output truncated: N chars total, showing first X and last part ...]` then `[full output saved to: <path> — read it with read_file (offset/limit) or grep]` (or `[full output could not be persisted]`). Measured: a 2,951-byte pytest result carrying that pair came back from `rtk pipe` at 296 bytes with BOTH lines gone, so the model could never find the rest. The pair is lifted out before filtering and re-attached after it.
-const TRUNCATION_NOTICE = /^\[\.\.\. output truncated: [^\]\n]*\]$/;
-const SPILL_NOTICE = /^\[full output (?:saved to: [^\]\n]*|could not be persisted)\]$/;
-
-function isSpillNotice(line: string): boolean {
-	return TRUNCATION_NOTICE.test(line) || SPILL_NOTICE.test(line);
-}
-
-// Rules: split out of the body so rtk cannot fold them, and returned as one block so the caller can re-attach the pointer the model needs.
-// Rules: a notice's line is blanked, not dropped: dropping it would join the two halves the host truncated between, and a filter that reads position (a diff hunk, a numbered list) would then see a different body.
-// Rules: the marker pre-check is the whole cost of this call on a normal result. Almost no result was truncated, but every result goes through here, and the split+join below is 31 ms on a 700 KB body — paid twice per result, since the local pass and the rtk pass each call it. Native `includes` over the raw text answers "no notice" for a fraction of a millisecond, and the output is byte-identical because rejoining the split lines returns the input.
-const SPILL_MARKERS = ['[... output truncated', '[full output '];
-
-export function extractSpillNotices(text: string): {body: string; notices: string} {
-	if (!SPILL_MARKERS.some(marker => text.includes(marker))) return {body: text, notices: ''};
-	const kept: string[] = [];
-	const notices: string[] = [];
-	// Rules: split on `\r?\n`. Windows shell and ripgrep output is CRLF, and a retained `\r` fails the `$`-anchored notice test, so the truncation pointer would be left in the body for the filter to delete.
-	for (const line of text.split(/\r?\n/)) {
-		if (isSpillNotice(line)) {
-			notices.push(line);
-			kept.push('');
-		} else kept.push(line);
-	}
-	return {body: kept.join('\n'), notices: notices.join('\n')};
-}
-
-export type RtkVersion = {major: number; minor: number; patch: number};
-// Rules: output is `rtk 1.0.1`; anything unparseable is null so the caller stays quiet rather than inventing a version.
-export function parseRtkVersion(raw: string): RtkVersion | null {
-	const match = raw.trim().match(/(\d+)\.(\d+)\.(\d+)/);
-	if (!match) return null;
-	return {major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3])};
-}
-
-// Rules: a pre-1.0 binary must reach minor 25 — the release that introduced the Rewrite subcommand; any 1.x already satisfies it.
-export function isSupportedVersion(version: RtkVersion | null): boolean {
-	if (!version) return true;
-	return version.major > 0 || version.minor >= MIN_SUPPORTED_RTK_MINOR;
-}
-
-export type RewriteVerdict =
-	| {kind: 'rewrite'; command: string}
-	| {kind: 'deny'; reason: string}
-	| {kind: 'pass'};
-
-// Rules: mirrors rtk's exit contract as its own source defines it — 0 AllowRewrite and 3 AskRewrite both carry a rewrite, 2 Deny carries a deny (with a message only when an rtk rule, not a host rule, blocked it), 1 Defer means no equivalent and its stdout is ignored.
-// Rules: exit 3 asks the host to prompt before running the rewritten command. This host resolves permissions before `beforeToolCall` runs, so that signal cannot be forwarded here; the rewrite is applied and the host's own permission model stays the gate.
-export function classifyRewrite(code: number, stdout: string, original: string): RewriteVerdict {
-	const out = stdout.trim();
-	if (code === 0 || code === 3) {
-		return out && out !== original ? {kind: 'rewrite', command: out} : {kind: 'pass'};
-	}
-	if (code === 2) {
-		return out ? {kind: 'deny', reason: out} : {kind: 'pass'};
-	}
-	return {kind: 'pass'};
-}
-
-// Rules: a command that is already rtk-prefixed, empty, or a disabled one is left alone so rewrites cannot compound.
-export function shouldRewrite(command: string): boolean {
-	const trimmed = command.trim();
-	if (!trimmed) return false;
-	if (/^rtk\s/.test(trimmed)) return false;
-	if (/^RTK_DISABLED=/.test(trimmed)) return false;
-	return true;
-}
-
-// Rules: `shell_command` carries an optional `args` array beside `command`, and the host runs `command + ' ' + args.shellQuoted` (verified in the bundled cli.mjs: `buildCommand2`). The rewrite must see that whole line, or a compound command is invisible: `command: 'cargo'` + `args: ['build']` asks rtk about the bare `cargo`, which has no rewrite, so the call ran unfiltered while `cargo build` rewrites fine. Measured on 12 real compound calls, every one was missed.
-// Rules: the answer is split back into a command plus the caller's untouched args, so the host's own quoting still applies to them — round-tripping them through a string would have to re-quote, and rtk does not preserve the quoting it is handed (`grep -r 'a b' src/` came back unquoted).
-// Rules: only a rewrite the line still *ends* with is trusted. rtk normalises some commands (`npx jest` -> `rtk jest`), and then the args suffix no longer lines up, so that rewrite is left alone rather than guessed at — a wrong split would move a caller's argument into the command.
-// Rules: the args are joined RAW, not shell-quoted the way the host runs them. That is deliberate and measured against rtk 1.1.0: quoting each arg makes rtk refuse the rewrite outright (`git 'status' '--porcelain'` and `cargo 'build'` both exit 1 with no output), while the raw form rewrites cleanly. A mismatch here can only cause rtk to judge a differently-quoted line, and any rewrite that comes back is re-emitted as the untouched `command` plus the caller's own args, which the host re-quotes — so a wrong verdict can only cost the rewrite, never change what runs.
-export function joinForRewrite(command: string, args: readonly string[]): {line: string; suffix: string} {
-	const suffix = args.length > 0 ? ` ${args.join(' ')}` : '';
-	return {line: `${command}${suffix}`, suffix};
-}
-
-// Rules: `rtk` must be a whole command word, so a `rtk-wrapper` binary or a path segment (`/tmp/rtk/git`) is not mistaken for the rewrite. The boundaries are the shell's own separators and quote characters, the same set `isCommandWordAt` uses; word boundaries alone accept both false positives.
-const CARRIES_RTK = /(?:^|[\s&|;<>"'(])rtk(?=$|[\s&|;<>"')])/;
-
-// Rules: a no-args rewrite is not `rtk ${command}` verbatim. rtk keeps a prefix (`env FOO=1 rtk …`, `nohup rtk …`, `timeout 5 rtk …`), a wrapper (`bash -c "rtk …"`), a chain (`cd src && rtk …`), or expands the subcommand (`cat README.md` -> `rtk read README.md`). Requiring exact equality dropped every one of those: measured against rtk 1.1.0, 7 of 10 representative commands were refused. The carried rewrite is accepted when it still names `rtk` at a command position, which is the same guard the args branch below uses.
-export function splitRewrite(rewritten: string, command: string, suffix: string): string | null {
-	if (!suffix) return CARRIES_RTK.test(rewritten) ? rewritten : null;
-	if (!rewritten.endsWith(suffix)) return null;
-	const rest = rewritten.slice(0, rewritten.length - suffix.length);
-	// Rules: the remainder must still carry the prefix, or the split ate the whole answer (a payload that happened to equal the suffix) and the caller would run an empty command.
-	return /\brtk\b/.test(rest) ? rest : null;
-}
-
-// Rules: `rtk rewrite` answers a bare `rtk …`, which the host shell resolves from ITS PATH. This mod can find rtk in a managed install dir that is not on PATH, so the bare name would run as `rtk: not found` and turn a working command into a failure. Pin each command-position `rtk` to the resolved absolute path.
-// Rules: the scan walks the line once, tracking quote state, so a `rtk` inside a quoted argument is data and stays untouched (`git commit -m "use rtk"`, `echo "x | rtk y"`). A regex with an alternation over the separators cannot do this: it has no idea whether the separator it just matched sits inside a quote, and pinning there corrupts the argument (`echo "x | rtk y"` became `echo "x | '/opt/rtk' y"`).
-// Rules: a command position is the start of a segment (`&&`, `||`, `;`, `|`, `&`) or a new line — rtk rewrites a multi-line block and `&` backgrounding, so both arrive from the binary itself — and either a line start, a line start after a run of `VAR=value` assignments, or one after a prefix command and its own arguments. Prefix commands are matched explicitly (`env`, `nohup`, `time`, `nice`, `command`, `exec`, `builtin`, `stdbuf`, `timeout` with its own duration) because rtk peels them rather than dropping them, and a program that merely shares the name must stay intact.
-// Rules: the quote style follows the shell that will read it. POSIX shells need single quotes (with `'\''` for an embedded one); cmd.exe has no single-quote meaning at all — it would pass the quote characters through — so Windows gets a double-quoted path instead.
-const PREFIX_COMMANDS = new Set(['env', 'nohup', 'time', 'nice', 'command', 'exec', 'builtin', 'stdbuf', 'timeout']);
-// Rules: a flag that carries its value in a SEPARATE word must consume it (`nice -n 5`, `env -u X`, `timeout -k 1`, `time -o FILE`), or the value is left as the payload and the real command is never reached. A flag written `-o0`, `--unset=X` or `--signal=9` already carries its value and must consume none.
-// Rules: `-i` and `-c` are NOT value-consuming: for `env`, `-i` is `--ignore-environment`, and for `exec`, `-c` is `-clear` (both verified: `bash -c 'exec -c echo hi'` printed `hi`, i.e. no argument was eaten). Listing either ate `rtk` as the flag's value and left the binary unpinned (measured). `stdbuf`'s `-i` is `--input=MODE` and normally written joined (`-i0`), which the joined branch handles.
-const VALUE_FLAGS = new Set(['-n', '-k', '-u', '-o', '-e', '-f', '-S', '-s', '-a', '--adjustment', '--unset', '--set', '--format', '--kill-after', '--signal']);
-
-// Rules: `rtk` must be a whole word, so `rtk-wrapper` and `myrtk` are not pinned.
-function isCommandWordAt(line: string, start: number): boolean {
-	const next = line[start + 3];
-	return line.startsWith('rtk', start) && (next === undefined || /[\s&|;<>]/.test(next));
-}
-
-function skipSpaces(text: string, start: number): number {
-	let index = start;
-	while (index < text.length && (text[index] === ' ' || text[index] === '\t')) index += 1;
-	return index;
-}
-
-// Rules: a value may be quoted (`FOO="a b"`), escaped (`FOO=a\ b`), or contain a quote, and `\S*` stopped at the first space inside the quotes: rtk emits `FOO="a b" rtk …`, so the inner `rtk` stayed bare and failed off PATH. Scan the value as a shell word, then continue to the command.
-function assignmentLength(text: string): number | null {
-	const prefix = /^[A-Za-z_][A-Za-z0-9_]*=/.exec(text);
-	if (!prefix) return null;
-	let index = prefix[0].length;
-	while (index < text.length) {
-		const char = text[index] ?? '';
-		if (char === '"' || char === "'") {
-			index += 1;
-			while (index < text.length) {
-				const next = text[index] ?? '';
-				if (char === '"' && next === '\\') {
-					index += 2;
-					continue;
-				}
-				index += 1;
-				if (next === char) break;
-			}
-			continue;
-		}
-		if (char === '\\') {
-			index += 2;
-			continue;
-		}
-		if (char === '\n' || char === '\r' || char === ';' || char === '&' || char === '|') return null;
-		if (char === ' ' || char === '\t') {
-			while (text[index] === ' ' || text[index] === '\t') index += 1;
-			return index;
-		}
-		index += 1;
-	}
-	return null;
-}
-
-// Rules: skip past the prefix commands and assignments in front of a command, returning the index the payload starts at. Stops at the first word that is neither, so the caller compares that word against `rtk`. Only a flag that starts with `-` is a flag: without that guard `time rtk git status` had `rtk` eaten as `time`'s option and the rewrite was never pinned.
-function skipPrefixes(line: string, start: number): number {
-	let index = start;
-	for (;;) {
-		index = skipSpaces(line, index);
-		const rest = line.slice(index);
-		// Rules: the assignment scanner runs before the bare word, because the word pattern would otherwise match its `FOO` and stop the scan at an assignment.
-		const assignment = assignmentLength(rest);
-		if (assignment !== null) {
-			index += assignment;
-			continue;
-		}
-		const word = /^[A-Za-z_][A-Za-z0-9_]*/.exec(rest)?.[0];
-		if (!word || !PREFIX_COMMANDS.has(word)) return index;
-		index += word.length;
-		for (;;) {
-			index = skipSpaces(line, index);
-			const flag = /^-{1,2}[^\s]+/.exec(line.slice(index))?.[0];
-			if (!flag) break;
-			index += flag.length;
-			if (VALUE_FLAGS.has(flag) && !flag.includes('=')) {
-				index = skipSpaces(line, index);
-				const value = /^\S+/.exec(line.slice(index))?.[0];
-				if (value) index += value.length;
-			}
-		}
-		// Rules: `timeout` takes a bare duration after its flags, which is neither a flag nor the payload.
-		if (word === 'timeout') {
-			index = skipSpaces(line, index);
-			const duration = /^[0-9.]+[A-Za-z]*/.exec(line.slice(index))?.[0];
-			if (duration) index += duration.length;
-		}
-	}
-}
-
-// Rules: rtk rewrites a shell wrapper's script rather than the wrapper, so `bash -c "git status"` comes back as `bash -c "rtk git status"` — the `rtk` sits INSIDE a quoted argument, where the main scan treats it as data and leaves it bare. Measured: with rtk installed outside the host shell's `PATH`, that rewrote a working command into `bash: rtk: command not found`. The script is pinned instead, and the quote style is converted when needed so the inner single quotes survive.
-const SHELL_WRAPPERS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish']);
-
-// Rules: the closing quote, with backslash escapes honoured only inside double quotes — a single-quoted POSIX string has no escapes at all.
-function findClosingQuote(text: string, open: number, quote: string): number {
-	for (let index = open + 1; index < text.length; index += 1) {
-		if (quote === '"' && text[index] === '\\') {
-			index += 1;
-			continue;
-		}
-		if (text[index] === quote) return index;
-	}
-	return -1;
-}
-
-// Rules: a script that EXPANDS — `$`, a backtick, or a backslash — cannot be moved into double quotes without changing what it does, so a single-quoted one that expands is left exactly as rtk emitted it rather than silently altered. A double-quoted script already accepts the inner single quotes unchanged.
-function hasExpansion(script: string): boolean {
-	return /[$`\\]/.test(script);
-}
-
-// Rules: rtk emits `env FOO=1 bash -c …`, `nohup bash -c …` and `timeout 5 bash -c …`, so the wrapper is found at a command position AFTER the prefixes are skipped, and `-c` may be combined with other single-letter flags (`-ec`).
-// Rules: `-c` must be a real flag of the wrapper, not the tail of a word, so the scan reads whole flags and checks for the letter.
-function wrapperScriptAt(text: string, start: number): {scriptStart: number; scriptEnd: number; quote: string} | null {
-	const word = /^[A-Za-z_][\w.-]*/.exec(text.slice(start))?.[0];
-	if (!word || !SHELL_WRAPPERS.has(word)) return null;
-	let index = start + word.length;
-	let sawC = false;
-	for (;;) {
-		const at = skipSpaces(text, index);
-		const flag = /^--?[A-Za-z][\w-]*/.exec(text.slice(at))?.[0];
-		if (!flag) {
-			index = at;
-			break;
-		}
-		if (!flag.startsWith('--') && flag.slice(1).includes('c')) sawC = true;
-		index = at + flag.length;
-	}
-	if (!sawC) return null;
-	const open = skipSpaces(text, index);
-	const quote = text[open];
-	if (quote !== '"' && quote !== "'") return null;
-	const close = findClosingQuote(text, open, quote);
-	if (close === -1) return null;
-	return {scriptStart: open + 1, scriptEnd: close, quote};
-}
-
-export function pinBinary(command: string, bin: string, platform: string = process.platform, escapeForOuter = false): string {
-	const posix = `'${bin.replace(/'/g, `'\\''`)}'`;
-	const quoted = platform === 'win32'
-		? `"${bin.replace(/"/g, '""')}"`
-		: escapeForOuter
-			? posix.replace(/[\\"$`]/g, '\\$&')
-			: posix;
-	// Rules: the wrapper pass runs first, then the normal scan. It recurses through the public entry so a nested wrapper is pinned too, and so `win32` quoting is not duplicated here.
-	const pinNormal = (text: string) => pinBinary(text, bin, platform, false);
-	const pinOuter = (text: string) => pinBinary(text, bin, platform, true);
-	let out = '';
-	let index = 0;
-	// Rules: the command position is true at the start of the string and again after a separator, so the scan carries one flag instead of re-deriving it from a lookbehind.
-	let atCommand = true;
-	while (index < command.length) {
-		const char = command[index] ?? '';
-		// Rules: a wrapper's script is a command line in its own right, so `rtk` inside it is at a command position even though the quotes make it an argument here. Measured: `bash -c "rtk git status"` left the inner `rtk` bare, so with rtk outside the host shell's PATH a working command became `bash: rtk: command not found`.
-		if (atCommand && platform !== 'win32') {
-			const script = wrapperScriptAt(command, index);
-			if (script) {
-				const inner = command.slice(script.scriptStart, script.scriptEnd);
-				// Rules: a nested single-quoted script inside a double-quoted outer script cannot hold a pinned POSIX path without another layer of escaping, and a wrong guess corrupts the command line. Leave that inner `rtk` bare rather than emit a broken line; the next pass over a top-level script still pins it.
-				if (escapeForOuter && script.quote === "'") {
-					out += command.slice(index, script.scriptEnd + 1);
-					index = script.scriptEnd + 1;
-					atCommand = false;
-					continue;
-				}
-				const pinnedInner = script.quote === '"' ? pinOuter(inner) : pinNormal(inner);
-				const requote = script.quote === '"' || !hasExpansion(inner);
-				if (pinnedInner !== inner && requote) {
-					// Rules: the script is re-emitted inside double quotes, because a single-quoted container cannot hold the `'\''` escaping a POSIX path may need. A single-quoted script has no expansion of its own, so every `"`, `\`, `$` and backtick in the pinned form is escaped for the outer double quotes. A double-quoted script keeps its own escapes and expansions, so only the pinned path is escaped; without that, a path containing `$` or a backtick was expanded by the outer shell. When this pass is already inside an outer double-quoted script, its own delimiters are escaped too, or the nested script closes the outer container and the command is corrupted.
-					const requoted = script.quote === '"' ? pinnedInner : pinnedInner.replace(/[\\"$`]/g, '\\$&');
-					const delimiter = escapeForOuter ? '\\"' : '"';
-					out += `${command.slice(index, script.scriptStart - 1)}${delimiter}${requoted}${delimiter}`;
-					index = script.scriptEnd + 1;
-					atCommand = false;
-					continue;
-				}
-			}
-		}
-		if (char === "'" || char === '"') {
-			// Rules: copy the quoted span verbatim — no pinning, no separator state inside it.
-			const end = findClosingQuote(command, index, char);
-			const stop = end === -1 ? command.length : end + 1;
-			out += command.slice(index, stop);
-			index = stop;
-			continue;
-		}
-		if (atCommand && isCommandWordAt(command, index)) {
-			out += quoted;
-			index += 3;
-			atCommand = false;
-			continue;
-		}
-		if (atCommand) {
-			const payload = skipPrefixes(command, index);
-			if (payload !== index) {
-				out += command.slice(index, payload);
-				index = payload;
-				continue;
-			}
-			if (isCommandWordAt(command, index)) {
-				out += quoted;
-				index += 3;
-				atCommand = false;
-				continue;
-			}
-			atCommand = false;
-		}
-		if (char === '\\' && command[index + 1] === '\n') {
-			out += '\\\n';
-			index += 2;
-			continue;
-		}
-		if (char === '\n' || char === '&' || char === '|' || char === ';') {
-			out += char;
-			index += 1;
-			// Rules: `||` and `&&` both end a segment; one flag is enough, so a second separator is consumed by the copy above.
-			atCommand = true;
-			continue;
-		}
-		out += char;
-		index += 1;
-	}
-	return out;
-}
 
 // Rules: grouping is applied by hand because toLocaleString varies with the host locale, so the message would differ per machine.
 function grouped(value: number): string {
 	return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
-const GUIDANCE = `RTK is active: command output is condensed before it reaches you. The facts that matter are kept — the failing test name, the assertion, the file and line. A grouped file or match list may print \`+N\` for repeated names it elided: that many entries were dropped, and when no \`rtk recall\` hint follows they were not stored. Re-run a command unfiltered (or narrow its pattern) when you need every name, when its result is empty although output was clearly expected, when it contradicts its exit code, or when it is garbled; do that with \`rtk bypass <cmd>\` or \`RTK_DISABLED=1 <cmd>\`, not by dropping the prefix yourself.
-
-Call rtk directly for what the automatic rewrite cannot express: \`rtk read <file> --level aggressive\` for an overview, \`rtk smart <file>\` for two lines, \`rtk err <cmd>\` for errors only, \`rtk log <file>\` to dedupe, \`rtk json <file> --keys-only\` for shape, \`rtk deps\`, \`rtk diff\`, \`rtk env\`, \`rtk test <cmd>\`, and \`rtk find . -name '*.ts'\`. Do not type \`rtk\` in front of a command that is already rewritten for you.
-
-Condensed output states its own recovery path. An elided span prints a count such as \`+50\`, and when the full text was kept it also prints a hint naming \`rtk recall <hash>\`; use that hint rather than re-running the command, which can be slow or have side effects. When there is a count but no hash the elided entries were not stored — narrow the pattern or re-read the specific file or range instead of re-running the whole command. \`rtk gain\` reports what rtk has saved; \`rtk discover\` finds past commands it could have condensed.`;
-
-// Rules: exported so a test can check every named subcommand against the installed binary instead of trusting the prose.
-// Rules: a direct rtk command must name the resolved absolute binary. This block is injected when the binary is usable, including a managed install that is off PATH — the same case `pinBinary` exists for — so a bare `rtk read` in the examples would fail exactly where the block is needed. The block stays byte-stable per session because the path is fixed once resolved.
-// Rules: a binary path may contain a backtick, and a one-backtick span would be cut short by it; the fence is always one longer than the longest run inside the path.
-function codeSpan(text: string): string {
-	const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map(run => run.length));
-	const fence = '`'.repeat(longest + 1);
-	return `${fence}${text}${fence}`;
-}
-
-export function guidanceText(bin?: string, platform: string = process.platform): string {
-	if (!bin) return GUIDANCE;
-	const quoted = pinBinary('rtk', bin, platform);
-	return `The resolved rtk binary is ${codeSpan(quoted)}; use it for every direct rtk command below.\n\n${GUIDANCE.replace(/`rtk ([a-z-]+)([^`\n]*)`/g, (_match, name: string, rest: string) => codeSpan(`${quoted} ${name}${rest}`))}`;
-}
-
-// Rules: a sub-agent never receives this mod, so nothing rewrites its shell calls. The parent cannot rewrite them either — its hooks only see its own tool calls, and the child's tool call ids never reach them. The one lever left is the `agent` call's prompt: tell the child to prefix commands itself, with the absolute path this mod resolved, because a bare `rtk` is exactly what `pinBinary` exists to avoid (rtk ships to ~/.local/bin, often off a GUI host's PATH).
-// Rules: this is a nudge, not a rewrite, and the measured compliance is partial — across 24 shell calls in four real headless delegations on 1.88.3, 14 (58%) used the prefix and the spread ran 0% to 80% depending on how much the task itself pointed at commands. A child may also call the block "an environment hint" and run everything bare, or comply by ALSO re-running unfiltered to double-check (which is the RTK_DISABLED advice working). So the block must never be described as enforcement, and there is no stronger mechanism available: a child's `systemPrompt` comes from its definition and `agentDefinitions()` is host-internal, so a mod cannot extend it.
-// Rules: the path is emitted through `pinBinary` so it arrives shell-quoted, for the same measured reason the rewrite path does. Raw, a path with a space breaks the line the child is told to type: `/opt/my tools/rtk git status` ran as `sh: /opt/my: not found`, and Windows puts rtk under `C:\Program Files\` by default.
-// Rules: the wording must not reuse GUIDANCE. That block says output is condensed *for* the reader and forbids typing `rtk` yourself — both false in a child, where nothing is rewritten unless the child does it.
 // Rules: an agent with no shell tool cannot follow the block, so it is not sent one. The names are the host's reserved ones and a custom file using them is ignored, so they always resolve to these bundled tool sets (measured on 1.88.2): `explore` is glob/grep/read_file/read_directory and `plan` is read_file alone. `general` and every custom agent may run shell, and an omitted `subagent_type` defaults to `general`, so those still get it.
 const NO_SHELL_AGENTS = new Set(['explore', 'plan']);
-
-// Rules: the block tells the child that the prefixed command IS the run, not a second opinion. Measured: children that complied often ran the command bare AND prefixed "so both outputs are reported" — twice the processes and twice the turns for one answer, and the bare run's output is exactly the ones the prefix was supposed to keep out of context. The `RTK_DISABLED=1` advice stays for the one case that justifies a re-run, an output that looks wrong or folded too far, so the escape hatch is still named rather than removed.
-export function subAgentGuidance(bin: string, platform: string = process.platform): string {
-	const quoted = pinBinary('rtk', bin, platform);
-	return `RTK is available here, but this sub-agent's own shell calls are NOT rewritten automatically — no hook reaches a sub-agent run. Prefix each command with ${quoted} so its output is condensed before you read it: \`${quoted} git status\`, \`${quoted} cargo build\`, \`${quoted} npm test\`. The prefixed command IS the run — do not also run it bare to compare, and never prefix the same command twice; that doubles the work and puts the full output back in context. It keeps the failing test name, the assertion, the file and line, and may fold repeated paths into \`+N\`. Re-run one unfiltered with \`RTK_DISABLED=1 <cmd>\` only when a result looks wrong or you need every name.`;
-}
 
 export default function (cmd: ModApi): void {
 	cmd.addFlag('rtk', {type: 'string', default: '', description: 'Start mode: on|off (default: off)'});
@@ -1037,7 +268,8 @@ export default function (cmd: ModApi): void {
 		} catch {
 			return null;
 		} finally {
-			if (dir) rmSync(dir, {recursive: true, force: true});
+			// Rules: cleanup is best effort. A throw here would replace the return value and escape `afterToolCall`, turning a condensed result into a failed hook on a locked Windows temp dir.
+			if (dir) removeTree(dir);
 		}
 	}
 
@@ -1196,7 +428,10 @@ export default function (cmd: ModApi): void {
 				const next = withAgentBlock(input, 'rtk', subAgentGuidance(bin));
 				return next ? {input: next} : undefined;
 			}
-			if (!isShellTool(toolName) || !bin || !binUsable() || !supported()) return undefined;
+			// Rules: the probe is awaited before `supported()`, matching `appendSystemPrompt` and the agent branch above. `isSupportedVersion(null)` grants the benefit of the doubt, which is right before the probe answers and wrong as its answer — an old binary must never be asked to rewrite.
+			if (!isShellTool(toolName) || !bin || !binUsable()) return undefined;
+			await versionSettled();
+			if (!supported()) return undefined;
 			const command = typeof input.command === 'string' ? input.command : '';
 			if (!shouldRewrite(command)) return undefined;
 			// Rules: the host appends `args` after shell-quoting them, so the rewrite is asked about the whole line and split back only when the answer still ends with the caller's own suffix. `powershell` has no args field, so this is empty there.
@@ -1234,7 +469,10 @@ export default function (cmd: ModApi): void {
 				// Rules: the local pass needs no binary and no byte floor, so it is tried before either guard. A session without rtk still gets its grep and glob results grouped, and a body under 1,200 bytes still shrinks. The guards below only gate the spawn.
 				const local = condenseLocally(toolName, text);
 				if (local) return {content: [{type: 'text', text: local}]};
-				if (text.length < MIN_FILTER_BYTES || !supported() || !binUsable()) return stripped;
+				// Rules: the probe is awaited before the spawn gate, so the answer is the version, not the benefit of the doubt.
+				if (text.length < MIN_FILTER_BYTES || !binUsable()) return stripped;
+				await versionSettled();
+				if (!supported()) return stripped;
 				const filtered = await condense(toolName, filter, text);
 				return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;
 			}
@@ -1251,7 +489,9 @@ export default function (cmd: ModApi): void {
 			// Rules: a rewritten call that rtk declined is a match list or a path list by construction, which is exactly what the local pass handles, and it needs no second process. It runs before the binary guard for the same reason as on the grep path.
 			const local = condenseLocally(toolName, text);
 			if (local) return {content: [{type: 'text', text: local}]};
-			if (!supported() || !binUsable()) return stripped;
+			if (!binUsable()) return stripped;
+			await versionSettled();
+			if (!supported()) return stripped;
 			if (text.length < MIN_FILTER_BYTES) return stripped;
 			const filtered = await condense(toolName, null, text);
 			return filtered ? {content: [{type: 'text', text: filtered}]} : undefined;

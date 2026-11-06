@@ -4,11 +4,11 @@
 // related: rules/caveman.ts, rules/ponytail.ts
 // rules: cmd.store is namespaced per mod, so a mod persists ONLY its own key; a sibling's mode is read through cmd.use.
 // rules: prompt text must be byte-stable per mode so the provider prefix cache survives across rounds.
-// agent: unknown | unknown | 2026-11-03 | unknown | turnOffSiblings — "normal mode" must end every mode, and transformInput short-circuits on handled
 // agent: unknown | unknown | 2026-11-03 | unknown | announceMode + MODE_EVENT so the compress status repaints on any mode change; drop promptHas, which no caller or test ever referenced
 // agent: unknown | unknown | 2026-11-04 | unknown | AGENT_TOOL + withAgentBlock — a sub-agent run gets no mod hooks, so the `agent` call's prompt is the only channel a mode block can reach it through
 // agent: unknown | xai | 2026-11-06 | unknown | review fixes: CodeDNA section dividers removed; `NORMAL_MODE`/`ModeName` added to exports; POSIX pipe paths single-quoted and Windows `%` escaped
 // agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: `resolveBin` now requires a regular executable file, so a same-named directory cannot shadow a later real binary
+// agent: unknown | xai | 2026-11-06 | unknown | withAgentBlock compares the wrapped block, not the bare tag; pipeCommand throws without a batch file
 
 import {accessSync, constants, existsSync, statSync} from 'node:fs';
 import {delimiter, join} from 'node:path';
@@ -103,8 +103,10 @@ export const AGENT_TOOL = 'agent';
 // Rules: the caller's own prompt is never rewritten, only extended — it is the whole task the child was given. A prompt already carrying the block is left alone, because a retried call would otherwise stack a second copy.
 export function withAgentBlock(input: Record<string, unknown>, tag: string, body: string): Record<string, unknown> | undefined {
 	const prompt = typeof input.prompt === 'string' ? input.prompt : '';
-	if (!prompt || prompt.includes(`<${tag}>`)) return undefined;
-	return {...input, prompt: `${prompt}\n\n${wrapBlock(tag, body)}`};
+	// Rules: compare the whole wrapped block, not the bare tag: a task that merely mentions `<rtk>` in prose is not a block already applied, and suppressing it there would silently drop the mode from the child. A retried call carries the identical block, so it is still not doubled.
+	const block = wrapBlock(tag, body);
+	if (!prompt || prompt.includes(block)) return undefined;
+	return {...input, prompt: `${prompt}\n\n${block}`};
 }
 
 
@@ -122,7 +124,15 @@ export function filterShell(
 
 // Rules: cmd.exe re-parses its /c line, and nested quotes do not survive that second pass — measured on windows-latest CI, where `""…\rtk.cmd" pipe -f grep < "…\in.txt""` was rejected with "is not recognized as an internal or external command". A batch file removes the second parse: the script holds the real line once, and cmd.exe is asked only to run one path.
 // Rules: cmd.exe expands `%NAME%` inside quotes too, so a literal `%` in the binary or input path is doubled for the batch file.
+// Rules: the filter is a fixed word, never caller text. `rtk pipe -f` takes one of two names, and this helper writes an unquoted shell word, so any other value would be shell syntax. Both builders guard it for that reason.
+const PIPE_FILTERS = new Set(['grep', 'find']);
+
+function checkFilter(filter: string | null): void {
+	if (filter !== null && !PIPE_FILTERS.has(filter)) throw new Error(`pipe filter must be grep or find, not ${JSON.stringify(filter)}`);
+}
+
 export function windowsPipeScript(bin: string, filter: string | null, file: string): string {
+	checkFilter(filter);
 	const flags = filter ? `-f ${filter} ` : '';
 	const literal = (value: string) => value.replace(/%/g, '%%');
 	return `@echo off\r\n"${literal(bin)}" pipe ${flags}< "${literal(file)}"\r\n`;
@@ -141,10 +151,13 @@ export function pipeCommand(
 	shell: {command: string; args: string[]; wrap: boolean},
 	scriptPath?: string,
 ): {command: string; args: string[]} {
+	checkFilter(filter);
 	const flags = filter ? `-f ${filter} ` : '';
 	const line = `${posixQuote(bin)} pipe ${flags}< ${posixQuote(file)}`;
 	if (shell.wrap) {
-		return {command: shell.command, args: [...shell.args, scriptPath ?? `"${bin}" pipe ${flags}< "${file}"`]};
+		// Rules: cmd.exe re-parses its /c line, so a wrapped shell is only usable through the batch file. Returning the double-quoted line here would hand cmd.exe the nested quoting that test/`pipeCommand: Windows` proves it rejects — throw instead, so a caller that forgets the batch file fails at the callsite rather than in the user's shell.
+		if (!scriptPath) throw new Error('pipeCommand: a wrapped shell needs the batch file path');
+		return {command: shell.command, args: [...shell.args, scriptPath]};
 	}
 	return {command: shell.command, args: [...shell.args, line]};
 }

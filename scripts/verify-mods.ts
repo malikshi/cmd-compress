@@ -1,11 +1,12 @@
 // verify-mods — loads every package mod for real: imports the file, runs its factory, and fails on a throw or an empty registration.
-// exports: none (run directly)
+// exports: none
 // used_by: npm run verify, CI
 // related: package.json, mods/*.ts
 // rules: `cmd mods inspect` only reads the source text — it never imports the file or runs the factory, so a mod that throws in its factory passed every check here and in the real host. This script imports each mod and runs its factory against a stub API instead.
 // rules: the stub is local on purpose. `test/` is not in package.json's `files`, so importing the test harness here would break `npm run verify` in an installed package.
 // rules: a native dynamic import is enough — Node strips TypeScript types without a flag from 22.18.0, which is the floor package.json declares.
 // agent: unknown | unknown | 2026-11-03 | unknown | replaced the inspect-only check after proving it passes a factory that throws
+// agent: unknown | xai | 2026-11-06 | unknown | win32 inspect skip is explicit instead of a swallowed cmd.exe failure
 
 import {execFileSync} from 'node:child_process';
 import {readFileSync} from 'node:fs';
@@ -84,7 +85,9 @@ function createStubApi() {
 let failed = false;
 
 // Rules: `cmd mods inspect` is a source scan, kept for its hooks/reaches report; it cannot prove the mod runs, so it never decides the result.
+// Rules: on win32 `execFileSync('cmd', ...)` resolves cmd.exe from System32 ahead of the host's cmd.cmd shim, so the report would run `mods` as a cmd.exe command, fail, and be swallowed by the catch. Say it was skipped instead of hiding the gap.
 function inspectReport(file: string): string | null {
+	if (process.platform === 'win32') return 'inspect: skipped on win32 — `cmd` resolves to cmd.exe, not the host CLI\n';
 	try {
 		return execFileSync('cmd', ['mods', 'inspect', file], {encoding: 'utf8', timeout: 120_000});
 	} catch {

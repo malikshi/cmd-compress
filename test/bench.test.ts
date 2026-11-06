@@ -4,12 +4,13 @@
 // related: bench/lib/stats.ts, bench/lib/fixtures.ts, bench/lib/prompts.ts, bench/prompt.ts, bench/output.ts
 // rules: the bench must not report a number it cannot reproduce, so each measurement helper is pinned by a test.
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
+// agent: unknown | xai | 2026-11-06 | unknown | import moved to rtk-local
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {estimateTokens, formatPct, median, percentile, reduction, table} from '../bench/lib/stats.ts';
 import {makeGrepClustered, makeGrepScattered, makeFindOutput, REWRITE_COMMANDS, makeGlobToolOutput, makeGlobToolTruncated, makeGrepToolTruncated, makeGrepFilesModeOutput, makeGrepCountModeOutput, makeShellToolOutput, makeShellAbortOutput, makeDeclinedBaseline} from '../bench/lib/fixtures.ts';
-import {canRefilterCompressed} from '../mods/rtk.ts';
+import {canRefilterCompressed} from '../mods/rtk-local.ts';
 import {CODE_PROMPTS, PROSE_PROMPTS, checkCode, checkProse} from '../bench/lib/prompts.ts';
 import {readUsage, writePromptResult} from '../bench/prompt.ts';
 import {writeOutputResult} from '../bench/output.ts';

@@ -6,6 +6,7 @@
 // agent: unknown | unknown | 2026-11-02 | unknown | initial
 // agent: unknown | xai | 2026-11-06 | unknown | timestamp-log rewritten-call regression; wrapper and cache covered here or in the pure suites
 // agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: footer pending/settled version paint, non-vacuous directory guidance, `compress` waits for the probe
+// agent: unknown | xai | 2026-11-06 | unknown | probe-await regression; imports split
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,7 +15,8 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import caveman, {normalizeCavemanLevel} from '../mods/caveman.ts';
 import ponytail from '../mods/ponytail.ts';
-import rtk, {subAgentGuidance} from '../mods/rtk.ts';
+import rtk from '../mods/rtk.ts';
+import {subAgentGuidance} from '../mods/rtk-cli.ts';
 import compress from '../mods/compress.ts';
 import {MODE_EVENT} from '../mods/shared.ts';
 import {createFakeCmd, firstHook, runHandler, messageOf, resultText} from './harness.ts';
@@ -1138,4 +1140,31 @@ test('rtk: an agent with no shell tool is not sent the prefix block', async () =
 	assert.ok(general, 'general may run shell, so it still gets the block');
 	// an omitted subagent_type defaults to general in the host, so it must keep the block too
 	assert.ok(await firstHook(fake).beforeToolCall?.({toolName: 'agent', input: {description: 'x', prompt: 'task'}}));
+});
+
+test('rtk: a shell rewrite waits for the version probe, so an old binary is never asked', async () => {
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => {
+		release = resolve;
+	});
+	const calls: string[][] = [];
+	const fake = load(rtk, {
+		flags: {rtk: 'on'},
+		exec: async request => {
+			calls.push(request.args ?? []);
+			if (request.args?.[0] === '--version') {
+				await gate;
+				return {stdout: 'rtk 0.24.0', stderr: '', code: 0};
+			}
+			return {stdout: '', stderr: '', code: 1};
+		},
+	});
+	const hook = firstHook(fake);
+	hook.onSessionStart?.();
+	const pending = hook.beforeToolCall?.({toolCallId: 'c1', toolName: 'shell_command', input: {command: 'git status'}});
+	await new Promise(resolve => setImmediate(resolve));
+	assert.equal(calls.some(args => args[0] === 'rewrite'), false, 'no rewrite is asked while the probe is pending');
+	release();
+	assert.equal(await pending, undefined, 'a pre-0.25 binary gives no rewrite');
+	assert.equal(calls.some(args => args[0] === 'rewrite'), false, 'and is never asked afterwards either');
 });

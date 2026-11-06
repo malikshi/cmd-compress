@@ -5,6 +5,7 @@
 // rules: prompt overhead is counted per turn, so a mode that shrinks replies can still cost more overall.
 // rules: a 0% row is reported, never hidden — rtk declines a regrouping larger than its input, and that is a finding.
 // agent: unknown | unknown | 2026-11-02 | unknown | initial; split grep into clustered and scattered after learning rtk's never_worse guard
+// agent: unknown | xai | 2026-11-06 | unknown | import moved to rtk-local
 
 import {execFileSync} from 'node:child_process';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -13,7 +14,7 @@ import {join} from 'node:path';
 import {CAVEMAN_LEVELS, cavemanRule} from '../rules/caveman.ts';
 import {PONYTAIL_LEVELS, ponytailRule} from '../rules/ponytail.ts';
 import {resolveBin} from '../mods/shared.ts';
-import {canRefilterCompressed, condenseCountRows, condenseGrepRows, condensePaths, filterForShape, splitSegments, stripAnsi} from '../mods/rtk.ts';
+import {canRefilterCompressed, condenseCountRows, condenseGrepRows, condensePaths, filterForShape, splitSegments, stripAnsi} from '../mods/rtk-local.ts';
 import {
 	makeFindOutput,
 	makeGlobToolOutput,
@@ -207,7 +208,7 @@ function measureRewrite(bin: string): RewriteResult {
 			if (stdout.trim()) rewritten += 1;
 		} catch {
 			times.push(Number(process.hrtime.bigint() - started) / 1_000_000);
-			// exit 1 is the documented "no rtk equivalent" answer, not a failure
+			// Rules: exit 1 is the documented "no rtk equivalent" answer, not a failure.
 		}
 	}
 	return {

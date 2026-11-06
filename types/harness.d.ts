@@ -7,6 +7,7 @@
 // rules: a hook's return type is the contract the host enforces — an unknown field is a silently ignored no-op at runtime, so it must be a type error here instead.
 // agent: unknown | unknown | 2026-11-03 | unknown | initial — typed the surface the four mods actually use, so `tsc --noEmit` can catch a runtime-silent mistake.
 // agent: unknown | xai | 2026-11-04 | 01a1a3cc | ModEventBus.on returns the bare unsubscribe function the host really returns
+// agent: unknown | xai | 2026-11-06 | unknown | section dividers removed per CodeDNA
 
 declare module '@commandcode/harness' {
 	export type ModFactory = (cmd: ModApi) => void | Promise<void>;
@@ -14,8 +15,6 @@ declare module '@commandcode/harness' {
 	export interface Disposable {
 		dispose(): void;
 	}
-
-	/* ------------------------------------------------------------ data */
 
 	export interface AgentUsage {
 		readonly inputTokens: number;
@@ -29,8 +28,6 @@ declare module '@commandcode/harness' {
 		signal?: AbortSignal;
 		cwd: string;
 	}
-
-	/* ------------------------------------------------------------ hooks */
 
 	export interface ToolCallHookArgs {
 		readonly toolCallId: string;
@@ -77,8 +74,6 @@ declare module '@commandcode/harness' {
 		onRunEnd?: () => void;
 	}
 
-	/* ------------------------------------------------------------ registrations */
-
 	export interface ModFlag {
 		type: 'boolean' | 'string';
 		default?: boolean | string;
@@ -92,15 +87,11 @@ declare module '@commandcode/harness' {
 		handler: (ctx: {args: string}) => {message?: string; prompt?: string} | undefined | Promise<{message?: string; prompt?: string} | undefined>;
 	}
 
-	/* ------------------------------------------------------------ ui */
-
 	export interface ModUi {
 		readonly capabilities: {readonly status: boolean; readonly surface: boolean};
 		setStatus: (text: string | null) => Disposable;
 		notify: (message: string, level?: 'info' | 'warning' | 'error') => void;
 	}
-
-	/* ------------------------------------------------------------ store */
 
 	export interface ModStoreApi {
 		get(key: string): unknown;
@@ -108,16 +99,12 @@ declare module '@commandcode/harness' {
 		delete(key: string): Promise<void>;
 	}
 
-	/* ------------------------------------------------------------ events */
-
 	// Rules: the host's cross-mod bus. `emit(channel, data?)` / `on(channel, handler)`; a handler throw is swallowed by the host, so it can never break a sibling.
 	// Rules: `on` returns a bare unsubscribe function, not a Disposable — measured on Command Code 1.88.2. Calling `.dispose()` on it would throw.
 	export interface ModEventBus {
 		emit(channel: string, data?: unknown): void;
 		on(channel: string, handler: (data?: unknown) => void): () => void;
 	}
-
-	/* ------------------------------------------------------------ api */
 
 	export interface ExecRequest {
 		command: string;

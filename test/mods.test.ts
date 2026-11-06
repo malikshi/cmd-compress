@@ -7,6 +7,7 @@
 // agent: unknown | xai | 2026-11-06 | unknown | wrapper requote execution test, quoted assignment prefixes, guidance pinned-path test
 // agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: double-quoted wrapper execution test and `$`-in-path guidance replacement test
 // agent: unknown | xai | 2026-11-06 | unknown | review follow-up: nested single-quoted wrapper inside a double-quoted one stays executable
+// agent: unknown | xai | 2026-11-06 | unknown | imports split across rtk-local and rtk-cli
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,7 +15,9 @@ import {normalizeCavemanLevel, CAVEMAN_STOP_PHRASES} from '../mods/caveman.ts';
 import {normalizePonytailLevel, PONYTAIL_STOP_PHRASES} from '../mods/ponytail.ts';
 import {COMPRESS_PRESETS, presetFor} from '../mods/compress.ts';
 import {defaultBinDirs, isShellTool} from '../mods/shared.ts';
-import {shouldRewrite, filterNameFor, filterForShape, MIN_FILTER_BYTES, parseRtkVersion, isSupportedVersion, classifyRewrite, MIN_SUPPORTED_RTK_MINOR, guidanceText, pinBinary, joinForRewrite, splitRewrite} from '../mods/rtk.ts';
+import {MIN_FILTER_BYTES} from '../mods/rtk.ts';
+import {filterForShape, filterNameFor} from '../mods/rtk-local.ts';
+import {classifyRewrite, guidanceText, isSupportedVersion, joinForRewrite, MIN_SUPPORTED_RTK_MINOR, parseRtkVersion, pinBinary, shouldRewrite, splitRewrite} from '../mods/rtk-cli.ts';
 import {createFakeCmd} from './harness.ts';
 import {chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';

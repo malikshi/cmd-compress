@@ -7,15 +7,17 @@
 // agent: unknown | unknown | 2026-11-05 | unknown | added the CRLF equivalence test and the two local-layout fidelity tests, after measuring that Windows parsing dropped every path list and that the guard refused the condenser's own `NF:` header
 // agent: unknown | xai | 2026-11-06 | unknown | review fixes: timestamp-log data-loss test, pass-cache regression, median timing batches, count/path `+N files` assertions
 // agent: unknown | xai | 2026-11-06 | unknown | independent review round 2: dotless-path context loss test and a rule-file-added-mid-session cache test
+// agent: unknown | xai | 2026-11-06 | unknown | removeTree failure guard; imports moved to rtk-local
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile, execFileSync} from 'node:child_process';
-import {mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {performance} from 'node:perf_hooks';
-import rtk, {canRefilterCompressed, checkFidelity, condenseCountRows, condenseGrepRows, condensePaths, hasGrepContext, isGrepRows, splitSegments, MIN_FILTER_BYTES} from '../mods/rtk.ts';
+import rtk, {MIN_FILTER_BYTES} from '../mods/rtk.ts';
+import {canRefilterCompressed, checkFidelity, condenseCountRows, condenseGrepRows, condensePaths, hasGrepContext, isGrepRows, removeTree, splitSegments} from '../mods/rtk-local.ts';
 import {createFakeCmd, firstHook, resultText, runHandler, type FakeExecRequest} from './harness.ts';
 
 type ExecRequest = {command: string; args?: string[]; cwd?: string; signal?: AbortSignal};
@@ -825,7 +827,7 @@ test('a coloured result loses its escapes and keeps every fact', async t => {
 
 // Rules: the strip must not be a rewrite. `stripAnsi` is the whole change for a result below the spawn floor, so it is asserted on its own — including that an ordinary result is returned byte-identical, and that an OSC hyperlink or title is removed rather than left half-consumed.
 test('stripAnsi removes colour, cursor, and OSC sequences, and leaves plain text alone', async () => {
-	const {stripAnsi} = await import('../mods/rtk.ts');
+	const {stripAnsi} = await import('../mods/rtk-local.ts');
 	assert.equal(stripAnsi('plain text\n'), 'plain text\n');
 	assert.equal(stripAnsi('\u001B[31mred\u001B[0m'), 'red');
 	assert.equal(stripAnsi('\u001B[1;38;5;196mbold\u001B[m'), 'bold');
@@ -891,7 +893,7 @@ test('the host spill pointer survives a compressed shell result', async t => {
 
 // Rules: the extractor is the whole guarantee, so it is asserted directly — both pointer forms, the "could not be persisted" fallback, and a body that happens to contain a similar but different bracket.
 test('extractSpillNotices lifts both pointer forms and nothing else', async () => {
-	const {extractSpillNotices} = await import('../mods/rtk.ts');
+	const {extractSpillNotices} = await import('../mods/rtk-local.ts');
 	const truncation = '[... output truncated: 900000 chars total, showing first 12000 and last part ...]';
 	const saved = '[full output saved to: /tmp/x.log — read it with read_file (offset/limit) or grep]';
 	const failed = '[full output could not be persisted]';
@@ -912,7 +914,7 @@ test('extractSpillNotices lifts both pointer forms and nothing else', async () =
 // Rules: this runs on every result, and the split+join below costs 31 ms on a 700 KB body even when no pointer is present — which is almost always. The marker pre-check is what makes the common case free, and it must return the input byte-identical rather than a renormalised copy.
 // Rules: the timing assertion is a MEDIAN of repeated batches, not a mean of one batch. Measured: a single 20-call batch occasionally reported 146 ms/call in this container while the true cost is ~0.55 ms/call — an unrelated no-op loop shows the same multi-hundred-ms stalls, so a mean against a wall-clock bound is a flaky test, not a regression detector. The median of several batches ignores a stalled batch and still fails loudly if the marker pre-check is removed, since the split+join path costs ~31 ms/call.
 test('extractSpillNotices: a body with no pointer is returned unchanged, and cheaply', async () => {
-	const {extractSpillNotices} = await import('../mods/rtk.ts');
+	const {extractSpillNotices} = await import('../mods/rtk-local.ts');
 	const plain = Array.from({length: 20_000}, (_, index) => `[build] compiling module ${index} ...`).join('\n');
 	const result = extractSpillNotices(plain);
 	assert.equal(result.body, plain, 'the body is byte-identical');
@@ -960,7 +962,7 @@ test('a build failure rtk mis-groups as grep output keeps its error messages', a
 
 // Rules: the guard must not reject a genuine grouping — a real path list grouped by the find filter is the documented win, and refusing it would turn the filter off for the shape it exists for.
 test('the fidelity guard separates a real grouping from a misdetected one', async () => {
-	const {checkFidelity} = await import('../mods/rtk.ts');
+	const {checkFidelity} = await import('../mods/rtk-local.ts');
 	const rows = Array.from({length: 40}, (_, index) => `src/a${index % 4}.ts:${index + 1}:  const x = compute();`).join('\n');
 	const grouped = '40 matches in 4 files:\n\nsrc/a0.ts (10):\n     1: const x = compute();';
 	assert.equal(checkFidelity(rows, grouped, true).ok, true, 'a match list grouped is correct');
@@ -981,7 +983,7 @@ test('the fidelity guard separates a real grouping from a misdetected one', asyn
 
 // Rules: a grouped result is only suspicious when rtk auto-detected it. A grep or find result is filtered with its own explicit filter, so its grouping is never second-guessed.
 test('the guard only second-guesses an auto-detected filter', async () => {
-	const {checkFidelity} = await import('../mods/rtk.ts');
+	const {checkFidelity} = await import('../mods/rtk-local.ts');
 	const build = ['error[E0308]: mismatched types', ...Array.from({length: 30}, (_, index) => `  note ${index}`)].join('\n');
 	const grouped = '31 matches in 1 files:\n\n[file]   --> src/lib.rs (31):\n     0: 9';
 	assert.equal(checkFidelity(build, grouped, false).ok, true, 'an explicit filter result is accepted');
@@ -990,7 +992,7 @@ test('the guard only second-guesses an auto-detected filter', async () => {
 
 // Rules: losing a negation inverts meaning, which is the DeepShrink thesis this guard borrows — no legitimate summariser drops one, so it is refused on every path.
 test('a filter that drops a negation is refused', async () => {
-	const {checkFidelity} = await import('../mods/rtk.ts');
+	const {checkFidelity} = await import('../mods/rtk-local.ts');
 	const original = 'Do not run this command. Never delete the cache.';
 	assert.equal(checkFidelity(original, 'Do not run this command. Never delete the cache.', false).ok, true);
 	const report = checkFidelity(original, 'Do run this command. Delete the cache.', false);
@@ -1000,7 +1002,7 @@ test('a filter that drops a negation is refused', async () => {
 
 // Rules: rtk's grep/find grouping elides repeated rows by design (`+N`), so the negation COUNT legitimately falls. Measured against rtk 1.1.0: a real grouped grep of `returns not ready_N` rows went 41,739 -> 11,252 bytes and the counting test refused it (`negation: 200 -> 80`), which turned the filter off for every search whose matches contain `not`. A grouped result keeps a reduced count, so the count test is skipped there.
 test('a grouped result is not refused for eliding repeated negations', async () => {
-	const {checkFidelity} = await import('../mods/rtk.ts');
+	const {checkFidelity} = await import('../mods/rtk-local.ts');
 	const rows = Array.from({length: 300}, (_, index) => `src/a.ts:${index + 1}:  if (!ready) return; // not allowed`).join('\n');
 	const grouped = '300 matches in 1F:\n\n[file] src/a.ts (300):\n     1: if (!ready) return; // not allowed\n  +290';
 	assert.equal(checkFidelity(rows, grouped, false).ok, true, 'elided rows carry a reduced negation count, which is expected');
@@ -1009,7 +1011,7 @@ test('a grouped result is not refused for eliding repeated negations', async () 
 
 // Rules: total negation loss still inverts meaning even when grouped, so the grouping exemption must not become a hole for the original failure.
 test('a grouped result that drops every negation is still refused', async () => {
-	const {checkFidelity} = await import('../mods/rtk.ts');
+	const {checkFidelity} = await import('../mods/rtk-local.ts');
 	const rows = Array.from({length: 40}, (_, index) => `src/a.ts:${index + 1}:  not ready`).join('\n');
 	const grouped = '40 matches in 1F:\n\n[file] src/a.ts (40):\n     1: fine';
 	const report = checkFidelity(rows, grouped, false);
@@ -1019,7 +1021,7 @@ test('a grouped result that drops every negation is still refused', async () => 
 
 // Rules: the mod's OWN local condenser emits the abbreviated `NF:` header, so the grouping exemption has to recognise it or the two disagree. Measured before this was fixed: a 12-row single-file body whose rows all said `not` condensed 80% but the fidelity guard refused it (`negation: 12 -> 1`), so the local pass quietly did nothing on any search whose matched code contains a negation. Both layouts are pinned, because `layoutByDir` emits `NF:` and `layoutByFile` emits `[file]`.
 test('the fidelity guard accepts the local condenser\'s own two layouts', async () => {
-	const {condenseGrepRows, checkFidelity} = await import('../mods/rtk.ts');
+	const {condenseGrepRows, checkFidelity} = await import('../mods/rtk-local.ts');
 	const single = Array.from({length: 12}, (_, index) => `src/a.ts:${index + 1}:  return not ready;`).join('\n');
 	const fileLayout = condenseGrepRows(single);
 	assert.ok(fileLayout?.startsWith('12 matches in 1F:'), 'the file layout uses the abbreviated header');
@@ -1033,7 +1035,7 @@ test('the fidelity guard accepts the local condenser\'s own two layouts', async 
 
 // Rules: the host's `grep` tool supports `-A/-B/-C`, and ripgrep prints a context line as `path-line-text` where a match is `path:line:text`. rtk's grep filter keeps only the match form, so the context the caller explicitly asked for is dropped — measured end-to-end through the real mod, a 40-match result with 40 context lines went 3,178 -> 1,665 bytes with all 40 gone. The explicit-filter path skips the grouping test, so this needs its own check.
 test('a grep result carrying -A/-B/-C context is not handed to the grep filter', async () => {
-	const {checkFidelity} = await import('../mods/rtk.ts');
+	const {checkFidelity} = await import('../mods/rtk-local.ts');
 	const paths = Array.from({length: 40}, (_, index) => `src/f${index % 4}.ts`);
 	const withContext = paths.map((path, index) => `src/f${index % 4}.ts:${index + 1}:  const hit${index} = f();\nsrc/f${index % 4}.ts-${index + 2}-  context${index}`).join('\n');
 	const grouped = '40 matches in 4F:\n\n[file] src/f0.ts (10):\n    10: const hit0 = f();';
@@ -1130,4 +1132,19 @@ test('condense: a filtered result that would be larger than the original is reje
 		assert.ok(resultText(result).length <= input.length, 'a filter may never return a larger result');
 	}
 	assert.equal(result, undefined, 'the original is smaller, so it is the only valid answer');
+});
+
+test('removeTree: a failed cleanup is swallowed, so it cannot escape afterToolCall', () => {
+	const calls: string[] = [];
+	assert.doesNotThrow(() => removeTree('/tmp/locked', path => {
+		calls.push(path);
+		throw new Error('EPERM');
+	}));
+	assert.deepEqual(calls, ['/tmp/locked'], 'the remover is attempted once');
+});
+
+test('removeTree: the default remover deletes a real directory', () => {
+	const dir = mkdtempSync(join(tmpdir(), 'cmd-compress-remove-'));
+	removeTree(dir);
+	assert.equal(existsSync(dir), false, 'the directory is gone');
 });
